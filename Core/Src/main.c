@@ -60,6 +60,7 @@ PCD_HandleTypeDef hpcd_USB_FS;
 /* USER CODE BEGIN PV */
 uint32_t dma_buffer[DMA_BUF_LEN];
 uint8_t  led_data[NUM_LEDS][3];   // [G][R][B]
+uint16_t sensor_raw[31];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -101,8 +102,6 @@ void fill_bosanquet(
 		uint8_t f_r, uint8_t f_g, uint8_t f_b,
 		uint8_t df_r, uint8_t df_g, uint8_t df_b)
 {
-  uint32_t idx = 0;
-
   for (int i = 0; i < NUM_LEDS; i++) {
 	switch (i) {
 	case 0:
@@ -183,6 +182,52 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
   }
 }
 
+void select_mux_channel(uint8_t channel)
+{
+  // channel = 0..15
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, (channel & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET); // S0
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, (channel & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET); // S1
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, (channel & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET); // S2
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, (channel & 0x08) ? GPIO_PIN_SET : GPIO_PIN_RESET); // S3
+}
+
+uint16_t read_adc_channel(uint32_t channel)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+  sConfig.Channel = channel;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+    Error_Handler();
+  }
+
+  HAL_ADC_Start(&hadc1);
+  HAL_ADC_PollForConversion(&hadc1, 10);
+  uint16_t value = HAL_ADC_GetValue(&hadc1);
+  HAL_ADC_Stop(&hadc1);
+
+  return value;
+}
+
+uint16_t read_sensor(uint8_t index)
+{
+  if (index < 16) {
+    // M1 on PA1 (ADC_CHANNEL_2)
+    select_mux_channel(index);
+    HAL_Delay(1);                           // settling time – increase if noisy
+    return read_adc_channel(ADC_CHANNEL_2);
+  } else {
+    // M2 on PA0 (ADC_CHANNEL_1)
+    select_mux_channel(index - 16);
+    HAL_Delay(1);
+    return read_adc_channel(ADC_CHANNEL_1);
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -250,7 +295,31 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
+	  while (1)
+	  {
+	    // --- Read all sensors ---
+	    for (uint8_t i = 0; i < 31; i++) {
+	      sensor_raw[i] = read_sensor(i);
+	    }
 
+	    // --- Simple threshold visualisation ---
+	    // Adjust these two numbers after you see real values
+	    const uint16_t center = 2400;     // roughly your resting value
+	    const uint16_t threshold = 150;   // how far from center counts as "pressed"
+
+	    fill_solid(0, 0, 0);              // clear LEDs
+
+	    for (uint8_t i = 0; i < 31; i++) {
+	      int16_t delta = (int16_t)sensor_raw[i] - center;
+
+	      if (delta > threshold || delta < -threshold) {
+	        // Magnet detected – light this key
+	        set_pixel(i, 0, 20, 0);       // dim green
+	      }
+	    }
+
+	    show_leds();
+	  }
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -355,7 +424,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_92CYCLES_5;
   sConfig.SingleDiff = ADC_DIFFERENTIAL_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
@@ -662,14 +731,14 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PB4 PB5 PB6 PB7 */
+  /*Configure GPIO pins : PA4 PA5 PA6 PA7 */
   GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
