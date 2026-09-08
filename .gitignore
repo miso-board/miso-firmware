@@ -1,0 +1,19 @@
+# Build outputs
+Debug/
+Release/
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.lnp
+
+# IDE / local
+.metadata/
+.settings/
+*.launch
+.mxproject
+
+# macOS
+.DS_Store
