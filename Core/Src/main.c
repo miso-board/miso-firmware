@@ -38,6 +38,11 @@
 // Duty cycle values (adjust these if colours look wrong)
 #define LED_CODE_0      45     // ~0.35 µs high
 #define LED_CODE_1      110    // ~0.8 µs high
+
+// USB DFU bootloader entry
+#define BOOTLOADER_MAGIC        0x4D49534Fu  // "MISO"
+#define BOOTLOADER_SYSMEM_BASE  0x1FFF0000u  // STM32G4 system memory (ROM bootloader)
+#define BOOTLOADER_TAP_WINDOW   500u         // ms: second reset within this window enters DFU
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,6 +63,9 @@ DMA_HandleTypeDef hdma_tim1_ch1;
 PCD_HandleTypeDef hpcd_USB_FS;
 
 /* USER CODE BEGIN PV */
+// Lives in .noinit RAM: keeps its value across NRST resets, only lost on power-off.
+__attribute__((section(".noinit"))) static volatile uint32_t bootloader_flag;
+
 uint32_t dma_buffer[DMA_BUF_LEN];
 uint8_t  led_data[NUM_LEDS][3];   // [G][R][B]
 uint16_t sensor_raw[31];
@@ -79,6 +87,29 @@ static void MX_TIM1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// Must run before HAL_Init/SystemClock_Config, while the MCU is still in its
+// reset state (HSI clock, no interrupts, peripherals untouched) — the ROM
+// bootloader expects to start from those conditions.
+static void bootloader_check(void)
+{
+  if (bootloader_flag != BOOTLOADER_MAGIC) {
+    return;
+  }
+  bootloader_flag = 0;  // one-shot: next reset boots the app normally
+
+  __set_MSP(*(volatile uint32_t *)BOOTLOADER_SYSMEM_BASE);
+  ((void (*)(void))(*(volatile uint32_t *)(BOOTLOADER_SYSMEM_BASE + 4)))();
+  while (1);  // never reached
+}
+
+// Call from anywhere (e.g. a future MIDI/serial "enter DFU" command) to reboot
+// into the USB DFU bootloader without touching the reset button.
+void Bootloader_RequestDFU(void)
+{
+  bootloader_flag = BOOTLOADER_MAGIC;
+  NVIC_SystemReset();
+}
 
 void set_pixel(uint16_t index, uint8_t r, uint8_t g, uint8_t b)
 {
@@ -239,6 +270,14 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 
+  // If the previous boot requested DFU (double-tap reset or Bootloader_RequestDFU),
+  // jump to the ROM bootloader now, before any clocks/peripherals are configured.
+  bootloader_check();
+
+  // Arm the double-tap window: if reset is pressed again before the window
+  // closes below, the next boot enters the USB DFU bootloader.
+  bootloader_flag = BOOTLOADER_MAGIC;
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -267,6 +306,11 @@ int main(void)
   MX_USB_PCD_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
+
+  // Close the double-tap DFU window. A second reset press must land within
+  // this delay (plus init time above) to enter the bootloader.
+  HAL_Delay(BOOTLOADER_TAP_WINDOW);
+  bootloader_flag = 0;
 
   // Simple test patterns
   fill_solid(5, 0, 0);     // dim red
@@ -297,28 +341,28 @@ int main(void)
     /* USER CODE END WHILE */
 	  while (1)
 	  {
-	    // --- Read all sensors ---
-	    for (uint8_t i = 0; i < 31; i++) {
-	      sensor_raw[i] = read_sensor(i);
-	    }
+	    // // --- Read all sensors ---
+	    // for (uint8_t i = 0; i < 31; i++) {
+	    //   sensor_raw[i] = read_sensor(i);
+	    // }
 
-	    // --- Simple threshold visualisation ---
-	    // Adjust these two numbers after you see real values
-	    const uint16_t center = 2400;     // roughly your resting value
-	    const uint16_t threshold = 150;   // how far from center counts as "pressed"
+	    // // --- Simple threshold visualisation ---
+	    // // Adjust these two numbers after you see real values
+	    // const uint16_t center = 2400;     // roughly your resting value
+	    // const uint16_t threshold = 150;   // how far from center counts as "pressed"
 
-	    fill_solid(0, 0, 0);              // clear LEDs
+	    // fill_solid(0, 0, 0);              // clear LEDs
 
-	    for (uint8_t i = 0; i < 31; i++) {
-	      int16_t delta = (int16_t)sensor_raw[i] - center;
+	    // for (uint8_t i = 0; i < 31; i++) {
+	    //   int16_t delta = (int16_t)sensor_raw[i] - center;
 
-	      if (delta > threshold || delta < -threshold) {
-	        // Magnet detected – light this key
-	        set_pixel(i, 0, 20, 0);       // dim green
-	      }
-	    }
+	    //   if (delta > threshold || delta < -threshold) {
+	    //     // Magnet detected – light this key
+	    //     set_pixel(i, 0, 20, 0);       // dim green
+	    //   }
+	    // }
 
-	    show_leds();
+	    // show_leds();
 	  }
     /* USER CODE BEGIN 3 */
   }

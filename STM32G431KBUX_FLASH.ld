@@ -165,6 +165,17 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
 
+  /* Data that must survive a reset (e.g. the DFU bootloader request flag).
+     NOLOAD + outside .bss/.data means the startup code never zeroes or
+     initializes it, so its contents persist across NRST resets. */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM
+
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */
   ._user_heap_stack :
   {
