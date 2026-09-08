@@ -56,6 +56,7 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
 void Bootloader_RequestDFU(void);  // reboot into the USB DFU bootloader
+void Miso_CDC_OnRx(uint8_t *buf, uint32_t len);  // bytes received on USB CDC (called from usbd_cdc_if.c)
 
 /* USER CODE END EFP */
 

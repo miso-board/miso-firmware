@@ -18,10 +18,14 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,6 +47,28 @@
 #define BOOTLOADER_MAGIC        0x4D49534Fu  // "MISO"
 #define BOOTLOADER_SYSMEM_BASE  0x1FFF0000u  // STM32G4 system memory (ROM bootloader)
 #define BOOTLOADER_TAP_WINDOW   500u         // ms: second reset within this window enters DFU
+
+// Hall sensor scanning + CDC streaming
+#define NUM_SENSORS         31
+#define CYCLES_PER_US       144u   // SYSCLK in MHz, for DWT cycle-counter timing
+#define MUX_SETTLE_US       5u     // 4067 switch + ADC input settling after channel select
+#define STREAM_MAGIC0       0xA5
+#define STREAM_MAGIC1       0x5A
+#define FRAME_TYPE_SCAN     0x01
+#define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
+#define FW_VERSION          "miso 0.3.0"
+
+// Velocity engine. Positions are normalized per key: 0 = rest, 1 = calibrated
+// full press. Thresholds chosen against measured spans of 510-700 counts with
+// a noise floor of ~2 counts, so even 4% of span is far above noise.
+#define KEY_START_POS       0.10f   // arm timing when travel passes this
+#define KEY_ABORT_POS       0.04f   // un-arm if it falls back below this
+#define KEY_END_POS         0.70f   // key-down fires here; dt = END - START time
+#define KEY_RELEASE_POS     0.30f   // key-up fires when travel falls below this
+#define KEY_EMA_ALPHA       0.3f    // light smoothing on raw readings
+#define VEL_DT_FAST_US      3000u   // transit this fast (or faster) = velocity 127
+#define VEL_DT_SLOW_US      120000u // transit this slow (or slower) = velocity 1
+#define REST_CAL_SCANS      128u    // boot scans averaged into per-key rest level
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,8 +85,6 @@ UART_HandleTypeDef huart2;
 
 TIM_HandleTypeDef htim1;
 DMA_HandleTypeDef hdma_tim1_ch1;
-
-PCD_HandleTypeDef hpcd_USB_FS;
 
 /* USER CODE BEGIN PV */
 // Lives in .noinit RAM: keeps its value across NRST resets, only lost on power-off.
@@ -79,7 +103,6 @@ static void MX_ADC1_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
-static void MX_USB_PCD_Init(void);
 static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -244,18 +267,223 @@ uint16_t read_adc_channel(uint32_t channel)
   return value;
 }
 
-uint16_t read_sensor(uint8_t index)
+// --- Microsecond timing via the DWT cycle counter ---------------------------
+
+static void dwt_init(void)
 {
-  if (index < 16) {
-    // M1 on PA1 (ADC_CHANNEL_2)
-    select_mux_channel(index);
-    HAL_Delay(1);                           // settling time – increase if noisy
-    return read_adc_channel(ADC_CHANNEL_2);
-  } else {
-    // M2 on PA0 (ADC_CHANNEL_1)
-    select_mux_channel(index - 16);
-    HAL_Delay(1);
-    return read_adc_channel(ADC_CHANNEL_1);
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static inline void delay_us(uint32_t us)
+{
+  uint32_t start = DWT->CYCCNT;
+  uint32_t cycles = us * CYCLES_PER_US;
+  while ((uint32_t)(DWT->CYCCNT - start) < cycles);
+}
+
+// Monotonic microsecond clock. CYCCNT wraps every ~29.8 s at 144 MHz, so this
+// accumulates deltas into a 64-bit base — it must be called at least that
+// often, which the scan loop guarantees. Returned value wraps at 2^32 µs
+// (~71.6 min); consumers must use wrap-safe delta arithmetic.
+static uint32_t micros32(void)
+{
+  static uint64_t total_cycles = 0;
+  static uint32_t last_cyccnt = 0;
+  uint32_t now = DWT->CYCCNT;
+  total_cycles += (uint32_t)(now - last_cyccnt);
+  last_cyccnt = now;
+  return (uint32_t)(total_cycles / CYCLES_PER_US);
+}
+
+// --- Sensor scanning ---------------------------------------------------------
+
+// Both 4067s share the S0-S3 select lines, so each select setting yields two
+// sensors: M1 (PA1/ch2) -> keys 0-15, M2 (PA0/ch1) -> keys 16-30.
+void scan_all(void)
+{
+  for (uint8_t ch = 0; ch < 16; ch++) {
+    select_mux_channel(ch);
+    delay_us(MUX_SETTLE_US);
+    sensor_raw[ch] = read_adc_channel(ADC_CHANNEL_2);
+    if (ch < 15) {
+      sensor_raw[16 + ch] = read_adc_channel(ADC_CHANNEL_1);
+    }
+  }
+}
+
+// --- USB CDC streaming + commands --------------------------------------------
+
+volatile uint8_t  stream_on   = 0;
+volatile uint32_t stream_decim = STREAM_DECIM_DEFAULT;
+volatile uint8_t  led_viz_on  = 1;
+volatile uint8_t  info_req    = 0;
+uint32_t scan_hz = 0;  // measured full-scan rate, updated once per second
+
+// Binary scan frame: A5 5A 01 | u32 t_us | 31 x u16 raw | u8 checksum(payload)
+static void stream_frame(uint32_t t_us)
+{
+  static uint8_t buf[3 + 4 + NUM_SENSORS * 2 + 1];
+  if (CDC_IsTxBusy()) return;  // drop the frame rather than stall the scan loop
+  buf[0] = STREAM_MAGIC0;
+  buf[1] = STREAM_MAGIC1;
+  buf[2] = FRAME_TYPE_SCAN;
+  memcpy(&buf[3], &t_us, 4);
+  memcpy(&buf[7], (const void *)sensor_raw, NUM_SENSORS * 2);
+  uint8_t sum = 0;
+  for (uint32_t i = 3; i < sizeof(buf) - 1; i++) sum += buf[i];
+  buf[sizeof(buf) - 1] = sum;
+  CDC_Transmit_FS(buf, sizeof(buf));
+}
+
+// Text output (info lines, key events). Waits briefly for the endpoint to
+// free up; data is copied to a static buffer that stays valid during TX.
+static void cdc_send_text(const char *s)
+{
+  static char txt[128];
+  size_t n = strlen(s);
+  if (n > sizeof(txt)) n = sizeof(txt);
+  uint32_t t0 = HAL_GetTick();
+  while (CDC_IsTxBusy()) {
+    if (HAL_GetTick() - t0 > 5) return;
+  }
+  memcpy(txt, s, n);
+  CDC_Transmit_FS((uint8_t *)txt, (uint16_t)n);
+}
+
+// --- Velocity engine ---------------------------------------------------------
+// Per-key calibrated full-press values, measured 2026-09-08 with the companion
+// app ("miso-cal-1" sweep). Rest levels are re-measured at every boot instead
+// (REST_CAL_SCANS), since they drift less than a press but more than a flash
+// cycle. Perimeter keys genuinely swing less than center keys (~2635 vs ~2828,
+// mechanical bottom-out differences) — normalizing per key absorbs that.
+static const uint16_t key_cal_max[NUM_SENSORS] = {
+  2810, 2769, 2816, 2828, 2811, 2774, 2746, 2816, 2715, 2797,
+  2825, 2672, 2821, 2781, 2777, 2817, 2759, 2635, 2804, 2761,
+  2704, 2703, 2815, 2700, 2807, 2812, 2800, 2824, 2806, 2790,
+  2820,
+};
+
+// LED chain index for each sensor, from the board layout traced 2026-09-08
+// (7x7 sparse grid, serpentine LED chain; see README "Board layout"). The
+// physical grid coordinates live in companion/src/lib/layout.ts — firmware
+// only needs sensor -> LED to light the key that was actually pressed.
+static const uint8_t led_for_sensor[NUM_SENSORS] = {
+   8,  0,  4, 15, 23, 24, 25, 14, 12, 13,
+   9, 11, 10,  2,  1,  3, 18, 19, 21, 20,
+  28, 29, 27, 30, 22, 26,  7,  5, 17, 16,
+   6,
+};
+
+enum { KS_IDLE, KS_PRESSING, KS_HELD };
+static float    key_rest[NUM_SENSORS];
+static float    key_ema[NUM_SENSORS];
+static uint8_t  key_state[NUM_SENSORS];
+static uint32_t key_t0[NUM_SENSORS];      // µs timestamp of START crossing
+static uint8_t  key_vel[NUM_SENSORS];     // last key-down velocity, 1..127
+static float    rest_acc[NUM_SENSORS];
+static uint32_t rest_scans = 0;           // < REST_CAL_SCANS while calibrating
+
+// Restart the boot-time rest calibration (also triggered by the 'r' command).
+static void keys_recalibrate_rest(void)
+{
+  memset(rest_acc, 0, sizeof(rest_acc));
+  rest_scans = 0;
+}
+
+// Two-threshold transit time -> 1..127, log-mapped so each doubling of speed
+// adds a fixed velocity increment (the same principle piano keybeds use).
+static uint8_t velocity_from_dt(uint32_t dt_us)
+{
+  if (dt_us <= VEL_DT_FAST_US) return 127;
+  if (dt_us >= VEL_DT_SLOW_US) return 1;
+  float f = logf((float)VEL_DT_SLOW_US / (float)dt_us)
+          / logf((float)VEL_DT_SLOW_US / (float)VEL_DT_FAST_US);
+  int v = 1 + (int)(126.0f * f + 0.5f);
+  return (uint8_t)(v < 1 ? 1 : (v > 127 ? 127 : v));
+}
+
+static void keys_process(uint32_t t_us)
+{
+  if (rest_scans < REST_CAL_SCANS) {
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) rest_acc[i] += sensor_raw[i];
+    if (++rest_scans == REST_CAL_SCANS) {
+      for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        key_rest[i] = rest_acc[i] / (float)REST_CAL_SCANS;
+        key_ema[i] = key_rest[i];
+        key_state[i] = KS_IDLE;
+        key_vel[i] = 0;
+      }
+    }
+    return;
+  }
+
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    key_ema[i] += KEY_EMA_ALPHA * ((float)sensor_raw[i] - key_ema[i]);
+    float pos = (key_ema[i] - key_rest[i]) / ((float)key_cal_max[i] - key_rest[i]);
+    char line[48];
+
+    switch (key_state[i]) {
+      case KS_IDLE:
+        if (pos > KEY_START_POS) {
+          key_state[i] = KS_PRESSING;
+          key_t0[i] = t_us;
+        }
+        break;
+      case KS_PRESSING:
+        if (pos > KEY_END_POS) {
+          uint32_t dt = t_us - key_t0[i];   // wrap-safe
+          key_vel[i] = velocity_from_dt(dt);
+          key_state[i] = KS_HELD;
+          snprintf(line, sizeof(line), "EV %u DOWN vel=%u dt_us=%lu\r\n",
+                   i, key_vel[i], (unsigned long)dt);
+          cdc_send_text(line);
+        } else if (pos < KEY_ABORT_POS) {
+          key_state[i] = KS_IDLE;           // grazed, never committed
+        }
+        break;
+      case KS_HELD:
+        if (pos < KEY_RELEASE_POS) {
+          key_state[i] = KS_IDLE;
+          key_vel[i] = 0;
+          snprintf(line, sizeof(line), "EV %u UP\r\n", i);
+          cdc_send_text(line);
+        }
+        break;
+    }
+  }
+}
+
+// Command parser, called from the USB interrupt (usbd_cdc_if.c) — only sets
+// flags/values; all TX happens in the main loop.
+//   i        info line          s/x      start/stop streaming
+//   d<N>     stream every Nth scan       l        toggle LED visualization
+//   r        redo the rest calibration (hands off the keys)
+void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
+{
+  static uint8_t collecting_decim = 0;
+  static uint32_t decim_val = 0;
+
+  for (uint32_t i = 0; i < len; i++) {
+    uint8_t c = buf[i];
+    if (collecting_decim) {
+      if (c >= '0' && c <= '9') {
+        decim_val = decim_val * 10 + (c - '0');
+        continue;
+      }
+      if (decim_val > 0) stream_decim = decim_val;
+      collecting_decim = 0;  // fall through: c may start a new command
+    }
+    switch (c) {
+      case 'i': info_req = 1; break;
+      case 's': stream_on = 1; break;
+      case 'x': stream_on = 0; break;
+      case 'l': led_viz_on ^= 1; break;
+      case 'r': keys_recalibrate_rest(); break;
+      case 'd': collecting_decim = 1; decim_val = 0; break;
+      default: break;  // ignore CR/LF and unknown bytes
+    }
   }
 }
 
@@ -303,8 +531,8 @@ int main(void)
   MX_LPUART1_UART_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
-  MX_USB_PCD_Init();
   MX_TIM1_Init();
+  MX_USB_Device_Init();
   /* USER CODE BEGIN 2 */
 
   // Close the double-tap DFU window. A second reset press must land within
@@ -312,22 +540,24 @@ int main(void)
   HAL_Delay(BOOTLOADER_TAP_WINDOW);
   bootloader_flag = 0;
 
-  // Simple test patterns
+  dwt_init();
+
+  // Simple test patterns (shortened so flash-test cycles stay quick)
   fill_solid(5, 0, 0);     // dim red
   show_leds();
-  HAL_Delay(1000);
+  HAL_Delay(250);
 
   fill_solid(0, 5, 0);     // dim green
   show_leds();
-  HAL_Delay(1000);
+  HAL_Delay(250);
 
   fill_solid(0, 0, 5);     // dim blue
   show_leds();
-  HAL_Delay(1000);
+  HAL_Delay(250);
 
   fill_solid(5, 5, 5);   // white
   show_leds();
-  HAL_Delay(1000);
+  HAL_Delay(250);
 
   fill_bosanquet(5, 5, 25, 5, 25, 5, 20, 20, 2, 25, 10, 2, 25, 2, 2);
   show_leds();
@@ -336,35 +566,57 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t scan_count = 0;
+  uint32_t rate_scans = 0;
+  uint32_t rate_t0 = HAL_GetTick();
+  uint32_t last_led_tick = 0;
+
   while (1)
   {
     /* USER CODE END WHILE */
-	  while (1)
-	  {
-	    // // --- Read all sensors ---
-	    // for (uint8_t i = 0; i < 31; i++) {
-	    //   sensor_raw[i] = read_sensor(i);
-	    // }
 
-	    // // --- Simple threshold visualisation ---
-	    // // Adjust these two numbers after you see real values
-	    // const uint16_t center = 2400;     // roughly your resting value
-	    // const uint16_t threshold = 150;   // how far from center counts as "pressed"
-
-	    // fill_solid(0, 0, 0);              // clear LEDs
-
-	    // for (uint8_t i = 0; i < 31; i++) {
-	    //   int16_t delta = (int16_t)sensor_raw[i] - center;
-
-	    //   if (delta > threshold || delta < -threshold) {
-	    //     // Magnet detected – light this key
-	    //     set_pixel(i, 0, 20, 0);       // dim green
-	    //   }
-	    // }
-
-	    // show_leds();
-	  }
     /* USER CODE BEGIN 3 */
+    scan_all();
+    uint32_t t_us = micros32();
+    keys_process(t_us);
+    scan_count++;
+    rate_scans++;
+
+    uint32_t tick = HAL_GetTick();
+    if (tick - rate_t0 >= 1000) {
+      scan_hz = rate_scans * 1000u / (tick - rate_t0);
+      rate_scans = 0;
+      rate_t0 = tick;
+    }
+
+    if (stream_on && (scan_count % stream_decim) == 0) {
+      stream_frame(t_us);
+    }
+
+    if (info_req) {
+      info_req = 0;
+      char line[96];
+      snprintf(line, sizeof(line), "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u\r\n",
+               FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
+               stream_on, led_viz_on);
+      cdc_send_text(line);
+    }
+
+    // Velocity feedback on the LEDs: a held key glows green with brightness
+    // proportional to its strike velocity. Decimated so the WS2812 DMA
+    // (~1.6 ms per refresh) doesn't eat into the scan rate; 'l' toggles it
+    // off for clean noise measurements.
+    if (led_viz_on && (tick - last_led_tick) >= 30) {
+      last_led_tick = tick;
+      fill_solid(0, 0, 0);
+      for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        if (key_state[i] == KS_HELD) {
+          // vel 1..127 maps directly to green, on the pressed key's own LED
+          set_pixel(led_for_sensor[i], 0, key_vel[i], 0);
+        }
+      }
+      show_leds();
+    }
   }
   /* USER CODE END 3 */
 }
@@ -704,39 +956,6 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
-
-}
-
-/**
-  * @brief USB Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USB_PCD_Init(void)
-{
-
-  /* USER CODE BEGIN USB_Init 0 */
-
-  /* USER CODE END USB_Init 0 */
-
-  /* USER CODE BEGIN USB_Init 1 */
-
-  /* USER CODE END USB_Init 1 */
-  hpcd_USB_FS.Instance = USB;
-  hpcd_USB_FS.Init.dev_endpoints = 8;
-  hpcd_USB_FS.Init.speed = PCD_SPEED_FULL;
-  hpcd_USB_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
-  hpcd_USB_FS.Init.Sof_enable = DISABLE;
-  hpcd_USB_FS.Init.low_power_enable = DISABLE;
-  hpcd_USB_FS.Init.lpm_enable = DISABLE;
-  hpcd_USB_FS.Init.battery_charging_enable = DISABLE;
-  if (HAL_PCD_Init(&hpcd_USB_FS) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USB_Init 2 */
-
-  /* USER CODE END USB_Init 2 */
 
 }
 
