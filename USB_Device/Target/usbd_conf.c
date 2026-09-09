@@ -440,13 +440,34 @@ USBD_StatusTypeDef USBD_LL_Init(USBD_HandleTypeDef *pdev)
   /* USER CODE END RegisterCallBackSecondPart */
 #endif /* USE_HAL_PCD_REGISTER_CALLBACKS */
   /* USER CODE BEGIN EndPoint_Configuration */
-  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x00 , PCD_SNG_BUF, 0x18);
-  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x80 , PCD_SNG_BUF, 0x58);
+  /* PMA layout for the composite device.
+   *
+   * The buffer descriptor table lives at the bottom of the PMA and takes 8
+   * bytes per endpoint PAIR, so it grows with the highest endpoint number in
+   * use. CubeMX's stock layout starts buffers at 0x18, which only clears a
+   * 3-pair table (EP0-EP2) — adding the MIDI endpoints on EP3 extends the
+   * table to 0x20 and it would then overwrite the EP0 OUT buffer, leaving the
+   * MIDI endpoints dead while CDC still appeared to work.
+   *
+   * Buffers therefore start at 0x40, clear of a full 8-pair table, so this
+   * cannot bite again if another endpoint is ever added:
+   *   0x000-0x040  buffer descriptor table (8 pairs)
+   *   0x040 EP0 OUT 64   0x080 EP0 IN 64
+   *   0x0C0 EP1 IN  64   0x100 EP1 OUT 64   0x140 EP2 IN 8   (CDC)
+   *   0x150 EP3 IN  64   0x190 EP3 OUT 64                    (MIDI)
+   * ending at 0x1D0 of 0x400.
+   */
+  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x00 , PCD_SNG_BUF, 0x40);
+  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x80 , PCD_SNG_BUF, 0x80);
   /* USER CODE END EndPoint_Configuration */
   /* USER CODE BEGIN EndPoint_Configuration_CDC */
   HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x81 , PCD_SNG_BUF, 0xC0);
-  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x01 , PCD_SNG_BUF, 0x110);
-  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x82 , PCD_SNG_BUF, 0x100);
+  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x01 , PCD_SNG_BUF, 0x100);
+  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x82 , PCD_SNG_BUF, 0x140);
+  /* USER CODE BEGIN MIDI_PMA */
+  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x83 , PCD_SNG_BUF, 0x150);
+  HAL_PCDEx_PMAConfig((PCD_HandleTypeDef*)pdev->pData , 0x03 , PCD_SNG_BUF, 0x190);
+  /* USER CODE END MIDI_PMA */
   /* USER CODE END EndPoint_Configuration_CDC */
   return USBD_OK;
 }

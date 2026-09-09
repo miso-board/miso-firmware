@@ -39,11 +39,13 @@ export const ui = $state({
   rows: [] as Row[],
   traces: [] as TraceMeta[],
   events: [] as KeyEvent[],
+  held: Array(NUM_KEYS).fill(false) as boolean[],
 });
 
 export function pushEvent(ev: KeyEvent): void {
   ui.events.unshift(ev);
   if (ui.events.length > 12) ui.events.pop();
+  if (ev.key < NUM_KEYS) ui.held[ev.key] = ev.kind === "DOWN";
 }
 
 let toastTimer: ReturnType<typeof setTimeout> | null = null;

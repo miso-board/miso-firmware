@@ -65,8 +65,10 @@
 #define USBD_VID     1155
 #define USBD_LANGID_STRING     1033
 #define USBD_MANUFACTURER_STRING     "STMicroelectronics"
-#define USBD_PID     22336
-#define USBD_PRODUCT_STRING     "STM32 Virtual ComPort"
+/* PID bumped from 22336 (0x5740, ST's CDC default) so hosts don't reuse
+   cached CDC-only descriptors for what is now a composite device. */
+#define USBD_PID     22337
+#define USBD_PRODUCT_STRING     "Miso"
 #define USBD_CONFIGURATION_STRING     "CDC Config"
 #define USBD_INTERFACE_STRING     "CDC Interface"
 
@@ -150,9 +152,9 @@ __ALIGN_BEGIN uint8_t USBD_CDC_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
   USB_DESC_TYPE_DEVICE,       /*bDescriptorType*/
   0x00,                       /*bcdUSB */
   0x02,
-  0x02,                       /*bDeviceClass*/
-  0x02,                       /*bDeviceSubClass*/
-  0x00,                       /*bDeviceProtocol*/
+  0xEF,                       /*bDeviceClass: Miscellaneous (composite w/ IAD)*/
+  0x02,                       /*bDeviceSubClass: Common Class*/
+  0x01,                       /*bDeviceProtocol: Interface Association Descriptor*/
   USB_MAX_EP0_SIZE,           /*bMaxPacketSize*/
   LOBYTE(USBD_VID),           /*idVendor*/
   HIBYTE(USBD_VID),           /*idVendor*/

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <math.h>
 #include "usbd_cdc_if.h"
+#include "usbd_composite.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -56,7 +57,28 @@
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.3.0"
+#define FW_VERSION          "miso 0.4.0"
+#define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
+#define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
+
+// --- MIDI / MPE ---------------------------------------------------------
+// Wicki-Hayden on a 31-EDO lattice. meantonal represents a pitch as
+// (w, h) = whole steps and diatonic semitones above C-1; this board's grid
+// maps in with w = x + 3y + W0, h = y + H0 (meantonal's WICKI_FROM basis).
+// The authoring-side source of truth is companion/src/lib/tuning.ts.
+#define TUNE_W0             34     // anchor: puts D5 on the centre key (3,3)
+#define TUNE_H0             15
+#define EDO_STEPS           31     // divisions of the octave
+#define EDO_WHOLE_TONE      5      // 31-EDO steps in a whole tone
+#define EDO_DIATONIC_SEMI   3      // 31-EDO steps in a diatonic semitone
+#define MPE_MEMBER_FIRST    1      // MIDI channel index of member channel 1 (= channel 2)
+#define MPE_MEMBER_COUNT    15     // channels 2..16
+#define MPE_BEND_SEMITONES  48     // MPE default; 0.59 cents per bend unit
+#define MPE_BEND_CENTS      (MPE_BEND_SEMITONES * 100)
+#define MIDI_CIN_NOTE_OFF   0x08
+#define MIDI_CIN_NOTE_ON    0x09
+#define MIDI_CIN_CC         0x0B
+#define MIDI_CIN_PITCHBEND  0x0E
 
 // Velocity engine. Positions are normalized per key: 0 = rest, 1 = calibrated
 // full press. Thresholds chosen against measured spans of 510-700 counts with
@@ -321,6 +343,16 @@ volatile uint8_t  led_viz_on  = 1;
 volatile uint8_t  info_req    = 0;
 uint32_t scan_hz = 0;  // measured full-scan rate, updated once per second
 
+// Background LED colors (RGB, LED-chain order), pushed by the host via the
+// 'C' command; initialized from the boot pattern. A frame in flight stages
+// into color_rx_buf from the USB interrupt and is applied by the main loop.
+static uint8_t led_background[NUM_LEDS][3];
+static volatile uint8_t  color_rx_buf[NUM_LEDS * 3];
+static volatile uint16_t color_rx_count = 0;
+static volatile uint8_t  color_rx_active = 0;
+static volatile uint8_t  color_rx_ready = 0;
+static volatile uint32_t last_rx_tick = 0;
+
 // Binary scan frame: A5 5A 01 | u32 t_us | 31 x u16 raw | u8 checksum(payload)
 static void stream_frame(uint32_t t_us)
 {
@@ -376,6 +408,20 @@ static const uint8_t led_for_sensor[NUM_SENSORS] = {
    6,
 };
 
+// Board grid coordinate (x, y) of each sensor, i.e. LED_POS[led_for_sensor[i]].
+static const int8_t sensor_grid[NUM_SENSORS][2] = {
+  {2,3}, {0,4}, {1,4}, {3,3}, {4,2}, {4,1}, {5,1}, {3,2},
+  {3,0}, {3,1}, {2,2}, {2,0}, {2,1}, {1,2}, {0,3}, {1,3},
+  {3,6}, {4,6}, {4,4}, {4,5}, {5,4}, {6,3}, {5,3}, {6,2},
+  {4,3}, {5,2}, {2,4}, {1,5}, {3,5}, {3,4}, {2,5},
+};
+
+// Per key: nearest MIDI note and the 14-bit bend that corrects it to the true
+// 31-EDO pitch. Computed once at boot by midi_build_pitch_table().
+static uint8_t  key_midi[NUM_SENSORS];
+static uint16_t key_bend[NUM_SENSORS];
+static uint8_t  key_playable[NUM_SENSORS];
+
 enum { KS_IDLE, KS_PRESSING, KS_HELD };
 static float    key_rest[NUM_SENSORS];
 static float    key_ema[NUM_SENSORS];
@@ -384,6 +430,128 @@ static uint32_t key_t0[NUM_SENSORS];      // µs timestamp of START crossing
 static uint8_t  key_vel[NUM_SENSORS];     // last key-down velocity, 1..127
 static float    rest_acc[NUM_SENSORS];
 static uint32_t rest_scans = 0;           // < REST_CAL_SCANS while calibrating
+
+// --- MIDI / MPE --------------------------------------------------------------
+
+static uint8_t  mpe_key_of_channel[MPE_MEMBER_COUNT];  // NUM_SENSORS = free
+static uint32_t mpe_channel_age[MPE_MEMBER_COUNT];
+static uint8_t  mpe_channel_of_key[NUM_SENSORS];       // MPE_MEMBER_COUNT = none
+static uint32_t mpe_alloc_counter = 0;
+volatile uint8_t events_text_on = 1;   // 'e' toggles the EV text lines
+volatile uint8_t mpe_setup_req = 0;    // 'M' re-sends the MPE configuration
+
+// Integer divide, rounding to nearest (C division truncates toward zero).
+static int32_t div_round(int32_t num, int32_t den)
+{
+  return (num >= 0) ? (num + den / 2) / den : (num - den / 2) / den;
+}
+
+static void midi_send(uint8_t cin, uint8_t status, uint8_t d1, uint8_t d2)
+{
+  const uint8_t pkt[4] = { cin, status, d1, d2 };  // cable 0
+  USBD_MIDI_Send(pkt);
+}
+
+// Whole board's pitch map, in integers: 31-EDO step -> nearest MIDI note plus
+// a bend for the remainder. No floating point and no Hz: MIDI wants note+bend.
+static void midi_build_pitch_table(void)
+{
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    int32_t x = sensor_grid[i][0];
+    int32_t y = sensor_grid[i][1];
+    // Wicki-Hayden basis, vertically flipped so fifths run up-right as the
+    // standard layout has them. meantonal's WICKI_FROM composed with the
+    // axial vertical flip (x,y)->(x+y,-y) reduces to w = x - 2y, h = -y.
+    int32_t w = x - 2 * y + TUNE_W0;
+    int32_t h = -y + TUNE_H0;
+    int32_t step = EDO_WHOLE_TONE * w + EDO_DIATONIC_SEMI * h;
+
+    // note = round(step * 12 / 31); the +15 is exact rounding here because
+    // step*12/31 never has a fractional part between 15/31 and 1/2.
+    int32_t note = (step * 12 + 15) / EDO_STEPS;
+    // Remaining offset, carried as cents x 31 to stay in integers.
+    int32_t off31 = step * 1200 - note * 100 * EDO_STEPS;
+    int32_t bend = 8192 + div_round(off31 * 8192, MPE_BEND_CENTS * EDO_STEPS);
+
+    if (note < 0 || note > 127 || bend < 0 || bend > 16383) {
+      key_playable[i] = 0;
+      key_midi[i] = 0;
+      key_bend[i] = 8192;
+    } else {
+      key_playable[i] = 1;
+      key_midi[i] = (uint8_t)note;
+      key_bend[i] = (uint16_t)bend;
+    }
+  }
+  for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
+    mpe_key_of_channel[c] = NUM_SENSORS;
+    mpe_channel_age[c] = 0;
+  }
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    mpe_channel_of_key[i] = MPE_MEMBER_COUNT;
+  }
+}
+
+// MPE Configuration Message: lower zone, master channel 1, 15 member channels,
+// then pitch-bend sensitivity on each member channel.
+static void midi_send_mpe_setup(void)
+{
+  midi_send(MIDI_CIN_CC, 0xB0, 101, 0);   // RPN MSB
+  midi_send(MIDI_CIN_CC, 0xB0, 100, 6);   // RPN LSB = 6 (MCM)
+  midi_send(MIDI_CIN_CC, 0xB0, 6, MPE_MEMBER_COUNT);
+
+  for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
+    uint8_t status = (uint8_t)(0xB0 | (MPE_MEMBER_FIRST + c));
+    midi_send(MIDI_CIN_CC, status, 101, 0);  // RPN 0 = pitch bend sensitivity
+    midi_send(MIDI_CIN_CC, status, 100, 0);
+    midi_send(MIDI_CIN_CC, status, 6, MPE_BEND_SEMITONES);
+    midi_send(MIDI_CIN_CC, status, 38, 0);
+  }
+}
+
+static void midi_note_on(uint8_t key, uint8_t vel)
+{
+  if (!key_playable[key] || mpe_channel_of_key[key] != MPE_MEMBER_COUNT) {
+    return;
+  }
+  // Least-recently-used free channel, stealing the oldest voice if all busy.
+  uint8_t pick = 0;
+  uint32_t best = 0xFFFFFFFFu;
+  for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
+    uint32_t age = (mpe_key_of_channel[c] == NUM_SENSORS) ? mpe_channel_age[c]
+                                                          : mpe_channel_age[c] + 0x80000000u;
+    if (age < best) {
+      best = age;
+      pick = c;
+    }
+  }
+  uint8_t stolen = mpe_key_of_channel[pick];
+  uint8_t status_ch = (uint8_t)(MPE_MEMBER_FIRST + pick);
+  if (stolen != NUM_SENSORS) {
+    midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | status_ch), key_midi[stolen], 0);
+    mpe_channel_of_key[stolen] = MPE_MEMBER_COUNT;
+  }
+
+  mpe_key_of_channel[pick] = key;
+  mpe_channel_of_key[key] = pick;
+  mpe_channel_age[pick] = ++mpe_alloc_counter;
+
+  // Bend first so the note starts already in tune.
+  midi_send(MIDI_CIN_PITCHBEND, (uint8_t)(0xE0 | status_ch),
+            (uint8_t)(key_bend[key] & 0x7F), (uint8_t)((key_bend[key] >> 7) & 0x7F));
+  midi_send(MIDI_CIN_NOTE_ON, (uint8_t)(0x90 | status_ch), key_midi[key], vel);
+}
+
+static void midi_note_off(uint8_t key)
+{
+  uint8_t c = mpe_channel_of_key[key];
+  if (c >= MPE_MEMBER_COUNT) {
+    return;
+  }
+  midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | (MPE_MEMBER_FIRST + c)), key_midi[key], 0);
+  mpe_key_of_channel[c] = NUM_SENSORS;
+  mpe_channel_of_key[key] = MPE_MEMBER_COUNT;
+}
 
 // Restart the boot-time rest calibration (also triggered by the 'r' command).
 static void keys_recalibrate_rest(void)
@@ -436,9 +604,12 @@ static void keys_process(uint32_t t_us)
           uint32_t dt = t_us - key_t0[i];   // wrap-safe
           key_vel[i] = velocity_from_dt(dt);
           key_state[i] = KS_HELD;
-          snprintf(line, sizeof(line), "EV %u DOWN vel=%u dt_us=%lu\r\n",
-                   i, key_vel[i], (unsigned long)dt);
-          cdc_send_text(line);
+          midi_note_on(i, key_vel[i]);
+          if (events_text_on) {
+            snprintf(line, sizeof(line), "EV %u DOWN vel=%u dt_us=%lu\r\n",
+                     i, key_vel[i], (unsigned long)dt);
+            cdc_send_text(line);
+          }
         } else if (pos < KEY_ABORT_POS) {
           key_state[i] = KS_IDLE;           // grazed, never committed
         }
@@ -447,8 +618,11 @@ static void keys_process(uint32_t t_us)
         if (pos < KEY_RELEASE_POS) {
           key_state[i] = KS_IDLE;
           key_vel[i] = 0;
-          snprintf(line, sizeof(line), "EV %u UP\r\n", i);
-          cdc_send_text(line);
+          midi_note_off(i);
+          if (events_text_on) {
+            snprintf(line, sizeof(line), "EV %u UP\r\n", i);
+            cdc_send_text(line);
+          }
         }
         break;
     }
@@ -460,13 +634,23 @@ static void keys_process(uint32_t t_us)
 //   i        info line          s/x      start/stop streaming
 //   d<N>     stream every Nth scan       l        toggle LED visualization
 //   r        redo the rest calibration (hands off the keys)
+//   C        followed by 93 bytes: RGB for all 31 LEDs, LED-chain order
 void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
 {
   static uint8_t collecting_decim = 0;
   static uint32_t decim_val = 0;
 
+  last_rx_tick = HAL_GetTick();
   for (uint32_t i = 0; i < len; i++) {
     uint8_t c = buf[i];
+    if (color_rx_active) {
+      color_rx_buf[color_rx_count++] = c;
+      if (color_rx_count >= NUM_LEDS * 3) {
+        color_rx_active = 0;
+        color_rx_ready = 1;
+      }
+      continue;
+    }
     if (collecting_decim) {
       if (c >= '0' && c <= '9') {
         decim_val = decim_val * 10 + (c - '0');
@@ -482,6 +666,9 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       case 'l': led_viz_on ^= 1; break;
       case 'r': keys_recalibrate_rest(); break;
       case 'd': collecting_decim = 1; decim_val = 0; break;
+      case 'C': color_rx_active = 1; color_rx_count = 0; break;
+      case 'M': mpe_setup_req = 1; break;
+      case 'e': events_text_on ^= 1; break;
       default: break;  // ignore CR/LF and unknown bytes
     }
   }
@@ -541,6 +728,7 @@ int main(void)
   bootloader_flag = 0;
 
   dwt_init();
+  midi_build_pitch_table();
 
   // Simple test patterns (shortened so flash-test cycles stay quick)
   fill_solid(5, 0, 0);     // dim red
@@ -562,6 +750,14 @@ int main(void)
   fill_bosanquet(5, 5, 25, 5, 25, 5, 20, 20, 2, 25, 10, 2, 25, 2, 2);
   show_leds();
 
+  // The boot pattern doubles as the initial background until a host pushes
+  // colors over CDC (led_data is GRB; led_background is RGB).
+  for (int i = 0; i < NUM_LEDS; i++) {
+    led_background[i][0] = led_data[i][1];
+    led_background[i][1] = led_data[i][0];
+    led_background[i][2] = led_data[i][2];
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -570,6 +766,7 @@ int main(void)
   uint32_t rate_scans = 0;
   uint32_t rate_t0 = HAL_GetTick();
   uint32_t last_led_tick = 0;
+  uint8_t  mpe_setup_done = 0;
 
   while (1)
   {
@@ -583,6 +780,19 @@ int main(void)
     rate_scans++;
 
     uint32_t tick = HAL_GetTick();
+
+    // Announce the MPE zone once the host has configured the device (and on
+    // demand via 'M'), then keep the MIDI endpoint draining.
+    if (mpe_setup_req || (!mpe_setup_done && USBD_MIDI_Ready() && tick > 1500)) {
+      mpe_setup_req = 0;
+      mpe_setup_done = 1;
+      midi_send_mpe_setup();
+    }
+    if (!USBD_MIDI_Ready()) {
+      mpe_setup_done = 0;   // re-announce after a re-enumeration
+    }
+    USBD_MIDI_Flush();
+
     if (tick - rate_t0 >= 1000) {
       scan_hz = rate_scans * 1000u / (tick - rate_t0);
       rate_scans = 0;
@@ -602,17 +812,50 @@ int main(void)
       cdc_send_text(line);
     }
 
-    // Velocity feedback on the LEDs: a held key glows green with brightness
-    // proportional to its strike velocity. Decimated so the WS2812 DMA
-    // (~1.6 ms per refresh) doesn't eat into the scan rate; 'l' toggles it
-    // off for clean noise measurements.
-    if (led_viz_on && (tick - last_led_tick) >= 30) {
+    // Apply a completed host color frame; abort one that stalled mid-transfer.
+    if (color_rx_ready) {
+      color_rx_ready = 0;
+      memcpy(led_background, (const void *)color_rx_buf, sizeof(led_background));
+    }
+    if (color_rx_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
+      color_rx_active = 0;
+    }
+
+    // LED rendering, decimated so the WS2812 DMA (~1.6 ms per refresh)
+    // doesn't eat into the scan rate. Base coat = host-set background colors;
+    // a held key's own color is lifted toward full brightness with strike
+    // velocity (unlit keys get a faint warm glow so feedback never vanishes).
+    // 'l' blanks the LEDs entirely for clean noise measurements.
+    if (tick - last_led_tick >= 30) {
       last_led_tick = tick;
-      fill_solid(0, 0, 0);
-      for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-        if (key_state[i] == KS_HELD) {
-          // vel 1..127 maps directly to green, on the pressed key's own LED
-          set_pixel(led_for_sensor[i], 0, key_vel[i], 0);
+      if (!led_viz_on) {
+        fill_solid(0, 0, 0);
+      } else {
+        for (uint8_t l = 0; l < NUM_LEDS; l++) {
+          set_pixel(l, led_background[l][0], led_background[l][1], led_background[l][2]);
+        }
+        for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+          if (key_state[i] != KS_HELD) continue;
+          uint8_t l = led_for_sensor[i];
+          uint32_t r = led_background[l][0];
+          uint32_t g = led_background[l][1];
+          uint32_t b = led_background[l][2];
+          uint32_t maxc = r > g ? r : g;
+          if (b > maxc) maxc = b;
+          if (maxc == 0) {
+            uint32_t w = 10 + (key_vel[i] * 60u) / 127u;
+            set_pixel(l, (uint8_t)w, (uint8_t)w, (uint8_t)(w * 3 / 4));
+          } else if (maxc < GLOW_TARGET) {
+            // scale = (maxc*127 + (target-maxc)*vel) / (maxc*127):
+            // 1.0 at vel 0, target/maxc at vel 127 — same hue, brighter
+            uint32_t denom = maxc * 127u;
+            uint32_t num = denom + (GLOW_TARGET - maxc) * key_vel[i];
+            uint32_t rr = r * num / denom, gg = g * num / denom, bb = b * num / denom;
+            set_pixel(l, (uint8_t)(rr > 255 ? 255 : rr),
+                         (uint8_t)(gg > 255 ? 255 : gg),
+                         (uint8_t)(bb > 255 ? 255 : bb));
+          }
+          // colors already at/above GLOW_TARGET stay as they are
         }
       }
       show_leds();

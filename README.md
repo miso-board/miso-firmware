@@ -46,10 +46,69 @@ interface on the same USB-C port:
 | `s` / `x` | Start / stop streaming scan frames |
 | `d<N>`  | Stream every Nth scan (default 2) |
 | `l`     | Toggle the LED velocity feedback (off for clean noise measurements) |
+| `M`     | Re-send the MPE configuration (zone + pitch-bend range) |
+| `e`     | Toggle the `EV` text event lines |
 | `r`     | Redo the boot-time rest calibration (hands off the keys for ~0.1 s) |
+| `C` + 93 bytes | Set all LED background colors: 31 × RGB, LED-chain order (a stalled frame aborts after 200 ms) |
 
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
 (little-endian; checksum = byte sum of the payload).
+
+## MIDI + MPE output
+
+The board enumerates as a **composite USB device**: the CDC serial port the
+companion uses *and* a USB-MIDI port named "Miso", simultaneously — so colours
+can be retuned while playing. The composite descriptor and class driver are
+hand-written in `USB_DEVICE/App/usbd_composite.c` (CubeMX only generates
+single-class devices); CDC keeps its original endpoints and its app-layer API,
+so the companion protocol was unaffected.
+
+Layout is **Wicki-Hayden in 31-EDO**. Each key's pitch is derived with integer
+arithmetic only — MIDI wants a note number and a bend, never a frequency:
+
+```
+w = x - 2y + 34 ,  h = -y + 15      Wicki-Hayden basis change + anchor
+step = 5w + 3h                      31-EDO step (whole tone 5, semitone 3)
+note = round(step * 12 / 31)        nearest 12-EDO MIDI note
+bend = 8192 + round((step*1200 - note*3100) * 8192 / (4800 * 31))
+```
+
+Whole tones run left to right, fifths up-right and fourths up-left. That basis
+is meantonal's `WICKI_FROM` composed with a vertical flip of the board; note
+that a vertical flip in a skewed axial basis is `(x, y) -> (x + y, -y)`, not
+`(x, -y)` — plain negation breaks hex adjacency and turns one diagonal into a
+major 6th.
+
+The music theory behind those constants lives in the companion's
+`src/lib/tuning.ts`, which uses [meantonal](https://meantonal.org/) — the
+firmware only needs the reduced formulas. Both were cross-checked: identical
+note numbers for all 31 keys and identical bend values.
+
+Output is **MPE lower zone** — master channel 1, member channels 2–16, so 15
+simultaneous notes each with their own pitch bend carrying the microtonal
+offset. The zone is announced (MCM + RPN 0 pitch-bend sensitivity, ±48
+semitones) once the host configures the device. Note-on sends the bend first
+so notes never start out of tune, and channels are allocated least-recently-
+used, stealing the oldest voice when all 15 are busy.
+
+The companion's **MIDI tab** monitors this over Web MIDI and checks each
+received note against what meantonal says that key should sound.
+
+### After regenerating code with CubeMX
+
+Four edits to generated files must be re-applied (CubeMX will revert them):
+
+1. `USB_DEVICE/Target/usbd_conf.h` — `USBD_MAX_NUM_INTERFACES` to `4U`
+2. `USB_DEVICE/Target/usbd_conf.c` — the whole PMA block. CubeMX regenerates
+   buffers starting at `0x18`, which only clears a 3-endpoint-pair buffer
+   descriptor table; with MIDI on EP3 the table reaches `0x20` and silently
+   corrupts the EP0 OUT buffer (symptom: the device enumerates and CDC works,
+   but MIDI never comes online). Buffers must start at `0x40`, and the two
+   MIDI endpoints `0x83`/`0x03` must be added.
+3. `USB_DEVICE/App/usbd_desc.c` — device class `0xEF/0x02/0x01`, PID 22337,
+   product string "Miso"
+4. `USB_DEVICE/App/usb_device.c` — register `USBD_Composite` and
+   `USBD_Composite_RegisterCDCInterface` instead of the CDC equivalents
 
 ## Board layout
 
@@ -85,12 +144,26 @@ included so the curve can be refit offline), and falling below 30% fires
 strike velocity. Tuning constants (`KEY_*_POS`, `VEL_DT_FAST_US`,
 `VEL_DT_SLOW_US`) live at the top of `main.c`.
 
-**Companion app** (`companion/`): Svelte 5 + TypeScript + Tailwind, built with
-Vite. It shows live per-key levels with min/max watermarks, per-key stats
+**Companion app** (`companion/`): Svelte 5 + TypeScript + Tailwind + [meantonal](https://meantonal.org/),
+built with Vite. It shows live per-key levels with min/max watermarks, per-key stats
 (rest / min / max / noise σ), and auto-triggered press-waveform capture with
-20→70% transit times — the groundwork for velocity calibration. Today it is
-the calibration instrument; it is structured to grow into the end-user
-configurator (key colors, pitch mappings).
+20→70% transit times — plus the **Key colors** tab: a click-to-paint view of
+the physical board (axial hex rendering) with named color mappings saved in
+the browser and streamed to the board live, either painted by hand or generated
+procedurally. Pitch mapping is next.
+
+The **procedural generator** colours each key by the accidental of the note
+that lands on it — the key's Bosanquet row — via meantonal. That library
+represents a pitch as a vector of whole steps and diatonic semitones above
+C₋₁, with the octave as (5,2) and a sharp as (1,−1): exactly this board's axial
+basis, so a grid coordinate is a pitch vector plus an anchor and
+`pitch.accidental` *is* the row. A palette of N colours covers N contiguous
+accidentals and wraps for rows beyond it (3 colours over the Miso's 5 rows
+gives red green blue red green). Layout (Bosanquet, or Wicki-Hayden via
+meantonal's own `WICKI_FROM` basis change), the starting accidental, an (x, y)
+placement offset and LED brightness are all adjustable, and the whole scheme
+streams to the board as you tweak it. Board rendering, note names and the
+layout bases live in `companion/src/lib/tuning.ts`.
 
 For live board data, run it locally in Chrome (Web Serial needs a top-level
 secure page; the published Claude artifact is wrapped in an iframe that

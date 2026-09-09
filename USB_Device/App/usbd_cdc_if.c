@@ -23,6 +23,7 @@
 
 /* USER CODE BEGIN INCLUDE */
 #include "main.h"
+#include "usbd_composite.h"
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -152,9 +153,7 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 static int8_t CDC_Init_FS(void)
 {
   /* USER CODE BEGIN 3 */
-  /* Set Application Buffers */
-  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
-  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
+  /* Buffers are owned by the composite class driver. */
   return (USBD_OK);
   /* USER CODE END 3 */
 }
@@ -261,9 +260,8 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  /* The composite driver re-arms the endpoint after this returns. */
   Miso_CDC_OnRx(Buf, *Len);
-  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
-  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
   /* USER CODE END 6 */
 }
@@ -283,12 +281,7 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
-  USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
-  if (hcdc->TxState != 0){
-    return USBD_BUSY;
-  }
-  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
-  result = USBD_CDC_TransmitPacket(&hUsbDeviceFS);
+  result = USBD_Composite_CDC_Transmit(&hUsbDeviceFS, Buf, Len);
   /* USER CODE END 7 */
   return result;
 }
@@ -325,11 +318,7 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   */
 uint8_t CDC_IsTxBusy(void)
 {
-  USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
-  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED || hcdc == NULL) {
-    return 1;
-  }
-  return (hcdc->TxState != 0);
+  return USBD_Composite_CDC_IsBusy(&hUsbDeviceFS);
 }
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */

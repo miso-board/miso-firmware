@@ -7,8 +7,12 @@
   import LiveBars from "./components/LiveBars.svelte";
   import PressScope from "./components/PressScope.svelte";
   import StatsTable from "./components/StatsTable.svelte";
+  import ColorsTab from "./components/ColorsTab.svelte";
+  import MidiMonitor from "./components/MidiMonitor.svelte";
+  import { load as loadColorMaps, pushToBoard } from "./lib/colorMaps.svelte";
 
   let decim = $state("2");
+  let activeTab = $state<"calibrate" | "colors" | "midi">("calibrate");
 
   function captureRest() {
     toast("Capturing rest — hands off the keys…");
@@ -53,6 +57,7 @@
     await serial.send("i");
     await serial.send(`d${decim}\n`);
     await serial.send("s");
+    await pushToBoard(); // restore the active color mapping on the LEDs
   }
 
   async function disconnect() {
@@ -75,6 +80,7 @@
   onMount(() => {
     ui.serialSupported = serial.serialSupported();
     engine.onTracesChanged(refreshTraces);
+    loadColorMaps();
     startSim();
     const restTimer = setTimeout(captureRest, 800);
 
@@ -134,12 +140,19 @@
 </header>
 
 <nav class="flex gap-0.5 border-b px-5" style="background: var(--panel); border-color: var(--line)">
-  <button class="border-b-2 px-3.5 py-2 font-semibold" style="border-color: var(--accent)">Calibrate</button>
-  {#each ["Key colors", "Pitch mapping"] as t}
-    <button class="cursor-default border-b-2 border-transparent px-3.5 py-2 font-semibold opacity-50" disabled style="color: var(--text-dim)">
-      {t}<span class="ml-1.5 text-[9px] uppercase tracking-widest" style="color: var(--accent)">soon</span>
-    </button>
+  {#each [["calibrate", "Calibrate"], ["colors", "Key colors"], ["midi", "MIDI"]] as [id, label]}
+    <button
+      class="cursor-pointer border-b-2 px-3.5 py-2 font-semibold"
+      style="border-color: {activeTab === id ? 'var(--accent)' : 'transparent'};
+             color: {activeTab === id ? 'var(--text)' : 'var(--text-dim)'}"
+      role="tab"
+      aria-selected={activeTab === id}
+      onclick={() => (activeTab = id as typeof activeTab)}
+    >{label}</button>
   {/each}
+  <button class="cursor-default border-b-2 border-transparent px-3.5 py-2 font-semibold opacity-50" disabled style="color: var(--text-dim)">
+    Pitch mapping<span class="ml-1.5 text-[9px] uppercase tracking-widest" style="color: var(--accent)">soon</span>
+  </button>
 </nav>
 
 <main class="mx-auto max-w-[1180px] px-5 pt-4 pb-7">
@@ -168,6 +181,7 @@
     </div>
   {/if}
 
+  {#if activeTab === "calibrate"}
   <section
     class="mb-3.5 rounded-lg border p-4"
     style="background: var(--panel); border-color: var(--line); box-shadow: var(--shadow)"
@@ -251,12 +265,17 @@
       {/if}
     </section>
   </div>
+  {:else if activeTab === "colors"}
+    <ColorsTab />
+  {:else}
+    <MidiMonitor />
+  {/if}
 </main>
 
 <footer class="mx-auto max-w-[1180px] px-5 pb-8 text-xs leading-relaxed" style="color: var(--text-dim)">
   Protocol: commands <code class="chip">i</code> info · <code class="chip">s</code>/<code class="chip">x</code>
   stream on/off · <code class="chip">d&lt;N&gt;</code> decimation · <code class="chip">l</code> LED toggle ·
-  <code class="chip">r</code> redo rest calibration.
+  <code class="chip">r</code> redo rest calibration · <code class="chip">C</code>+93B set LED colors (RGB, chain order).
   Scan frame: <code class="chip">A5 5A 01 · u32 t_µs · 31×u16 · u8 checksum</code> (little-endian,
   checksum = byte sum of payload). Firmware: <code class="chip">Core/Src/main.c</code> in the Miso repo.
 </footer>

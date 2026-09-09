@@ -64,6 +64,13 @@ export async function send(s: string): Promise<void> {
   } catch {}
 }
 
+export async function sendBytes(bytes: Uint8Array): Promise<void> {
+  if (!writer) return;
+  try {
+    await writer.write(bytes);
+  } catch {}
+}
+
 async function readLoop(): Promise<void> {
   while (port?.readable && active) {
     reader = port.readable.getReader();

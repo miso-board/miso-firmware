@@ -27,7 +27,7 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN Includes */
-
+#include "usbd_composite.h"
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN PV */
@@ -73,10 +73,12 @@ void MX_USB_Device_Init(void)
   if (USBD_Init(&hUsbDeviceFS, &CDC_Desc, DEVICE_FS) != USBD_OK) {
     Error_Handler();
   }
-  if (USBD_RegisterClass(&hUsbDeviceFS, &USBD_CDC) != USBD_OK) {
+  /* Composite CDC + MIDI instead of the generated CDC-only class.
+     Re-apply this after any CubeMX regeneration (see README checklist). */
+  if (USBD_RegisterClass(&hUsbDeviceFS, &USBD_Composite) != USBD_OK) {
     Error_Handler();
   }
-  if (USBD_CDC_RegisterInterface(&hUsbDeviceFS, &USBD_Interface_fops_FS) != USBD_OK) {
+  if (USBD_Composite_RegisterCDCInterface(&hUsbDeviceFS, &USBD_Interface_fops_FS) != USBD_OK) {
     Error_Handler();
   }
   if (USBD_Start(&hUsbDeviceFS) != USBD_OK) {

@@ -43,3 +43,48 @@ export const SENSOR_FOR_LED: readonly number[] = (() => {
 export const SENSOR_POS: readonly (readonly [number, number])[] = LED_FOR_SENSOR.map(
   (led) => LED_POS[led],
 );
+
+// ---------------------------------------------------------------------------
+// Screen geometry
+// ---------------------------------------------------------------------------
+
+/**
+ * Octave direction in axial coordinates.
+ *
+ * Inferred from the Bosanquet boot pattern, whose accidental classes fall in
+ * 3-wide bands of (x − 2y): that reads as (1,0) = whole tone = 5 steps of
+ * 31-EDO and (0,1) = diatonic semitone = 3 steps, making (5,2) exactly 31
+ * steps — one octave. Confirm this before the pitch mapping depends on it.
+ */
+export const OCTAVE_AXIAL: readonly [number, number] = [5, 2];
+
+const SQ3 = Math.sqrt(3);
+
+/** Unrotated pointy-top axial layout, in units of the hex radius. */
+function axialRaw(x: number, y: number): [number, number] {
+  return [SQ3 * (x + y / 2), 1.5 * y];
+}
+
+/**
+ * Rotation (radians) that lays the octave direction on the horizontal — the
+ * standard Bosanquet orientation. Applied counter-clockwise on screen, where
+ * y grows downward. Derived from OCTAVE_AXIAL so it stays correct if the
+ * underlying mapping ever changes.
+ */
+export const BOARD_ROTATION: number = (() => {
+  const [px, py] = axialRaw(OCTAVE_AXIAL[0], OCTAVE_AXIAL[1]);
+  return Math.atan2(py, px);
+})();
+
+/** Axial coordinate to rotated screen position, in units of the hex radius. */
+export function axialToPixel(x: number, y: number, size = 1): [number, number] {
+  const [px, py] = axialRaw(x, y);
+  const c = Math.cos(BOARD_ROTATION);
+  const s = Math.sin(BOARD_ROTATION);
+  return [size * (px * c + py * s), size * (-px * s + py * c)];
+}
+
+/** Rotated screen position of each LED, in units of the hex radius. */
+export const LED_PIXEL: readonly (readonly [number, number])[] = LED_POS.map(([x, y]) =>
+  axialToPixel(x, y),
+);
