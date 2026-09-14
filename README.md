@@ -289,22 +289,33 @@ coordinate → (board, sensor) is unambiguous.
 
 ### What tiling does to pitch
 
-Geometry and tuning are separate questions, and the answer here is not obvious.
-Pitch is a linear function of absolute coordinate, so a tiled grid is seamless —
-but under the firmware's Wicki-Hayden basis the two tiling vectors are wildly
-asymmetric:
+Geometry and tuning are separate questions. A board displacement is a vector in
+the two-dimensional pitch space `(w, h)` — whole tones and diatonic semitones —
+which specifies a **spelled** interval exactly. Reducing it to 12-TET semitones
+or MIDI note numbers is lossy: that map has a non-trivial null space, and
+different tunings temper out different intervals, so the projection hides
+something different in each case.
 
-| Direction | Wicki-Hayden (firmware) | Bosanquet |
-|---|---|---|
-| right `(5,2)` | **−1 step = −38.7 cents** | +1 octave exactly |
-| down `(−3,5)` | −80 steps = −2.58 octaves | unison |
+| Layout | Board move | `(dw, dh)` | 31-EDO | 12-TET | Example |
+|---|---|---|---|---|---|
+| Wicki-Hayden | right `(5,2)` | `(1,−2)` | −1 step | **0** | C4 → B♯3, an enharmonic diesis |
+| Wicki-Hayden | down `(−3,5)` | `(−13,−5)` | −80 steps | −31 | C6 → F3 |
+| Bosanquet | right `(5,2)` | `(5,2)` | +31 steps | +12 | C4 → C5, an octave |
+| Bosanquet | down `(−3,5)` | `(−3,5)` | **0** | −1 | C4 → E♭♭♭♭♭4 |
 
-So a **horizontal** row adds keys but almost no range (1 board 2.52 octaves,
-3 boards 2.58, and at three wide 12 of the 93 pitches duplicate), while a
-vertical stack adds ~2.6 octaves per board. In Wicki-Hayden the horizontal axis
-is whole tones and the vertical is fifths, and `(5,2)` nearly cancels. Switching
-the firmware to the Bosanquet basis would invert this. Worth deciding before
-building a wide row.
+The two bold entries pull in opposite directions, which is the whole point: the
+diesis is a real 31-EDO interval that *vanishes* in 12-TET, while Bosanquet's
+vertical step is a real 12-TET semitone that *31-EDO* tempers to nothing. Either
+one described by its MIDI note number would be a description of the projection
+artefact rather than of the interval.
+
+Practically, under Wicki-Hayden a horizontal row transposes each successive board
+down by one enharmonic diesis, so a wide row deepens the enharmonic resources
+rather than extending range — three boards wide gives 93 keys sounding 81
+distinct 31-EDO pitches. The range lies vertically instead, at two octaves and a
+fifth per board, which is exactly the direction that needs the TOP port. Under
+Bosanquet the two directions swap roles: horizontal gives exact octaves, vertical
+gives boards that sound alike but are spelled five flats apart.
 
 ### Topology: a spanning tree
 
