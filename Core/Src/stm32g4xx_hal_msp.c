@@ -200,6 +200,27 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
 
     /* USER CODE BEGIN LPUART1_MspInit 1 */
 
+    // Inter-board link: TX must NOT idle driven. A push-pull 3.3V TX pin feeds
+    // an unpowered neighbour's 3V3 rail through its RX ESD diode and stops it
+    // booting, so the pin parks in high-Z and link.c only drives it once a live
+    // board has been heard. RX gets the internal pull-up: that holds the line at
+    // UART idle *and* makes a dead neighbour readable as a low (~0.7V clamp).
+    // Runs before HAL_UART_Init() sets TE, so the pin is never driven at all.
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF12_LPUART1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    HAL_NVIC_SetPriority(LPUART1_IRQn, 1, 0);   // below USB_LP (0), above SysTick (15)
+    HAL_NVIC_EnableIRQ(LPUART1_IRQn);
+
     /* USER CODE END LPUART1_MspInit 1 */
   }
   else if(huart->Instance==USART1)
@@ -233,6 +254,27 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* USER CODE BEGIN USART1_MspInit 1 */
+
+    // Inter-board link: TX must NOT idle driven. A push-pull 3.3V TX pin feeds
+    // an unpowered neighbour's 3V3 rail through its RX ESD diode and stops it
+    // booting, so the pin parks in high-Z and link.c only drives it once a live
+    // board has been heard. RX gets the internal pull-up: that holds the line at
+    // UART idle *and* makes a dead neighbour readable as a low (~0.7V clamp).
+    // Runs before HAL_UART_Init() sets TE, so the pin is never driven at all.
+    GPIO_InitStruct.Pin = GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_10;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);   // below USB_LP (0), above SysTick (15)
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
 
     /* USER CODE END USART1_MspInit 1 */
   }
@@ -275,6 +317,27 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     /* USER CODE BEGIN USART2_MspInit 1 */
+
+    // Inter-board link: TX must NOT idle driven. A push-pull 3.3V TX pin feeds
+    // an unpowered neighbour's 3V3 rail through its RX ESD diode and stops it
+    // booting, so the pin parks in high-Z and link.c only drives it once a live
+    // board has been heard. RX gets the internal pull-up: that holds the line at
+    // UART idle *and* makes a dead neighbour readable as a low (~0.7V clamp).
+    // Runs before HAL_UART_Init() sets TE, so the pin is never driven at all.
+    GPIO_InitStruct.Pin = GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);   // below USB_LP (0), above SysTick (15)
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
 
     /* USER CODE END USART2_MspInit 1 */
   }

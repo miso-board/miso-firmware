@@ -27,6 +27,7 @@
 #include <math.h>
 #include "usbd_cdc_if.h"
 #include "usbd_composite.h"
+#include "link.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,7 +58,7 @@
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.4.0"
+#define FW_VERSION          "miso 0.5.0"
 #define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
@@ -138,6 +139,26 @@ static void MX_TIM1_Init(void);
 // bootloader expects to start from those conditions.
 static void bootloader_check(void)
 {
+  // *Why* we reset matters. The double-tap gesture is about the NRST button,
+  // so only a pin reset (or our own NVIC_SystemReset) may be read as a tap.
+  // The comment on bootloader_flag assumes power-off clears .noinit RAM, but a
+  // rail that sags without fully collapsing keeps it — and a bouncing supply
+  // (a pogo-pin mate, a hand-plugged USB connector) produces exactly the burst
+  // of resets that looks like a deliberate double tap. The board then boots
+  // into the ROM bootloader with its LEDs dark and reads as dead.
+  // Flags are cleared here so each boot only ever sees its own reset cause.
+  uint32_t csr = RCC->CSR;
+  RCC->CSR |= RCC_CSR_RMVF;
+
+  // BORRSTF covers power-on and brown-out alike. Note a POR asserts NRST
+  // internally and so sets PINRSTF too, which is why this has to be checked
+  // first rather than just testing for a pin reset.
+  if ((csr & RCC_CSR_BORRSTF) ||
+      !(csr & (RCC_CSR_PINRSTF | RCC_CSR_SFTRSTF))) {
+    bootloader_flag = 0;  // stale magic, or uninitialized RAM after a POR
+    return;
+  }
+
   if (bootloader_flag != BOOTLOADER_MAGIC) {
     return;
   }
@@ -341,6 +362,8 @@ volatile uint8_t  stream_on   = 0;
 volatile uint32_t stream_decim = STREAM_DECIM_DEFAULT;
 volatile uint8_t  led_viz_on  = 1;
 volatile uint8_t  info_req    = 0;
+volatile uint8_t  link_req    = 0;
+volatile uint8_t  dfu_req     = 0;
 uint32_t scan_hz = 0;  // measured full-scan rate, updated once per second
 
 // Background LED colors (RGB, LED-chain order), pushed by the host via the
@@ -634,11 +657,14 @@ static void keys_process(uint32_t t_us)
 //   i        info line          s/x      start/stop streaming
 //   d<N>     stream every Nth scan       l        toggle LED visualization
 //   r        redo the rest calibration (hands off the keys)
+//   k        dump the state of the four inter-board links
+//   B!       reboot into the USB DFU bootloader (two bytes, to avoid misfires)
 //   C        followed by 93 bytes: RGB for all 31 LEDs, LED-chain order
 void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
 {
   static uint8_t collecting_decim = 0;
   static uint32_t decim_val = 0;
+  static uint8_t dfu_armed = 0;
 
   last_rx_tick = HAL_GetTick();
   for (uint32_t i = 0; i < len; i++) {
@@ -651,6 +677,13 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       }
       continue;
     }
+    // 'B' then '!' enters DFU. Two bytes rather than one so a stray character
+    // on the port can never reboot the board out from under the host.
+    if (dfu_armed) {
+      dfu_armed = 0;
+      if (c == '!') { dfu_req = 1; continue; }
+      // not the confirmation: fall through so c is still read as a command
+    }
     if (collecting_decim) {
       if (c >= '0' && c <= '9') {
         decim_val = decim_val * 10 + (c - '0');
@@ -661,6 +694,8 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
     }
     switch (c) {
       case 'i': info_req = 1; break;
+      case 'k': link_req = 1; break;
+      case 'B': dfu_armed = 1; break;
       case 's': stream_on = 1; break;
       case 'x': stream_on = 0; break;
       case 'l': led_viz_on ^= 1; break;
@@ -729,6 +764,7 @@ int main(void)
 
   dwt_init();
   midi_build_pitch_table();
+  link_init();
 
   // Simple test patterns (shortened so flash-test cycles stay quick)
   fill_solid(5, 0, 0);     // dim red
@@ -793,6 +829,8 @@ int main(void)
     }
     USBD_MIDI_Flush();
 
+    link_tick(tick);
+
     if (tick - rate_t0 >= 1000) {
       scan_hz = rate_scans * 1000u / (tick - rate_t0);
       rate_scans = 0;
@@ -805,11 +843,41 @@ int main(void)
 
     if (info_req) {
       info_req = 0;
-      char line[96];
-      snprintf(line, sizeof(line), "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u\r\n",
+      char line[128];
+      snprintf(line, sizeof(line),
+               "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u links=%c%c%c%c usb=%u\r\n",
                FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
-               stream_on, led_viz_on);
+               stream_on, led_viz_on,
+               link_state_char(LINK_PORT_TOP), link_state_char(LINK_PORT_BOTTOM),
+               link_state_char(LINK_PORT_LEFT), link_state_char(LINK_PORT_RIGHT),
+               link_self_has_usb());
       cdc_send_text(line);
+    }
+
+    if (link_req) {
+      link_req = 0;
+      for (link_port_t lp = 0; lp < LINK_PORT_COUNT; lp++) {
+        uint32_t rx = 0, tx = 0, err = 0;
+        link_stats(lp, &rx, &tx, &err);
+        char line[128];
+        snprintf(line, sizeof(line),
+                 "LINK %-6s %-9s peer=%08lX pp=%u usb=%u rx=%lu tx=%lu err=%lu\r\n",
+                 link_port_name(lp), link_state_name(lp),
+                 (unsigned long)link_peer_uid(lp)[0], link_peer_port(lp),
+                 link_peer_has_usb(lp),
+                 (unsigned long)rx, (unsigned long)tx, (unsigned long)err);
+        cdc_send_text(line);
+      }
+    }
+
+    // Reboot into the ROM bootloader on request. Done here rather than in the
+    // CDC callback so the acknowledgement makes it onto the wire first (that
+    // runs in USB interrupt context, where nothing would ever drain the TX).
+    if (dfu_req) {
+      dfu_req = 0;
+      cdc_send_text("DFU entering bootloader\r\n");
+      HAL_Delay(50);
+      Bootloader_RequestDFU();
     }
 
     // Apply a completed host color frame; abort one that stalled mid-transfer.
@@ -993,7 +1061,7 @@ static void MX_LPUART1_UART_Init(void)
 
   /* USER CODE END LPUART1_Init 1 */
   hlpuart1.Instance = LPUART1;
-  hlpuart1.Init.BaudRate = 209700;
+  hlpuart1.Init.BaudRate = 460800;
   hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;
   hlpuart1.Init.StopBits = UART_STOPBITS_1;
   hlpuart1.Init.Parity = UART_PARITY_NONE;
@@ -1040,7 +1108,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 460800;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -1088,7 +1156,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 460800;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;

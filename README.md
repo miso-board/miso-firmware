@@ -23,9 +23,12 @@ Then build and flash in one step:
 (Uses the ARM GCC and STM32CubeProgrammer CLI bundled inside STM32CubeIDE.app;
 the `-g` flag restarts the application after flashing.)
 
-Firmware can also reboot itself into DFU mode by calling
-`Bootloader_RequestDFU()` — intended for a future "enter DFU" command over
-MIDI/serial so updates need no button press at all.
+Or send `B!` on the CDC port, which needs no button press at all. Both routes
+are kept deliberately: the serial command is the everyday one, but it is only
+reachable while the application still enumerates. The double tap runs from
+`bootloader_check()` before any clock or peripheral is configured, so it is the
+recovery path when a bad flash, a hang during init or a hard fault means USB
+never comes up — precisely when DFU is most needed.
 
 How it works: a magic word in a `.noinit` RAM section (which survives NRST
 resets) is armed for the first 500 ms after boot (`BOOTLOADER_TAP_WINDOW` in
@@ -33,6 +36,59 @@ resets) is armed for the first 500 ms after boot (`BOOTLOADER_TAP_WINDOW` in
 in `main.c` jumps to system memory at `0x1FFF0000` before any clocks or
 peripherals are configured. SWD via the 5-pin header still works as before for
 debugging.
+
+**The reset cause is checked first.** `.noinit` RAM only really clears when the
+rail collapses to 0 V, and a supply that merely sags keeps it — so a bouncing
+power connection (a pogo-pin mate, a hand-plugged USB cable) produces a burst of
+brown-out resets that reads as a deliberate double tap. The board then boots
+into the ROM bootloader with its LEDs dark and looks completely dead, while
+actually enumerating as `DFU in FS Mode`. So the magic word is only honoured
+after a pin reset or a software reset (`RCC_CSR_PINRSTF`/`SFTRSTF`) with
+`BORRSTF` clear; a power-on or brown-out reset discards it. A POR asserts NRST
+internally and therefore sets `PINRSTF` too, which is why `BORRSTF` has to be
+tested first.
+
+If a board ever appears dead, check what it enumerated as before assuming
+hardware:
+
+    ioreg -p IOUSB -w0 -l | grep -i '"USB Product Name"'
+
+`DFU in FS Mode` means it is in the ROM bootloader and `./flash-usb.sh` will
+talk to it right now.
+
+### Required option bytes (every board, once)
+
+**BOOT0 must be taken away from the pin.** The G431KBU6 samples BOOT0 at reset
+from **PB8**, and this design leaves PB8 unconnected — so at the factory default
+(`nSWBOOT0 = 1`) the boot mode is decided by whatever charge happens to sit on a
+floating pin as the rail rises. When it floats high the ROM bootloader runs, the
+LEDs stay dark, and the board reads as dead while quietly enumerating as
+`DFU in FS Mode`. No firmware can intercept this; the hardware jumps before a
+single instruction of the application executes. Symptoms were random failures to
+start on USB replug, and worse odds when hot-plugging boards together (a pogo
+mate being a messier power-up than a cable).
+
+    STM32_Programmer_CLI -c port=usb1 -ob nSWBOOT0=0 nBOOT0=1
+
+Option bytes are per-chip, so **each board needs this once**. On the next PCB
+revision a 10 kΩ pull-down from PB8 to GND does the same job in copper, and
+`nSWBOOT0 = 0` additionally frees PB8 for use as an ordinary GPIO.
+
+**Watch the polarity.** `nBOOT0` is active-low despite CubeProgrammer describing
+it as "this option bit sets the BOOT0 value", which reads as direct and is not.
+Verified empirically on hardware, both directions:
+
+| `nBOOT0` (with `nSWBOOT0 = 0`) | Boots to |
+|---|---|
+| `0` | system memory — permanent DFU |
+| `1` | main flash — what you want |
+
+Getting it backwards is recoverable, since DFU stays reachable and the option
+bytes can just be rewritten, but it looks alarming.
+
+Raising the brown-out threshold from its default of level 0 (~1.7 V)
+(`STM32_Programmer_CLI -c port=usb1 -ob BOR_LEV=4`) hardens the power-up further
+by holding the MCU in reset until VDD is properly established.
 
 ## Sensor streaming & the companion app
 
@@ -49,6 +105,8 @@ interface on the same USB-C port:
 | `M`     | Re-send the MPE configuration (zone + pitch-bend range) |
 | `e`     | Toggle the `EV` text event lines |
 | `r`     | Redo the boot-time rest calibration (hands off the keys for ~0.1 s) |
+| `k`     | Dump the state of the four inter-board links |
+| `B!`    | Reboot into the USB DFU bootloader (two bytes, so a stray character can't misfire) |
 | `C` + 93 bytes | Set all LED background colors: 31 × RGB, LED-chain order (a stalled frame aborts after 200 ms) |
 
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
@@ -109,6 +167,98 @@ Four edits to generated files must be re-applied (CubeMX will revert them):
    product string "Miso"
 4. `USB_DEVICE/App/usb_device.c` — register `USBD_Composite` and
    `USBD_Composite_RegisterCDCInterface` instead of the CDC equivalents
+
+## Board linking (inter-board UART)
+
+Boards tile through the four pogo-pin connectors, each carrying +5 V and a UART
+pair. Sides map to peripherals as:
+
+| Side | Peripheral | TX | RX |
+|------|-----------|----|----|
+| top | *(bit-banged, pins not assigned yet)* | — | — |
+| bottom | LPUART1 | PA2 | PA3 |
+| left | USART2 | PB3 | PA15 |
+| right | USART1 | PA9 | PA10 |
+
+All three run at 460800 baud. Only three full-duplex pairs are bonded out on the
+UFQFPN32 package, so the fourth side will be bit-banged; its port exists in
+`Core/Src/link.c` with a null UART and is skipped until then.
+
+### Why TX pins idle in high-Z
+
+CubeMX configures every UART TX pin as `GPIO_MODE_AF_PP`, so from ~10 ms after
+boot the pin is driven push-pull to 3.3 V as UART idle — forever, whether or not
+anything is plugged in. Hot-plug a second board onto a running one and that
+3.3 V lands on the new board's RX pin while its own rail is still at 0 V.
+Current flows through the RX pad's ESD clamp diode into the dead board's 3V3
+net and parks it near 2.6 V; the STM32's POR needs VDD to rise *from* below
+~1.6 V, so it never releases and the board stays dark. Connecting both boards
+unpowered and *then* applying USB works, because the rails rise together.
+
+So `HAL_UART_MspInit()` immediately re-configures each TX pin to
+`GPIO_MODE_INPUT` (before `HAL_UART_Init()` even sets `TE`, so it is never
+driven at all), and `link.c` only drives it once a live board has been heard.
+
+Each RX pin gets the **internal pull-up**, which is what makes the dangerous
+case detectable:
+
+| RX reads | Meaning |
+|----------|---------|
+| high | nothing connected, or a powered neighbour idling |
+| **low** | an unpowered board is clamping the line to ~0.7 V through its ESD diode — do not drive |
+
+The pull-up sources ~65 µA into a dead board (harmless) and holds the line at
+UART idle, so a burst from the far end never looks like a spurious start bit.
+
+### Port state machine
+
+Ticked from the scan loop at ms resolution, identical on every board and every
+port — there is no master/slave asymmetry to deadlock.
+
+| State | `i` char | TX pin | Leaves when |
+|-------|:--------:|--------|-------------|
+| `BLOCKED` | `b` | high-Z | RX high for 50 ms |
+| `DOWN` | `.` | high-Z | RX goes low → `BLOCKED`; HELLO received → `HANDSHAKE`; probe timer → `PROBE` |
+| `PROBE` | `p` | driven, one frame | frame drained and `TC` set → back to `DOWN`, next probe in 200 ms + UID jitter |
+| `HANDSHAKE` | `h` | driven | peer ACK (or PING) → `UP`; 100 ms timeout → teardown |
+| `UP` | `U` | driven | 250 ms of silence → teardown |
+
+A purely passive "wait until RX proves someone is there" rule deadlocks when
+both ends run it, so an unconfirmed port emits one HELLO every 200 ms and
+returns to high-Z. At 460800 that is ~370 µs of drive in 200 ms (~0.2%), far too
+little to hold a neighbour's rail up: even 1 mA of load collapses ~10 µF within
+~26 ms, well inside the gap. Receiving a valid *frame* is stronger evidence than
+any level check — it can only come from a powered, running board — so it
+overrides `BLOCKED`.
+
+**Teardown matters as much as the gating.** Leave TX driven after a neighbour is
+unplugged and the next hot-plug fails exactly the way this whole mechanism
+exists to prevent.
+
+### Frame format
+
+Same family as the CDC scan frame, plus a length byte because the link is
+hot-pluggable and has to resync mid-stream:
+
+    A5 5A | type | len | payload[len] | checksum     (checksum = byte sum of type, len, payload)
+
+Types start at `0x10` to stay clear of the CDC frame types: `HELLO` (0x10),
+`HELLO_ACK` (0x11), `PING` (0x12, the 50 ms keepalive). HELLO carries the 96-bit
+device UID, a protocol version, the sender's port index and a `has_usb` flag.
+That flag marks the board plugged into a host — the one feeding +5 V to the rest
+of the chain, and the eventual MIDI/CDC master — but nothing acts on it yet:
+topology discovery, addressing and key-event forwarding come next.
+
+`k` over CDC dumps every port's state, peer UID, and RX/TX/error counts; `i`
+adds a compact `links=TBLR` summary using the characters above.
+
+### Hardware note
+
+Firmware gating fixes the symptom. The robust fix is a ~1–4.7 kΩ series resistor
+in each signal line at the connector, which limits ESD-diode injection to well
+under 1 mA and kills the hazard regardless of what firmware is running — worth
+adding on the next board revision, not least because it also protects against a
+board flashed with an older build.
 
 ## Board layout
 

@@ -22,6 +22,7 @@
 #include "stm32g4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "link.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -228,5 +229,24 @@ void USB_LP_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief Inter-board link UARTs. Hand-rolled rather than HAL_UART_IRQHandler:
+  *        these are free-running byte streams, not HAL transfer transactions.
+  */
+void LPUART1_IRQHandler(void)
+{
+  link_irq_lpuart1();
+}
+
+void USART1_IRQHandler(void)
+{
+  link_irq_usart1();
+}
+
+void USART2_IRQHandler(void)
+{
+  link_irq_usart2();
+}
 
 /* USER CODE END 1 */
