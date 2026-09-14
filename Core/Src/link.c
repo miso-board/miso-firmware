@@ -48,7 +48,7 @@
 #define LINK_DEAD_MS            250u   /* silence this long tears the link down */
 
 #define LINK_RX_RING            256u   /* must be a power of two */
-#define LINK_TX_RING            128u   /* must be a power of two */
+#define LINK_TX_RING            256u   /* must be a power of two; holds a 98-byte colour frame */
 
 /* --- Port hardware map ------------------------------------------------------
  * Sides as wired on the PCB. TOP is the bit-banged port; its pins are not
@@ -109,6 +109,8 @@ typedef struct {
 
 static link_t link[LINK_PORT_COUNT];
 static uint8_t self_has_usb;
+static link_rx_handler_t   rx_handler;
+static link_down_handler_t down_handler;
 
 /* --- TX pin gating ---------------------------------------------------------- */
 
@@ -251,6 +253,7 @@ static void link_teardown(link_port_t p, uint32_t tick)
   link_t *L = &link[p];
   const link_hw_t *hw = &link_hw[p];
   if (hw->uart == NULL) return;   /* TOP, once it is bit-banged, tears down elsewhere */
+  uint8_t was_up = (L->state == LINK_UP);
   link_drive_off(p);
 
   /* Fence the ISR out before touching both ends of a ring: caught mid-update
@@ -267,6 +270,9 @@ static void link_teardown(link_port_t p, uint32_t tick)
   L->state = LINK_DOWN;
   L->t_state = tick;
   L->t_next_probe = tick + LINK_PROBE_MS;
+
+  /* After the state is settled, so the handler sees a consistent view. */
+  if (was_up && down_handler) down_handler(p);
 }
 
 /* --- Frame handling ---------------------------------------------------------- */
@@ -319,7 +325,10 @@ static void link_on_frame(link_port_t p, uint32_t tick)
     break;
 
   default:
-    break;   /* t_last_rx above is the whole point of a PING */
+    /* Not ours: hand it to the mesh layer. t_last_rx is already updated above,
+     * so any application traffic also counts as a keepalive. */
+    if (rx_handler) rx_handler(p, L->p_type, L->p_buf, L->p_len);
+    break;
   }
 }
 
@@ -491,7 +500,11 @@ const char *link_state_name(link_port_t p)
 char link_state_char(link_port_t p)
 {
   static const char chars[] = { 'b', '.', 'p', 'h', 'U' };
-  return (p < LINK_PORT_COUNT) ? chars[link[p].state] : '?';
+  if (p >= LINK_PORT_COUNT) return '?';
+  /* No UART on this port yet (TOP, pending the bit-banged one). Reporting it as
+   * BLOCKED forever reads like a fault; '-' says "no hardware here". */
+  if (link_hw[p].uart == NULL) return '-';
+  return chars[link[p].state];
 }
 
 const char *link_port_name(link_port_t p)
@@ -521,6 +534,16 @@ void link_stats(link_port_t p, uint32_t *rx, uint32_t *tx, uint32_t *err)
   if (rx)  *rx  = link[p].n_rx;
   if (tx)  *tx  = link[p].n_tx;
   if (err) *err = link[p].n_err;
+}
+
+void link_set_rx_handler(link_rx_handler_t cb)
+{
+  rx_handler = cb;
+}
+
+void link_set_down_handler(link_down_handler_t cb)
+{
+  down_handler = cb;
 }
 
 uint8_t link_self_has_usb(void)

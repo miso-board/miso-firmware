@@ -106,6 +106,8 @@ interface on the same USB-C port:
 | `e`     | Toggle the `EV` text event lines |
 | `r`     | Redo the boot-time rest calibration (hands off the keys for ~0.1 s) |
 | `k`     | Dump the state of the four inter-board links |
+| `T`     | Dump the mesh topology: offsets, port roles, known boards, health counters |
+| `L` + `int16 x`, `int16 y`, 93 bytes | Set LED colors on the board at that grid origin, anywhere in the mesh |
 | `B!`    | Reboot into the USB DFU bootloader (two bytes, so a stray character can't misfire) |
 | `C` + 93 bytes | Set all LED background colors: 31 × RGB, LED-chain order (a stalled frame aborts after 200 ms) |
 
@@ -259,6 +261,117 @@ in each signal line at the connector, which limits ESD-diode injection to well
 under 1 mA and kills the hazard regardless of what firmware is running — worth
 adding on the next board revision, not least because it also protects against a
 board flashed with an older build.
+
+## Multi-board grid (topology, events, colours)
+
+A tiled grid behaves as **one instrument**: the USB-connected board ("master")
+sounds every key in the grid, and colour schemes can be painted onto any board
+in it. Implemented in `Core/Src/mesh.c` on top of the link layer above.
+
+### The tiling is exact
+
+Neighbour offsets are `right = (5, 2)` and `down = (-3, 5)`. That lattice has
+determinant `5·5 − 2·(−3) = 31`, exactly the key count, and the board's 31 cells
+form a **complete residue system** modulo it — 31 distinct residues under
+`f(x,y) = 2x + 26y mod 31`, with no two cells differing by a lattice vector. So
+the shape tiles the plane with no gaps or overlaps in any arrangement.
+
+Two consequences the design relies on: an absolute coordinate **uniquely
+identifies one key in the whole grid**, so it serves directly as a key id; and
+coordinate → (board, sensor) is unambiguous.
+
+| Port | Vector to that neighbour |
+|------|--------------------------|
+| right | `(+5, +2)` |
+| left | `(−5, −2)` |
+| bottom | `(−3, +5)` |
+| top | `(+3, −5)` |
+
+### What tiling does to pitch
+
+Geometry and tuning are separate questions, and the answer here is not obvious.
+Pitch is a linear function of absolute coordinate, so a tiled grid is seamless —
+but under the firmware's Wicki-Hayden basis the two tiling vectors are wildly
+asymmetric:
+
+| Direction | Wicki-Hayden (firmware) | Bosanquet |
+|---|---|---|
+| right `(5,2)` | **−1 step = −38.7 cents** | +1 octave exactly |
+| down `(−3,5)` | −80 steps = −2.58 octaves | unison |
+
+So a **horizontal** row adds keys but almost no range (1 board 2.52 octaves,
+3 boards 2.58, and at three wide 12 of the 93 pitches duplicate), while a
+vertical stack adds ~2.6 octaves per board. In Wicki-Hayden the horizontal axis
+is whole tones and the vertical is fifths, and `(5,2)` nearly cancels. Switching
+the firmware to the Bosanquet basis would invert this. Worth deciding before
+building a wide row.
+
+### Topology: a spanning tree
+
+A grid contains cycles (any 2×2 block), so routing uses a tree, not a flood.
+Every board with a known place in the grid beacons `ANNOUNCE` on all UP ports
+every 250 ms, carrying root UID, own UID, parent UID, offset and depth.
+
+Receiving one on port `P` implies an offset of `their_offset − direction(P)`. A
+board adopts `P` as parent when it has none, when the route is shorter, or on a
+depth tie by lower UID. A neighbour naming *us* as its parent makes that port a
+**child**. Traffic goes up to the parent only (so each event arrives exactly
+once) and down to children only (acyclic, so no loops).
+
+Two consistency checks, both nearly free. The peer's port must be the opposite
+edge — `right` must meet `left` — which catches a miswired or rotated board.
+And a non-tree edge implies an offset too, which must agree with the one already
+held: **cycles in the grid validate the topology rather than confusing it**.
+Disagreement is counted in `geom_err`, never silently accepted.
+
+### Events, and why notes cannot stick
+
+Key events are sent once, fire-and-forget, with the origin board applying its own
+offset so coordinates are absolute and intermediate boards forward opaquely.
+
+The safety net is `KEYSTATE`, sent every 100 ms, carrying a 31-bit held-key mask.
+It does three jobs: it is how the master learns which boards exist at all
+(`ANNOUNCE` only flows root→leaves); no `KEYSTATE` for 500 ms means the board is
+gone and its notes are released; and any key the master believes held but the
+board reports up gets a note-off. A key held there but never seen here is
+**counted, never fabricated** — the real velocity is gone, and a wrong-sounding
+note is worse than a logged miss.
+
+A link teardown releases a direct neighbour's notes immediately; the 500 ms
+timeout covers boards further away.
+
+### Commands
+
+| Command | Effect |
+|---------|--------|
+| `T` | Dump topology: own offset/depth/role, port roles, known boards, counters |
+| `L` + `int16 x`, `int16 y`, 93 bytes | Set colours on the board at that grid origin, wherever it is in the mesh |
+
+`C` keeps its exact meaning ("this board"), so the companion needs no change.
+`EV` lines gained trailing `x=` and `y=` fields; the existing prefix is
+unchanged, so existing parsers still match.
+
+Counters in `T` are the health readout — `missed_down`, `fixed_up`,
+`lost_release`, `geom_err`, `multi_master`. On a healthy link all but
+`lost_release` should stay at zero.
+
+### Limitation: no vertical links yet
+
+The TOP port has no UART (only three full-duplex pairs are bonded out on
+UFQFPN32), so a vertical pair cannot link at all — one board's BOTTOM would meet
+another's TOP. `k` and `i` show that port as `-` rather than a state. The mesh
+layer is written general over all four ports and needs no change when the
+bit-banged port lands; until then, only horizontal chains communicate.
+
+### Verified on hardware
+
+Two boards, master plus one hot-plugged to its right: link came up with
+`err=0` over 8,613 frames; the remote board was discovered at `off=5,2` with
+`geom=ok`; remote key events arrived with coordinates offset by exactly `(5,2)`
+(sensor 0 `(2,3)`→`(7,5)`, sensor 3 `(3,3)`→`(8,5)`, sensor 24 `(4,3)`→`(9,5)`);
+`L` addressed to each origin lit the intended board only; and a key held while
+its board was pulled off produced a synthesised note-off, with the board removed
+from the table and the port returned to high-Z.
 
 ## Board layout
 

@@ -48,8 +48,17 @@ typedef enum {
 #define LINK_MSG_HELLO      0x10   /* uid[12] | fw | port | has_usb */
 #define LINK_MSG_HELLO_ACK  0x11   /* same payload as HELLO */
 #define LINK_MSG_PING       0x12   /* no payload; keeps the link alive */
+/* Mesh-layer types are delivered to the handler registered below; link.c itself
+ * knows nothing about them. See mesh.h for their payload layouts. */
+#define LINK_MSG_ANNOUNCE   0x13
+#define LINK_MSG_KEYEV      0x14
+#define LINK_MSG_KEYSTATE   0x15
+#define LINK_MSG_COLOR      0x16
 
-#define LINK_MAX_PAYLOAD    32
+/* Large enough for a whole colour frame in one message (4 bytes of target
+ * coordinate + 93 of RGB = 97), so the mesh layer needs no fragmentation.
+ * `len` is a u8, so this can grow to 255 if ever needed. */
+#define LINK_MAX_PAYLOAD    104
 
 void         link_init(void);
 void         link_tick(uint32_t tick);
@@ -65,6 +74,18 @@ uint8_t         link_peer_port(link_port_t p);
 uint8_t         link_peer_has_usb(link_port_t p);
 
 void link_stats(link_port_t p, uint32_t *rx, uint32_t *tx, uint32_t *err);
+
+/* Application delivery. link.c handles HELLO/HELLO_ACK/PING itself and passes
+ * every other frame type to this handler; without one they are dropped. */
+typedef void (*link_rx_handler_t)(link_port_t p, uint8_t type,
+                                  const uint8_t *payload, uint8_t len);
+void link_set_rx_handler(link_rx_handler_t cb);
+
+/* Fired when a port that was LINK_UP goes down, so the layer above can release
+ * anything it was holding for that neighbour (notes, most importantly). Not
+ * fired for a handshake that never completed. */
+typedef void (*link_down_handler_t)(link_port_t p);
+void link_set_down_handler(link_down_handler_t cb);
 
 /* True once this board has been enumerated over USB, i.e. it is the one
  * plugged into a host and is feeding +5V to the rest of the chain. Carried

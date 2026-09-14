@@ -28,6 +28,7 @@
 #include "usbd_cdc_if.h"
 #include "usbd_composite.h"
 #include "link.h"
+#include "mesh.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,13 +53,15 @@
 
 // Hall sensor scanning + CDC streaming
 #define NUM_SENSORS         31
+_Static_assert(NUM_SENSORS == MESH_SENSORS,
+               "mesh.h's MESH_SENSORS must match NUM_SENSORS");
 #define CYCLES_PER_US       144u   // SYSCLK in MHz, for DWT cycle-counter timing
 #define MUX_SETTLE_US       5u     // 4067 switch + ADC input settling after channel select
 #define STREAM_MAGIC0       0xA5
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.5.0"
+#define FW_VERSION          "miso 0.6.0"
 #define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
@@ -364,6 +367,7 @@ volatile uint8_t  led_viz_on  = 1;
 volatile uint8_t  info_req    = 0;
 volatile uint8_t  link_req    = 0;
 volatile uint8_t  dfu_req     = 0;
+volatile uint8_t  topo_req    = 0;
 uint32_t scan_hz = 0;  // measured full-scan rate, updated once per second
 
 // Background LED colors (RGB, LED-chain order), pushed by the host via the
@@ -374,6 +378,14 @@ static volatile uint8_t  color_rx_buf[NUM_LEDS * 3];
 static volatile uint16_t color_rx_count = 0;
 static volatile uint8_t  color_rx_active = 0;
 static volatile uint8_t  color_rx_ready = 0;
+
+// 'L' is the addressed variant of 'C': 4 bytes of target board origin (int16 x,
+// int16 y, little-endian) followed by the same 93 RGB bytes. The mesh applies it
+// here if the target is this board, otherwise routes it down the tree.
+static volatile uint8_t  lcolor_rx_buf[4 + NUM_LEDS * 3];
+static volatile uint16_t lcolor_rx_count = 0;
+static volatile uint8_t  lcolor_rx_active = 0;
+static volatile uint8_t  lcolor_rx_ready = 0;
 static volatile uint32_t last_rx_tick = 0;
 
 // Binary scan frame: A5 5A 01 | u32 t_us | 31 x u16 raw | u8 checksum(payload)
@@ -439,11 +451,6 @@ static const int8_t sensor_grid[NUM_SENSORS][2] = {
   {4,3}, {5,2}, {2,4}, {1,5}, {3,5}, {3,4}, {2,5},
 };
 
-// Per key: nearest MIDI note and the 14-bit bend that corrects it to the true
-// 31-EDO pitch. Computed once at boot by midi_build_pitch_table().
-static uint8_t  key_midi[NUM_SENSORS];
-static uint16_t key_bend[NUM_SENSORS];
-static uint8_t  key_playable[NUM_SENSORS];
 
 enum { KS_IDLE, KS_PRESSING, KS_HELD };
 static float    key_rest[NUM_SENSORS];
@@ -456,10 +463,24 @@ static uint32_t rest_scans = 0;           // < REST_CAL_SCANS while calibrating
 
 // --- MIDI / MPE --------------------------------------------------------------
 
-static uint8_t  mpe_key_of_channel[MPE_MEMBER_COUNT];  // NUM_SENSORS = free
-static uint32_t mpe_channel_age[MPE_MEMBER_COUNT];
-static uint8_t  mpe_channel_of_key[NUM_SENSORS];       // MPE_MEMBER_COUNT = none
+// One record per MPE member channel, keyed by PACKED ABSOLUTE COORDINATE rather
+// than by local sensor index, so keys on neighbouring boards are representable
+// at all. The note number is cached here because a note-off must send the note
+// that was actually started; recomputing it would go wrong if the pitch map
+// ever moved under a held key.
+typedef struct {
+  uint8_t  active;
+  uint32_t key;     // packed absolute (x, y)
+  uint8_t  note;
+  uint32_t age;
+} mpe_voice_t;
+static mpe_voice_t mpe_voice[MPE_MEMBER_COUNT];
 static uint32_t mpe_alloc_counter = 0;
+
+static uint32_t key_id(int16_t x, int16_t y)
+{
+  return ((uint32_t)(uint16_t)x << 16) | (uint32_t)(uint16_t)y;
+}
 volatile uint8_t events_text_on = 1;   // 'e' toggles the EV text lines
 volatile uint8_t mpe_setup_req = 0;    // 'M' re-sends the MPE configuration
 
@@ -475,44 +496,38 @@ static void midi_send(uint8_t cin, uint8_t status, uint8_t d1, uint8_t d2)
   USBD_MIDI_Send(pkt);
 }
 
-// Whole board's pitch map, in integers: 31-EDO step -> nearest MIDI note plus
-// a bend for the remainder. No floating point and no Hz: MIDI wants note+bend.
-static void midi_build_pitch_table(void)
+// Pitch for ANY absolute grid coordinate, in integers: 31-EDO step -> nearest
+// MIDI note plus a bend for the remainder. No floating point and no Hz: MIDI
+// wants note+bend. Taking a coordinate rather than a sensor index is what lets
+// the master sound keys that live on a neighbouring board.
+// Returns 0 if the pitch falls outside MIDI range.
+static uint8_t pitch_for_xy(int32_t x, int32_t y, uint8_t *note_out, uint16_t *bend_out)
 {
-  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-    int32_t x = sensor_grid[i][0];
-    int32_t y = sensor_grid[i][1];
-    // Wicki-Hayden basis, vertically flipped so fifths run up-right as the
-    // standard layout has them. meantonal's WICKI_FROM composed with the
-    // axial vertical flip (x,y)->(x+y,-y) reduces to w = x - 2y, h = -y.
-    int32_t w = x - 2 * y + TUNE_W0;
-    int32_t h = -y + TUNE_H0;
-    int32_t step = EDO_WHOLE_TONE * w + EDO_DIATONIC_SEMI * h;
+  // Wicki-Hayden basis, vertically flipped so fifths run up-right as the
+  // standard layout has them. meantonal's WICKI_FROM composed with the
+  // axial vertical flip (x,y)->(x+y,-y) reduces to w = x - 2y, h = -y.
+  int32_t w = x - 2 * y + TUNE_W0;
+  int32_t h = -y + TUNE_H0;
+  int32_t step = EDO_WHOLE_TONE * w + EDO_DIATONIC_SEMI * h;
 
-    // note = round(step * 12 / 31); the +15 is exact rounding here because
-    // step*12/31 never has a fractional part between 15/31 and 1/2.
-    int32_t note = (step * 12 + 15) / EDO_STEPS;
-    // Remaining offset, carried as cents x 31 to stay in integers.
-    int32_t off31 = step * 1200 - note * 100 * EDO_STEPS;
-    int32_t bend = 8192 + div_round(off31 * 8192, MPE_BEND_CENTS * EDO_STEPS);
+  // round(step * 12 / 31). div_round rather than the old (step*12+15)/31: on a
+  // multi-board grid a coordinate can be negative, and C division truncates
+  // toward zero, which would round the wrong way there.
+  int32_t note = div_round(step * 12, EDO_STEPS);
+  // Remaining offset, carried as cents x 31 to stay in integers.
+  int32_t off31 = step * 1200 - note * 100 * EDO_STEPS;
+  int32_t bend = 8192 + div_round(off31 * 8192, MPE_BEND_CENTS * EDO_STEPS);
 
-    if (note < 0 || note > 127 || bend < 0 || bend > 16383) {
-      key_playable[i] = 0;
-      key_midi[i] = 0;
-      key_bend[i] = 8192;
-    } else {
-      key_playable[i] = 1;
-      key_midi[i] = (uint8_t)note;
-      key_bend[i] = (uint16_t)bend;
-    }
-  }
-  for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
-    mpe_key_of_channel[c] = NUM_SENSORS;
-    mpe_channel_age[c] = 0;
-  }
-  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-    mpe_channel_of_key[i] = MPE_MEMBER_COUNT;
-  }
+  if (note < 0 || note > 127 || bend < 0 || bend > 16383) return 0;
+  *note_out = (uint8_t)note;
+  *bend_out = (uint16_t)bend;
+  return 1;
+}
+
+static void midi_reset_voices(void)
+{
+  memset(mpe_voice, 0, sizeof(mpe_voice));
+  mpe_alloc_counter = 0;
 }
 
 // MPE Configuration Message: lower zone, master channel 1, 15 member channels,
@@ -532,48 +547,55 @@ static void midi_send_mpe_setup(void)
   }
 }
 
-static void midi_note_on(uint8_t key, uint8_t vel)
+static void midi_note_on(int16_t x, int16_t y, uint8_t vel)
 {
-  if (!key_playable[key] || mpe_channel_of_key[key] != MPE_MEMBER_COUNT) {
-    return;
+  uint8_t note;
+  uint16_t bend;
+  if (!pitch_for_xy(x, y, &note, &bend)) return;
+  uint32_t id = key_id(x, y);
+
+  for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
+    if (mpe_voice[c].active && mpe_voice[c].key == id) return;   // already sounding
   }
+
   // Least-recently-used free channel, stealing the oldest voice if all busy.
   uint8_t pick = 0;
   uint32_t best = 0xFFFFFFFFu;
   for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
-    uint32_t age = (mpe_key_of_channel[c] == NUM_SENSORS) ? mpe_channel_age[c]
-                                                          : mpe_channel_age[c] + 0x80000000u;
+    uint32_t age = mpe_voice[c].active ? mpe_voice[c].age + 0x80000000u
+                                       : mpe_voice[c].age;
     if (age < best) {
       best = age;
       pick = c;
     }
   }
-  uint8_t stolen = mpe_key_of_channel[pick];
+
   uint8_t status_ch = (uint8_t)(MPE_MEMBER_FIRST + pick);
-  if (stolen != NUM_SENSORS) {
-    midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | status_ch), key_midi[stolen], 0);
-    mpe_channel_of_key[stolen] = MPE_MEMBER_COUNT;
+  if (mpe_voice[pick].active) {
+    midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | status_ch), mpe_voice[pick].note, 0);
   }
 
-  mpe_key_of_channel[pick] = key;
-  mpe_channel_of_key[key] = pick;
-  mpe_channel_age[pick] = ++mpe_alloc_counter;
+  mpe_voice[pick].active = 1;
+  mpe_voice[pick].key = id;
+  mpe_voice[pick].note = note;
+  mpe_voice[pick].age = ++mpe_alloc_counter;
 
   // Bend first so the note starts already in tune.
   midi_send(MIDI_CIN_PITCHBEND, (uint8_t)(0xE0 | status_ch),
-            (uint8_t)(key_bend[key] & 0x7F), (uint8_t)((key_bend[key] >> 7) & 0x7F));
-  midi_send(MIDI_CIN_NOTE_ON, (uint8_t)(0x90 | status_ch), key_midi[key], vel);
+            (uint8_t)(bend & 0x7F), (uint8_t)((bend >> 7) & 0x7F));
+  midi_send(MIDI_CIN_NOTE_ON, (uint8_t)(0x90 | status_ch), note, vel);
 }
 
-static void midi_note_off(uint8_t key)
+static void midi_note_off(int16_t x, int16_t y)
 {
-  uint8_t c = mpe_channel_of_key[key];
-  if (c >= MPE_MEMBER_COUNT) {
+  uint32_t id = key_id(x, y);
+  for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
+    if (!mpe_voice[c].active || mpe_voice[c].key != id) continue;
+    midi_send(MIDI_CIN_NOTE_OFF,
+              (uint8_t)(0x80 | (MPE_MEMBER_FIRST + c)), mpe_voice[c].note, 0);
+    mpe_voice[c].active = 0;
     return;
   }
-  midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | (MPE_MEMBER_FIRST + c)), key_midi[key], 0);
-  mpe_key_of_channel[c] = NUM_SENSORS;
-  mpe_channel_of_key[key] = MPE_MEMBER_COUNT;
 }
 
 // Restart the boot-time rest calibration (also triggered by the 'r' command).
@@ -595,6 +617,58 @@ static uint8_t velocity_from_dt(uint32_t dt_us)
   return (uint8_t)(v < 1 ? 1 : (v > 127 ? 127 : v));
 }
 
+// --- Seam shared by local and remote keys -------------------------------------
+// Everything below here is driven identically by this board's own scan loop and
+// by events arriving from a neighbour over the mesh. Coordinates are absolute,
+// so a remote key needs no special case anywhere downstream.
+
+void Miso_EmitKeyDown(uint8_t sensor, int16_t x, int16_t y, uint8_t vel, uint32_t dt_us)
+{
+  midi_note_on(x, y, vel);
+  if (events_text_on) {
+    char line[96];
+    snprintf(line, sizeof(line), "EV %u DOWN vel=%u dt_us=%lu x=%d y=%d\r\n",
+             sensor, vel, (unsigned long)dt_us, x, y);
+    cdc_send_text(line);
+  }
+}
+
+void Miso_EmitKeyUp(uint8_t sensor, int16_t x, int16_t y)
+{
+  midi_note_off(x, y);
+  if (events_text_on) {
+    char line[96];
+    snprintf(line, sizeof(line), "EV %u UP x=%d y=%d\r\n", sensor, x, y);
+    cdc_send_text(line);
+  }
+}
+
+void Miso_ApplyColors(const uint8_t *rgb)
+{
+  memcpy(led_background, rgb, sizeof(led_background));
+}
+
+void Miso_SensorCoord(uint8_t sensor, int8_t *x, int8_t *y)
+{
+  if (sensor >= NUM_SENSORS) { *x = 0; *y = 0; return; }
+  *x = sensor_grid[sensor][0];
+  *y = sensor_grid[sensor][1];
+}
+
+uint32_t Miso_LocalHeldMask(void)
+{
+  uint32_t m = 0;
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    if (key_state[i] == KS_HELD) m |= (1u << i);
+  }
+  return m;
+}
+
+void Miso_SendText(const char *s)
+{
+  cdc_send_text(s);
+}
+
 static void keys_process(uint32_t t_us)
 {
   if (rest_scans < REST_CAL_SCANS) {
@@ -610,10 +684,17 @@ static void keys_process(uint32_t t_us)
     return;
   }
 
+  // Hoisted: these were two function calls per sensor per scan (62 per pass),
+  // which at -O0 cost measurable scan rate for a value that cannot change
+  // inside the loop.
+  const int16_t box = mesh_offset_x();
+  const int16_t boy = mesh_offset_y();
+
   for (uint8_t i = 0; i < NUM_SENSORS; i++) {
     key_ema[i] += KEY_EMA_ALPHA * ((float)sensor_raw[i] - key_ema[i]);
     float pos = (key_ema[i] - key_rest[i]) / ((float)key_cal_max[i] - key_rest[i]);
-    char line[48];
+    int16_t kx = (int16_t)(sensor_grid[i][0] + box);
+    int16_t ky = (int16_t)(sensor_grid[i][1] + boy);
 
     switch (key_state[i]) {
       case KS_IDLE:
@@ -627,12 +708,7 @@ static void keys_process(uint32_t t_us)
           uint32_t dt = t_us - key_t0[i];   // wrap-safe
           key_vel[i] = velocity_from_dt(dt);
           key_state[i] = KS_HELD;
-          midi_note_on(i, key_vel[i]);
-          if (events_text_on) {
-            snprintf(line, sizeof(line), "EV %u DOWN vel=%u dt_us=%lu\r\n",
-                     i, key_vel[i], (unsigned long)dt);
-            cdc_send_text(line);
-          }
+          mesh_key_down(i, kx, ky, key_vel[i], dt);
         } else if (pos < KEY_ABORT_POS) {
           key_state[i] = KS_IDLE;           // grazed, never committed
         }
@@ -641,11 +717,7 @@ static void keys_process(uint32_t t_us)
         if (pos < KEY_RELEASE_POS) {
           key_state[i] = KS_IDLE;
           key_vel[i] = 0;
-          midi_note_off(i);
-          if (events_text_on) {
-            snprintf(line, sizeof(line), "EV %u UP\r\n", i);
-            cdc_send_text(line);
-          }
+          mesh_key_up(i, kx, ky);
         }
         break;
     }
@@ -658,6 +730,9 @@ static void keys_process(uint32_t t_us)
 //   d<N>     stream every Nth scan       l        toggle LED visualization
 //   r        redo the rest calibration (hands off the keys)
 //   k        dump the state of the four inter-board links
+//   T        dump the mesh topology (ports, known boards, counters)
+//   L        followed by int16 x, int16 y, then 93 RGB bytes: set the colors
+//            of the board at that grid origin, wherever it is in the mesh
 //   B!       reboot into the USB DFU bootloader (two bytes, to avoid misfires)
 //   C        followed by 93 bytes: RGB for all 31 LEDs, LED-chain order
 void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
@@ -684,6 +759,14 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       if (c == '!') { dfu_req = 1; continue; }
       // not the confirmation: fall through so c is still read as a command
     }
+    if (lcolor_rx_active) {
+      lcolor_rx_buf[lcolor_rx_count++] = c;
+      if (lcolor_rx_count >= sizeof(lcolor_rx_buf)) {
+        lcolor_rx_active = 0;
+        lcolor_rx_ready = 1;
+      }
+      continue;
+    }
     if (collecting_decim) {
       if (c >= '0' && c <= '9') {
         decim_val = decim_val * 10 + (c - '0');
@@ -702,6 +785,8 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       case 'r': keys_recalibrate_rest(); break;
       case 'd': collecting_decim = 1; decim_val = 0; break;
       case 'C': color_rx_active = 1; color_rx_count = 0; break;
+      case 'L': lcolor_rx_active = 1; lcolor_rx_count = 0; break;
+      case 'T': topo_req = 1; break;
       case 'M': mpe_setup_req = 1; break;
       case 'e': events_text_on ^= 1; break;
       default: break;  // ignore CR/LF and unknown bytes
@@ -763,8 +848,9 @@ int main(void)
   bootloader_flag = 0;
 
   dwt_init();
-  midi_build_pitch_table();
+  midi_reset_voices();
   link_init();
+  mesh_init();
 
   // Simple test patterns (shortened so flash-test cycles stay quick)
   fill_solid(5, 0, 0);     // dim red
@@ -830,6 +916,7 @@ int main(void)
     USBD_MIDI_Flush();
 
     link_tick(tick);
+    mesh_tick(tick);
 
     if (tick - rate_t0 >= 1000) {
       scan_hz = rate_scans * 1000u / (tick - rate_t0);
@@ -885,8 +972,21 @@ int main(void)
       color_rx_ready = 0;
       memcpy(led_background, (const void *)color_rx_buf, sizeof(led_background));
     }
+    if (lcolor_rx_ready) {
+      lcolor_rx_ready = 0;
+      int16_t tx = (int16_t)((uint16_t)lcolor_rx_buf[0] | ((uint16_t)lcolor_rx_buf[1] << 8));
+      int16_t ty = (int16_t)((uint16_t)lcolor_rx_buf[2] | ((uint16_t)lcolor_rx_buf[3] << 8));
+      mesh_set_colors(tx, ty, (const uint8_t *)&lcolor_rx_buf[4]);
+    }
+    if (topo_req) {
+      topo_req = 0;
+      mesh_dump();
+    }
     if (color_rx_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
       color_rx_active = 0;
+    }
+    if (lcolor_rx_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
+      lcolor_rx_active = 0;
     }
 
     // LED rendering, decimated so the WS2812 DMA (~1.6 ms per refresh)
