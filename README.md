@@ -92,8 +92,8 @@ by holding the MCU in reset until VDD is properly established.
 
 ## Sensor streaming & the companion app
 
-The firmware scans all 31 Hall sensors in a tight loop (target ≥1.5 kHz; the
-measured rate is reported by the `i` command) and exposes a USB CDC serial
+The firmware scans all 31 Hall sensors in a tight loop — **~2276 Hz measured**,
+439 µs per scan, reported by the `i` command — and exposes a USB CDC serial
 interface on the same USB-C port:
 
 | Command | Effect |
@@ -113,6 +113,35 @@ interface on the same USB-C port:
 
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
 (little-endian; checksum = byte sum of the payload).
+
+### Build optimisation level matters more than anything else
+
+The project builds `Debug` at **`-Os`**, not `-O0`. This is not a detail: at
+`-O0` the scan loop runs at ~1129 Hz, and `keys_process()` is float-heavy enough
+that the optimiser roughly doubles it. Measured on one board with nothing
+attached, six samples each, all within two counts:
+
+| Build | scan_hz | µs/scan | flash |
+|---|---|---|---|
+| `c813fa9` @ `-O0` (before the link layer) | 1129 | 886 | 59,808 |
+| `f34193d` @ `-O0` (link + mesh) | 1079 | 927 | 70,760 |
+| `f34193d` @ `-Os` | **2276** | 439 | 37,608 |
+
+So the inter-board work costs ~4.4%, and the optimisation level is worth ~2x —
+the earlier "target ≥1.5 kHz" was never met at `-O0` and is comfortably beaten at
+`-Os`. Flash drops by 47% as a bonus.
+
+Set in `.cproject` on the Debug configuration (the Release configuration was
+always `-Os`). `-g3` is kept, so SWD debugging still works, with the usual
+caveats about stepping through optimised code.
+
+**One consequence to remember when tuning the velocity engine:** `KEY_EMA_ALPHA`
+is a per-*sample* coefficient, so doubling the scan rate halves the smoothing
+filter's time constant — roughly 2.6 ms of averaging becomes 1.3 ms. Keys feel
+more responsive and are more exposed to sensor noise. `VEL_DT_FAST_US` and
+`VEL_DT_SLOW_US` are in real microseconds and so are unaffected, and transit
+timing gets *more* accurate with finer sampling — but the velocity curve was
+fitted at ~1.1 kHz and is worth re-checking with the companion's press capture.
 
 ## MIDI + MPE output
 

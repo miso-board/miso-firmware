@@ -494,7 +494,9 @@ link_state_t link_state(link_port_t p)
 
 const char *link_state_name(link_port_t p)
 {
-  return (p < LINK_PORT_COUNT) ? link_state_names[link[p].state] : "?";
+  if (p >= LINK_PORT_COUNT) return "?";
+  if (link_hw[p].uart == NULL) return "ABSENT";   /* matches the '-' that 'i' shows */
+  return link_state_names[link[p].state];
 }
 
 char link_state_char(link_port_t p)
