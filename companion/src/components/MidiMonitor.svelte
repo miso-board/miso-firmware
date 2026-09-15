@@ -27,7 +27,7 @@
   // pitch at its ABSOLUTE coordinate, which is the whole point of the mesh.
   const expected = $derived(
     gridCells().map((c) => {
-      const p = pitchAt(LAYOUTS["wicki-hayden"], c.x, c.y);
+      const p = pitchAt(LAYOUTS.bosanquet, c.x, c.y);
       return {
         label: mesh.boards.length > 1 ? `${c.x},${c.y}` : `S${String(c.sensor).padStart(2, "0")}`,
         name: noteName(p),
@@ -164,7 +164,7 @@
 
       <div>
         <h3 class="m-0 mb-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
-          Expected (Wicki-Hayden, 31-EDO)
+          Expected (Bosanquet, 31-EDO)
         </h3>
         <div class="max-h-[300px] overflow-auto rounded-md border" style="border-color: var(--line)">
           <table class="mono w-full border-collapse text-xs">

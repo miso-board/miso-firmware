@@ -40,7 +40,8 @@
 /* USER CODE BEGIN PD */
 #define NUM_LEDS        31
 #define BITS_PER_LED    24
-#define DMA_BUF_LEN     (NUM_LEDS * BITS_PER_LED + 750)   // +40 for reset
+#define LED_RESET_WORDS 750    // trailing low period; latches the frame
+#define DMA_BUF_LEN     (NUM_LEDS * BITS_PER_LED + LED_RESET_WORDS)
 
 // Duty cycle values (adjust these if colours look wrong)
 #define LED_CODE_0      45     // ~0.35 µs high
@@ -66,12 +67,12 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
 // --- MIDI / MPE ---------------------------------------------------------
-// Wicki-Hayden on a 31-EDO lattice. meantonal represents a pitch as
-// (w, h) = whole steps and diatonic semitones above C-1; this board's grid
-// maps in with w = x + 3y + W0, h = y + H0 (meantonal's WICKI_FROM basis).
-// The authoring-side source of truth is companion/src/lib/tuning.ts.
-#define TUNE_W0             34     // anchor: puts D5 on the centre key (3,3)
-#define TUNE_H0             15
+// Bosanquet on a 31-EDO lattice. meantonal represents a pitch as
+// (w, h) = whole steps and diatonic semitones above C-1, and this board's grid
+// axes are already those axes, so the mapping is just the anchor: w = x + W0,
+// h = y + H0. The authoring-side source of truth is companion/src/lib/tuning.ts.
+#define TUNE_W0             23     // anchor: puts D4 on the centre key (3,3)
+#define TUNE_H0             7
 #define EDO_STEPS           31     // divisions of the octave
 #define EDO_WHOLE_TONE      5      // 31-EDO steps in a whole tone
 #define EDO_DIATONIC_SEMI   3      // 31-EDO steps in a diatonic semitone
@@ -263,15 +264,83 @@ void prepare_dma_buffer(void)
   }
 
   // Reset pulse (low for a while)
-  for (int i = 0; i < 750; i++) {
+  for (int i = 0; i < LED_RESET_WORDS; i++) {
     dma_buffer[idx++] = 0;
   }
 }
 
+// Rewriting dma_buffer while the previous transfer is still streaming it clocks
+// garbage into the chain, and HAL_TIM_PWM_Start_DMA's HAL_BUSY return was being
+// discarded. Skip the refresh instead; the next one is only 30 ms away.
+static volatile uint8_t  led_dma_busy = 0;
+static volatile uint32_t usb_defers = 0;   // USB sends held off during the bitstream
+
+/* Diagnostic: busy-wait this many microseconds per scan, set by 'p<N>'.
+ * Lets -Os code be run at -O0's scan rate, which separates "the optimiser
+ * broke something" from "running twice as fast is what breaks it" (twice the
+ * mux switching and ADC transients on the 3V3 rail that also drives the LED
+ * data line, whose 3.3 V high already sits under the SK6812's ~3.5 V VIH). */
+volatile uint32_t scan_throttle_us = 0;
+
+/* Diagnostic: 'n' stops the Hall scan entirely while leaving the loop, USB and
+ * LED refresh running. If the LEDs go clean with scanning off, the disturbance
+ * is the analog side -- 16 mux channel switches and 31 ADC conversions per
+ * scan, whose current transients ride on the same 3V3 rail that drives the LED
+ * data line -- rather than CPU or USB activity. */
+volatile uint8_t scan_enabled = 1;
+
+/* Objective check on the two remaining possibilities, so this stops depending
+ * on watching the board:
+ *   led_churn  - led_data changed between refreshes. With no keys held and no
+ *                colour frames arriving it must not, so any count means
+ *                something is writing over it.
+ *   dma_churn  - dma_buffer differed at the end of the transfer from what was
+ *                put there at the start, i.e. it was modified mid-flight.
+ * If both stay zero while the LEDs visibly flash, the bytes leaving the MCU
+ * were correct and correctly transmitted, and the fault is on the wire. */
+static uint32_t led_sum_prev = 0;
+static uint32_t dma_sum_start = 0;
+static volatile uint32_t led_churn = 0;
+static volatile uint32_t dma_churn = 0;
+
+static uint32_t sum32(const uint32_t *p, uint32_t n)
+{
+  uint32_t s = 0;
+  while (n--) s = (s << 1) ^ *p++;   /* order-sensitive, unlike a plain sum */
+  return s;
+}
+
+/**
+ * True only while the DMA is still clocking out LED DATA.
+ *
+ * The SK6812 encodes each bit as a pulse width, so one late DMA beat mis-sizes
+ * that bit and every LED after it in the chain receives shifted data -- which is
+ * why the corrupt region moves around. USB activity is what makes the beat late,
+ * so the two must not overlap.
+ *
+ * The trailing reset words are deliberately excluded: the line is held low
+ * throughout them, so a late beat there cannot corrupt anything. That keeps the
+ * exclusion window to ~930 us of each 30 ms refresh rather than ~1.9 ms.
+ */
+static uint8_t led_critical(void)
+{
+  return led_dma_busy && (__HAL_DMA_GET_COUNTER(&hdma_tim1_ch1) > LED_RESET_WORDS);
+}
+
 void show_leds(void)
 {
+  if (led_dma_busy) return;
   prepare_dma_buffer();
-  HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, dma_buffer, DMA_BUF_LEN);
+  if (HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, dma_buffer, DMA_BUF_LEN) != HAL_OK) {
+    return;
+  }
+  led_dma_busy = 1;
+
+  uint32_t led_sum = sum32((const uint32_t *)(const void *)led_data,
+                           sizeof(led_data) / 4);
+  if (led_sum_prev && led_sum != led_sum_prev) led_churn++;
+  led_sum_prev = led_sum;
+  dma_sum_start = sum32(dma_buffer, DMA_BUF_LEN);
 }
 
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
@@ -279,6 +348,8 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM1)
   {
     HAL_TIM_PWM_Stop_DMA(&htim1, TIM_CHANNEL_1);
+    if (sum32(dma_buffer, DMA_BUF_LEN) != dma_sum_start) dma_churn++;
+    led_dma_busy = 0;
   }
 }
 
@@ -370,22 +441,27 @@ volatile uint8_t  dfu_req     = 0;
 volatile uint8_t  topo_req    = 0;
 uint32_t scan_hz = 0;  // measured full-scan rate, updated once per second
 
-// Background LED colors (RGB, LED-chain order), pushed by the host via the
-// 'C' command; initialized from the boot pattern. A frame in flight stages
-// into color_rx_buf from the USB interrupt and is applied by the main loop.
+// Background LED colors (RGB, LED-chain order), initialized from the boot
+// pattern and replaced by host color frames.
 static uint8_t led_background[NUM_LEDS][3];
-static volatile uint8_t  color_rx_buf[NUM_LEDS * 3];
-static volatile uint16_t color_rx_count = 0;
-static volatile uint8_t  color_rx_active = 0;
-static volatile uint8_t  color_rx_ready = 0;
 
-// 'L' is the addressed variant of 'C': 4 bytes of target board origin (int16 x,
-// int16 y, little-endian) followed by the same 93 RGB bytes. The mesh applies it
-// here if the target is this board, otherwise routes it down the tree.
-static volatile uint8_t  lcolor_rx_buf[4 + NUM_LEDS * 3];
-static volatile uint16_t lcolor_rx_count = 0;
-static volatile uint8_t  lcolor_rx_active = 0;
-static volatile uint8_t  lcolor_rx_ready = 0;
+// Incoming color frames are QUEUED, not single-buffered. The host sends one
+// frame per board back to back, so a single staging buffer meant the USB
+// interrupt began overwriting frame 2 while the main loop was still copying
+// frame 1 out of it: one board lost its colors and the other got a torn mix of
+// both. With painting debounced at 100 ms that tears repeatedly, which shows up
+// as flicker. The interrupt only ever writes the head slot and the main loop
+// only ever reads the tail, so neither can touch the other's.
+//
+// Layout per slot: int16 x | int16 y | 93 RGB bytes. 'C' ("this board") is
+// staged as an 'L' aimed at our own origin, so there is one path, not two.
+#define COLOR_MSG_LEN   (4 + NUM_LEDS * 3)
+#define COLOR_Q_SLOTS   4
+static volatile uint8_t  color_q[COLOR_Q_SLOTS][COLOR_MSG_LEN];
+static volatile uint8_t  cq_head = 0, cq_tail = 0;
+static volatile uint16_t cq_fill = 0;     // bytes written into the head slot
+static volatile uint8_t  cq_active = 0;
+static volatile uint32_t cq_dropped = 0;  // queue full; surfaced by 'i'
 static volatile uint32_t last_rx_tick = 0;
 
 // Binary scan frame: A5 5A 01 | u32 t_us | 31 x u16 raw | u8 checksum(payload)
@@ -393,6 +469,7 @@ static void stream_frame(uint32_t t_us)
 {
   static uint8_t buf[3 + 4 + NUM_SENSORS * 2 + 1];
   if (CDC_IsTxBusy()) return;  // drop the frame rather than stall the scan loop
+  if (led_critical()) { usb_defers++; return; }  // never during the bitstream
   buf[0] = STREAM_MAGIC0;
   buf[1] = STREAM_MAGIC1;
   buf[2] = FRAME_TYPE_SCAN;
@@ -408,7 +485,7 @@ static void stream_frame(uint32_t t_us)
 // free up; data is copied to a static buffer that stays valid during TX.
 static void cdc_send_text(const char *s)
 {
-  static char txt[128];
+  static char txt[224];
   size_t n = strlen(s);
   if (n > sizeof(txt)) n = sizeof(txt);
   uint32_t t0 = HAL_GetTick();
@@ -503,11 +580,10 @@ static void midi_send(uint8_t cin, uint8_t status, uint8_t d1, uint8_t d2)
 // Returns 0 if the pitch falls outside MIDI range.
 static uint8_t pitch_for_xy(int32_t x, int32_t y, uint8_t *note_out, uint16_t *bend_out)
 {
-  // Wicki-Hayden basis, vertically flipped so fifths run up-right as the
-  // standard layout has them. meantonal's WICKI_FROM composed with the
-  // axial vertical flip (x,y)->(x+y,-y) reduces to w = x - 2y, h = -y.
-  int32_t w = x - 2 * y + TUNE_W0;
-  int32_t h = -y + TUNE_H0;
+  // Bosanquet: the board's axial grid IS meantonal's (w, h) basis, so +x is a
+  // whole tone, +y a diatonic semitone and the identity needs no basis change.
+  int32_t w = x + TUNE_W0;
+  int32_t h = y + TUNE_H0;
   int32_t step = EDO_WHOLE_TONE * w + EDO_DIATONIC_SEMI * h;
 
   // round(step * 12 / 31). div_round rather than the old (step*12+15)/31: on a
@@ -739,16 +815,22 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
 {
   static uint8_t collecting_decim = 0;
   static uint32_t decim_val = 0;
+  static uint8_t collecting_thr = 0;
+  static uint32_t thr_val = 0;
   static uint8_t dfu_armed = 0;
 
   last_rx_tick = HAL_GetTick();
   for (uint32_t i = 0; i < len; i++) {
     uint8_t c = buf[i];
-    if (color_rx_active) {
-      color_rx_buf[color_rx_count++] = c;
-      if (color_rx_count >= NUM_LEDS * 3) {
-        color_rx_active = 0;
-        color_rx_ready = 1;
+    if (cq_active) {
+      color_q[cq_head][cq_fill++] = c;
+      if (cq_fill >= COLOR_MSG_LEN) {
+        cq_active = 0;
+        uint8_t next = (uint8_t)((cq_head + 1u) % COLOR_Q_SLOTS);
+        // Queue full: drop this frame rather than overwrite one the main loop
+        // has not consumed. The slot is simply reused by the next frame.
+        if (next != cq_tail) cq_head = next;
+        else cq_dropped++;
       }
       continue;
     }
@@ -759,13 +841,13 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       if (c == '!') { dfu_req = 1; continue; }
       // not the confirmation: fall through so c is still read as a command
     }
-    if (lcolor_rx_active) {
-      lcolor_rx_buf[lcolor_rx_count++] = c;
-      if (lcolor_rx_count >= sizeof(lcolor_rx_buf)) {
-        lcolor_rx_active = 0;
-        lcolor_rx_ready = 1;
+    if (collecting_thr) {
+      if (c >= '0' && c <= '9') {
+        thr_val = thr_val * 10 + (c - '0');
+        continue;
       }
-      continue;
+      scan_throttle_us = thr_val;
+      collecting_thr = 0;  // fall through: c may start a new command
     }
     if (collecting_decim) {
       if (c >= '0' && c <= '9') {
@@ -784,9 +866,20 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       case 'l': led_viz_on ^= 1; break;
       case 'r': keys_recalibrate_rest(); break;
       case 'd': collecting_decim = 1; decim_val = 0; break;
-      case 'C': color_rx_active = 1; color_rx_count = 0; break;
-      case 'L': lcolor_rx_active = 1; lcolor_rx_count = 0; break;
+      case 'C': {
+        // "this board": synthesise the target so 'C' and 'L' share one path.
+        int16_t ox = mesh_offset_x(), oy = mesh_offset_y();
+        color_q[cq_head][0] = (uint8_t)ox;
+        color_q[cq_head][1] = (uint8_t)(ox >> 8);
+        color_q[cq_head][2] = (uint8_t)oy;
+        color_q[cq_head][3] = (uint8_t)(oy >> 8);
+        cq_active = 1; cq_fill = 4;
+        break;
+      }
+      case 'L': cq_active = 1; cq_fill = 0; break;
       case 'T': topo_req = 1; break;
+      case 'p': collecting_thr = 1; thr_val = 0; break;
+      case 'n': scan_enabled ^= 1; break;
       case 'M': mpe_setup_req = 1; break;
       case 'e': events_text_on ^= 1; break;
       default: break;  // ignore CR/LF and unknown bytes
@@ -895,9 +988,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    scan_all();
+    if (scan_throttle_us) delay_us(scan_throttle_us);
+    if (scan_enabled) scan_all();
     uint32_t t_us = micros32();
-    keys_process(t_us);
+    if (scan_enabled) keys_process(t_us);
     scan_count++;
     rate_scans++;
 
@@ -913,7 +1007,7 @@ int main(void)
     if (!USBD_MIDI_Ready()) {
       mpe_setup_done = 0;   // re-announce after a re-enumeration
     }
-    USBD_MIDI_Flush();
+    if (!led_critical()) USBD_MIDI_Flush();
 
     link_tick(tick);
     mesh_tick(tick);
@@ -930,14 +1024,18 @@ int main(void)
 
     if (info_req) {
       info_req = 0;
-      char line[128];
+      char line[224];
       snprintf(line, sizeof(line),
-               "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u links=%c%c%c%c usb=%u\r\n",
+               "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u links=%c%c%c%c usb=%u cdrop=%lu "
+               "usbdef=%lu thr=%lu scan=%u ledchurn=%lu dmachurn=%lu\r\n",
                FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
                stream_on, led_viz_on,
                link_state_char(LINK_PORT_TOP), link_state_char(LINK_PORT_BOTTOM),
                link_state_char(LINK_PORT_LEFT), link_state_char(LINK_PORT_RIGHT),
-               link_self_has_usb());
+               link_self_has_usb(), (unsigned long)cq_dropped,
+               (unsigned long)usb_defers,
+               (unsigned long)scan_throttle_us, scan_enabled,
+               (unsigned long)led_churn, (unsigned long)dma_churn);
       cdc_send_text(line);
     }
 
@@ -967,26 +1065,20 @@ int main(void)
       Bootloader_RequestDFU();
     }
 
-    // Apply a completed host color frame; abort one that stalled mid-transfer.
-    if (color_rx_ready) {
-      color_rx_ready = 0;
-      memcpy(led_background, (const void *)color_rx_buf, sizeof(led_background));
-    }
-    if (lcolor_rx_ready) {
-      lcolor_rx_ready = 0;
-      int16_t tx = (int16_t)((uint16_t)lcolor_rx_buf[0] | ((uint16_t)lcolor_rx_buf[1] << 8));
-      int16_t ty = (int16_t)((uint16_t)lcolor_rx_buf[2] | ((uint16_t)lcolor_rx_buf[3] << 8));
-      mesh_set_colors(tx, ty, (const uint8_t *)&lcolor_rx_buf[4]);
+    // Drain every queued color frame; each targets one board in the grid.
+    while (cq_tail != cq_head) {
+      const uint8_t *m = (const uint8_t *)color_q[cq_tail];
+      int16_t tx = (int16_t)((uint16_t)m[0] | ((uint16_t)m[1] << 8));
+      int16_t ty = (int16_t)((uint16_t)m[2] | ((uint16_t)m[3] << 8));
+      mesh_set_colors(tx, ty, m + 4);
+      cq_tail = (uint8_t)((cq_tail + 1u) % COLOR_Q_SLOTS);
     }
     if (topo_req) {
       topo_req = 0;
       mesh_dump();
     }
-    if (color_rx_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
-      color_rx_active = 0;
-    }
-    if (lcolor_rx_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
-      lcolor_rx_active = 0;
+    if (cq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
+      cq_active = 0;   // half-received frame: abandon the slot, keep the queue
     }
 
     // LED rendering, decimated so the WS2812 DMA (~1.6 ms per refresh)

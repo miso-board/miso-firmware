@@ -114,6 +114,39 @@ interface on the same USB-C port:
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
 (little-endian; checksum = byte sum of the payload).
 
+### The LED data line has no voltage margin
+
+The SK6812's input-high threshold is 0.7 x VDD = **3.5 V**, and PA8 can only
+drive 3.3 V. Only the *first* LED in the chain sees that marginal signal --
+every one after it gets a regenerated 5 V copy -- so a single misread bit at
+that first input corrupts every LED downstream of it, which is why a corrupt
+region appears at a random point and moves around.
+
+This was latent until `-Os` doubled the scan rate, which doubled the stream
+frame rate with it (decimation is per *scan*), and the extra system activity
+was enough to start tipping it. Symptom: while the companion is streaming, part
+of the chain flickers; it stops the instant streaming stops.
+
+**PA8 is set to `GPIO_SPEED_FREQ_VERY_HIGH`**, not CubeMX's default `LOW`
+(`stm32g4xx_hal_msp.c`, `TIM1_MspPostInit`). Slow slew keeps every edge in the
+indeterminate band for longer, which is exactly where noise flips a bit. Fastest
+slew took the worst case from constant flicker to occasional. It does not fix
+the underlying level problem.
+
+**The real fix is hardware**, and belongs on the next board revision: either a
+level shifter (74AHCT125 or similar) on the data line, or a series Schottky in
+the LED chain's 5 V feed to drop it to ~4.4 V, which brings their threshold to
+~3.1 V and gives the 3.3 V driver genuine margin. Note the diode carries the
+whole chain's current -- size it for the full LED load, not a signal diode.
+
+**How this was established, in case it recurs.** The `i` line carries
+`ledchurn` (times `led_data` changed between refreshes) and `dmachurn` (times
+`dma_buffer` was altered mid-transfer). Both stayed at zero through two minutes
+of visible flickering, proving the bytes leaving the MCU were correct and
+correctly transmitted -- so the fault had to be on the wire, not in memory or
+DMA timing. `p<N>` throttles the scan loop and `n` stops the Hall scan, which
+between them separate "how fast we run" from "what we run" without a reflash.
+
 ### Build optimisation level matters more than anything else
 
 The project builds `Debug` at **`-Os`**, not `-O0`. This is not a detail: at
@@ -152,21 +185,27 @@ hand-written in `USB_DEVICE/App/usbd_composite.c` (CubeMX only generates
 single-class devices); CDC keeps its original endpoints and its app-layer API,
 so the companion protocol was unaffected.
 
-Layout is **Wicki-Hayden in 31-EDO**. Each key's pitch is derived with integer
-arithmetic only — MIDI wants a note number and a bend, never a frequency:
+Layout is **Bosanquet in 31-EDO**, with D4 on the centre key. Each key's pitch
+is derived with integer arithmetic only — MIDI wants a note number and a bend,
+never a frequency:
 
 ```
-w = x - 2y + 34 ,  h = -y + 15      Wicki-Hayden basis change + anchor
+w = x + 23 ,  h = y + 7             anchor only; no basis change
 step = 5w + 3h                      31-EDO step (whole tone 5, semitone 3)
 note = round(step * 12 / 31)        nearest 12-EDO MIDI note
 bend = 8192 + round((step*1200 - note*3100) * 8192 / (4800 * 31))
 ```
 
-Whole tones run left to right, fifths up-right and fourths up-left. That basis
-is meantonal's `WICKI_FROM` composed with a vertical flip of the board; note
-that a vertical flip in a skewed axial basis is `(x, y) -> (x + y, -y)`, not
-`(x, -y)` — plain negation breaks hex adjacency and turns one diagonal into a
-major 6th.
+The board's axial grid *is* meantonal's `(w, h)` pitch basis — `+x` a whole
+tone, `+y` a diatonic semitone — so Bosanquet is the identity map and only the
+anchor is left to choose. That also makes the pitch mapping agree with the
+boot colour pattern, which groups keys by accidental along the same rows.
+
+The companion still carries **Wicki-Hayden** (meantonal's `WICKI_FROM` composed
+with a vertical flip of the board, `w = x - 2y`, `h = -y`) as an alternative for
+colour generation; note that a vertical flip in a skewed axial basis is
+`(x, y) -> (x + y, -y)`, not `(x, -y)` — plain negation breaks hex adjacency and
+turns one diagonal into a major 6th.
 
 The music theory behind those constants lives in the companion's
 `src/lib/tuning.ts`, which uses [meantonal](https://meantonal.org/) — the
@@ -338,13 +377,13 @@ vertical step is a real 12-TET semitone that *31-EDO* tempers to nothing. Either
 one described by its MIDI note number would be a description of the projection
 artefact rather than of the interval.
 
-Practically, under Wicki-Hayden a horizontal row transposes each successive board
-down by one enharmonic diesis, so a wide row deepens the enharmonic resources
-rather than extending range — three boards wide gives 93 keys sounding 81
-distinct 31-EDO pitches. The range lies vertically instead, at two octaves and a
-fifth per board, which is exactly the direction that needs the TOP port. Under
-Bosanquet the two directions swap roles: horizontal gives exact octaves, vertical
-gives boards that sound alike but are spelled five flats apart.
+Practically, under Bosanquet — the default — a horizontal row gives exact
+octaves, so range extends sideways, while a vertical column gives boards that
+sound alike but are spelled five flats apart. Under Wicki-Hayden the two
+directions swap roles: a horizontal row transposes each successive board down by
+one enharmonic diesis, deepening the enharmonic resources rather than extending
+range (three boards wide gives 93 keys sounding 81 distinct 31-EDO pitches), and
+the range lies vertically instead at two octaves and a fifth per board.
 
 ### Topology: a spanning tree
 

@@ -29,8 +29,9 @@ export const LAYOUTS: Record<LayoutId, Layout> = {
     id: "bosanquet",
     name: "Bosanquet",
     matrix: IDENTITY,
-    // Puts D5 on the centre key (3,3) and reproduces the board's boot pattern.
-    anchor: { w: 28, h: 9 },
+    // Puts D4 on the centre key (3,3) and reproduces the board's boot pattern.
+    // This is the firmware default (TUNE_W0/TUNE_H0 in Core/Src/main.c).
+    anchor: { w: 23, h: 7 },
     axes: "+x whole tone · +y diatonic semitone",
   },
   "wicki-hayden": {
@@ -47,7 +48,7 @@ export const LAYOUTS: Record<LayoutId, Layout> = {
     // (x, -y): plain negation would break hex adjacency, turning one diagonal
     // into a major 6th. Composed this is w = x - 2y, h = -y.
     matrix: WICKI_FROM.compose(new Map2D(1, 1, 0, -1)),
-    anchor: { w: 34, h: 15 }, // also D5 on the centre key
+    anchor: { w: 29, h: 13 }, // also D4 on the centre key
     axes: "+x whole tone · fifth up-right · fourth up-left",
   },
 };
