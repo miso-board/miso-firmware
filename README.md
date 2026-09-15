@@ -451,9 +451,35 @@ strike velocity. Tuning constants (`KEY_*_POS`, `VEL_DT_FAST_US`,
 built with Vite. It shows live per-key levels with min/max watermarks, per-key stats
 (rest / min / max / noise σ), and auto-triggered press-waveform capture with
 20→70% transit times — plus the **Key colors** tab: a click-to-paint view of
-the physical board (axial hex rendering) with named color mappings saved in
+the board (axial hex rendering) with named color mappings saved in
 the browser and streamed to the board live, either painted by hand or generated
 procedurally. Pitch mapping is next.
+
+**It is grid-aware.** The app polls `T` once a second and models the discovered
+mesh in `companion/src/lib/mesh.svelte.ts`, so a tiled set of boards renders as
+the single continuous instrument it is — one SVG, every key placed by its
+absolute coordinate, with each board captioned by UID when there is more than
+one. Key events carry their coordinate, the MIDI monitor checks incoming notes
+against the pitch at the *absolute* coordinate (so a note from a neighbouring
+board is verified like any other), and the header shows a live board count.
+
+Colour mappings are keyed by **absolute grid coordinate**, not LED index, so one
+scheme covers however many boards are attached and survives them being added,
+removed or rearranged — which also matches how the procedural generator always
+worked, colouring by the accidental of the pitch at a coordinate. Pushing sends
+one `L` frame per board. Generated schemes are evaluated lazily rather than
+materialised, so attaching another board needs no regeneration.
+
+Storage moved to `miso-color-maps-v2` with automatic migration: a v1 31-entry
+LED-indexed array is read as a board at the origin, and the v1 key is left in
+place as a backup rather than deleted.
+
+Two limits worth knowing. The **Calibrate tab is master-only** — the firmware
+forwards key events, not raw scans, and remote sensor data at full rate would be
+93 kB/s against a 46 kB/s link, so live levels, stats and press capture show only
+the USB board's own keys. And connecting to firmware older than 0.6.0 still
+works: with no topology seen, the app falls back to a single board at the origin
+and the original `C` colour frame.
 
 The **procedural generator** colours each key by the accidental of the note
 that lands on it — the key's Bosanquet row — via meantonal. That library

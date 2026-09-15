@@ -3,7 +3,9 @@
   import * as engine from "./lib/engine";
   import * as serial from "./lib/serial";
   import { startSim, stopSim } from "./lib/sim";
-  import { ui, toast, refreshRows, refreshTraces, pushEvent } from "./lib/ui.svelte";
+  import { ui, toast, refreshRows, refreshTraces, pushEvent, clearHeld } from "./lib/ui.svelte";
+  import { mesh, parseMeshLine, resetMesh } from "./lib/mesh.svelte";
+  import { SENSOR_POS } from "./lib/layout";
   import LiveBars from "./components/LiveBars.svelte";
   import PressScope from "./components/PressScope.svelte";
   import StatsTable from "./components/StatsTable.svelte";
@@ -26,15 +28,24 @@
     try {
       ok = await serial.connect({
         onLine(line) {
+          if (parseMeshLine(line)) return;
           const info = line.match(/scan_hz=(\d+)/);
           if (info) ui.scanHz = +info[1];
-          const ev = line.match(/^EV (\d+) (DOWN|UP)(?: vel=(\d+) dt_us=(\d+))?/);
+          const ev = line.match(
+            /^EV (\d+) (DOWN|UP)(?: vel=(\d+) dt_us=(\d+))?(?: x=(-?\d+) y=(-?\d+))?/,
+          );
           if (ev) {
+            const sensor = +ev[1];
+            // Firmware before 0.6.0 omits the coordinate; assume the attached
+            // board, which is the only one such firmware can see anyway.
+            const local = SENSOR_POS[sensor] ?? [0, 0];
             pushEvent({
-              key: +ev[1],
+              key: sensor,
               kind: ev[2] as "DOWN" | "UP",
               vel: ev[3] ? +ev[3] : null,
               dtUs: ev[4] ? +ev[4] : null,
+              x: ev[5] !== undefined ? +ev[5] : local[0],
+              y: ev[6] !== undefined ? +ev[6] : local[1],
               at: new Date().toISOString().slice(11, 23),
             });
           }
@@ -55,6 +66,7 @@
     ui.connected = true;
     ui.scanHz = null;
     await serial.send("i");
+    await serial.send("T"); // discover the grid before the first colour push
     await serial.send(`d${decim}\n`);
     await serial.send("s");
     await pushToBoard(); // restore the active color mapping on the LEDs
@@ -64,6 +76,8 @@
     ui.connected = false;
     await serial.disconnect();
     engine.resetTimeline();
+    clearHeld(); // no key-up is coming for anything still down
+    resetMesh();
     startSim();
   }
 
@@ -89,7 +103,10 @@
       ui.fps = engine.frameCounter - lastCount;
       lastCount = engine.frameCounter;
       ui.badFrames = engine.badFrames;
-      if (ui.connected) void serial.send("i");
+      if (ui.connected) {
+        void serial.send("i");
+        void serial.send("T"); // boards can be hot-plugged at any time
+      }
     }, 1000);
     const rowTimer = setInterval(refreshRows, 200);
 
@@ -131,6 +148,7 @@
   {@render readout(ui.connected ? String(ui.scanHz ?? "…") : "sim", "scan Hz")}
   {@render readout(String(ui.fps), "frames/s")}
   {@render readout(String(ui.badFrames), "bad frames")}
+  {@render readout(ui.connected && mesh.seen ? String(mesh.boards.length) : "—", "boards")}
   <button
     class="cursor-pointer rounded-md px-4 py-1.5 font-semibold"
     style="background: var(--accent); color: var(--accent-ink)"
@@ -245,6 +263,39 @@
 
       {#if ui.events.length > 0}
         <h2 class="m-0 mt-4 mb-1 text-[11px] font-semibold uppercase tracking-[0.14em]" style="color: var(--text-dim)">
+          Grid
+        </h2>
+        {#if !ui.connected}
+          <p class="m-0 mb-2 text-xs" style="color: var(--text-dim)">Not connected.</p>
+        {:else if !mesh.seen}
+          <p class="m-0 mb-2 text-xs" style="color: var(--warn)">
+            This firmware doesn't report topology — update it for multi-board support.
+          </p>
+        {:else}
+          <ul class="mono m-0 mb-2 flex list-none flex-col gap-0.5 p-0 text-xs">
+            {#each mesh.boards as b}
+              <li style="color: var(--text-dim)">
+                <b class="font-medium" style="color: var(--text)">{b.uid}</b>
+                at <b style="color: var(--accent)">{b.ox},{b.oy}</b>
+                {#if b.self}· this board{/if}
+                {#if !b.self}· last seen {b.ageMs} ms ago{/if}
+              </li>
+            {/each}
+          </ul>
+          {#if mesh.stats.geomErr > 0 || mesh.stats.multiMaster > 0 || mesh.stats.missedDown > 0}
+            <p class="mono m-0 mb-2 text-xs" style="color: var(--crit)">
+              missed_down {mesh.stats.missedDown} · geom_err {mesh.stats.geomErr} ·
+              multi_master {mesh.stats.multiMaster}
+            </p>
+          {/if}
+          {#if mesh.stats.lostRelease > 0}
+            <p class="mono m-0 mb-2 text-xs" style="color: var(--text-dim)">
+              {mesh.stats.lostRelease} note{mesh.stats.lostRelease === 1 ? "" : "s"} released on board loss
+            </p>
+          {/if}
+        {/if}
+
+        <h2 class="m-0 mt-4 mb-1 text-[11px] font-semibold uppercase tracking-[0.14em]" style="color: var(--text-dim)">
           Key events (from firmware)
         </h2>
         <ul class="mono m-0 flex list-none flex-col gap-0.5 p-0 text-xs">
@@ -252,6 +303,7 @@
             <li style="color: var(--text-dim)">
               <span>{ev.at}</span>
               key <b class="font-medium" style="color: var(--text)">{String(ev.key).padStart(2, "0")}</b>
+              <span style="color: var(--text-dim)">@{ev.x},{ev.y}</span>
               {#if ev.kind === "DOWN"}
                 <b class="font-semibold" style="color: var(--accent)">DOWN</b>
                 vel <b class="font-medium" style="color: var(--text)">{ev.vel}</b>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { SENSOR_POS, NUM_KEYS } from "../lib/layout";
+  import { mesh, gridCells } from "../lib/mesh.svelte";
   import {
     LAYOUTS, pitchAt, noteName, midiFor, centsFromBend, MPE_BEND_SEMITONES,
   } from "../lib/tuning";
@@ -12,7 +12,7 @@
     channel: number;
     text: string;
     /** Set when a note-on's note+bend matched (or failed to match) a key. */
-    match?: { key: number; name: string; ok: boolean; deltaCents: number };
+    match?: { key: string; name: string; ok: boolean; deltaCents: number };
   }
 
   let supported = $state(true);
@@ -22,11 +22,19 @@
   let lastBend = $state<number[]>(Array(16).fill(8192));
   let access: MisoMIDIAccess | null = null;
 
-  // What each key should produce, computed independently via meantonal.
-  const expected = SENSOR_POS.map(([x, y], sensor) => {
-    const p = pitchAt(LAYOUTS["wicki-hayden"], x, y);
-    return { sensor, name: noteName(p), ...midiFor(p) };
-  });
+  // What each key in the grid should produce, computed independently via
+  // meantonal — so a note from a neighbouring board is checked against the
+  // pitch at its ABSOLUTE coordinate, which is the whole point of the mesh.
+  const expected = $derived(
+    gridCells().map((c) => {
+      const p = pitchAt(LAYOUTS["wicki-hayden"], c.x, c.y);
+      return {
+        label: mesh.boards.length > 1 ? `${c.x},${c.y}` : `S${String(c.sensor).padStart(2, "0")}`,
+        name: noteName(p),
+        ...midiFor(p),
+      };
+    }),
+  );
 
   function stamp() {
     return new Date().toISOString().slice(11, 23);
@@ -63,7 +71,7 @@
         at: stamp(), kind: "on", channel,
         text: `note ${d1} vel ${d2}`,
         match: {
-          key: best.sensor, name: best.name,
+          key: best.label, name: best.name,
           ok: best.note === d1 && Math.abs(deltaCents) < 1.5,
           deltaCents,
         },
@@ -143,7 +151,7 @@
               <span style="color: {r.kind === 'on' ? 'var(--accent)' : r.kind === 'off' ? 'var(--good)' : 'var(--text-dim)'}">{r.text}</span>
               {#if r.match}
                 <span style="color: {r.match.ok ? 'var(--good)' : 'var(--crit)'}">
-                  {r.match.ok ? "✓" : "✗"} key {String(r.match.key).padStart(2, "0")} {r.match.name}
+                  {r.match.ok ? "✓" : "✗"} key {r.match.key} {r.match.name}
                   {#if !r.match.ok}({r.match.deltaCents.toFixed(1)}¢ off){/if}
                 </span>
               {/if}
@@ -171,7 +179,7 @@
             <tbody>
               {#each expected as e}
                 <tr>
-                  <td class="px-2 py-0.5" style="border-bottom: 1px solid var(--grid)">S{String(e.sensor).padStart(2, "0")}</td>
+                  <td class="px-2 py-0.5" style="border-bottom: 1px solid var(--grid)">{e.label}</td>
                   <td class="px-2 py-0.5 text-right" style="border-bottom: 1px solid var(--grid); color: var(--text)">{e.name}</td>
                   <td class="px-2 py-0.5 text-right" style="border-bottom: 1px solid var(--grid)">{e.note}</td>
                   <td class="px-2 py-0.5 text-right" style="border-bottom: 1px solid var(--grid)">{e.bend}</td>
@@ -181,7 +189,9 @@
             </tbody>
           </table>
         </div>
-        <p class="m-0 mt-1 text-xs" style="color: var(--text-dim)">{NUM_KEYS} keys</p>
+        <p class="m-0 mt-1 text-xs" style="color: var(--text-dim)">
+          {expected.length} keys{#if mesh.boards.length > 1} across {mesh.boards.length} boards{/if}
+        </p>
       </div>
     </div>
   {/if}

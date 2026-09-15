@@ -21,10 +21,14 @@ export interface TraceMeta {
 }
 
 export interface KeyEvent {
+  /** Sensor index on the originating board. */
   key: number;
   kind: "DOWN" | "UP";
   vel: number | null;
   dtUs: number | null;
+  /** Absolute grid coordinate. Firmware before 0.6.0 omits it. */
+  x: number;
+  y: number;
   at: string; // wall-clock HH:MM:SS.mmm
 }
 
@@ -39,13 +43,21 @@ export const ui = $state({
   rows: [] as Row[],
   traces: [] as TraceMeta[],
   events: [] as KeyEvent[],
-  held: Array(NUM_KEYS).fill(false) as boolean[],
+  /** Currently-held keys anywhere in the grid, keyed "x,y". */
+  held: {} as Record<string, boolean>,
 });
 
 export function pushEvent(ev: KeyEvent): void {
   ui.events.unshift(ev);
   if (ui.events.length > 12) ui.events.pop();
-  if (ev.key < NUM_KEYS) ui.held[ev.key] = ev.kind === "DOWN";
+  const k = `${ev.x},${ev.y}`;
+  if (ev.kind === "DOWN") ui.held[k] = true;
+  else delete ui.held[k];
+}
+
+/** Drop every held flag — on disconnect, where no key-up is coming. */
+export function clearHeld(): void {
+  ui.held = {};
 }
 
 let toastTimer: ReturnType<typeof setTimeout> | null = null;

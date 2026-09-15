@@ -1,12 +1,12 @@
 <script lang="ts">
-  import BoardView from "./BoardView.svelte";
+  import BoardView, { type ViewCell } from "./BoardView.svelte";
   import GeneratorPanel from "./GeneratorPanel.svelte";
-  import { LED_FOR_SENSOR, SENSOR_FOR_LED, LED_POS, NUM_KEYS } from "../lib/layout";
   import { LAYOUTS, pitchAt, noteName } from "../lib/tuning";
   import { swatchStyle, ledColor } from "../lib/ledColor";
   import { ui, toast } from "../lib/ui.svelte";
+  import { mesh, gridCells } from "../lib/mesh.svelte";
   import {
-    colorState, activeMap, paint, fillAll, newMap, duplicateMap, renameMap,
+    colorState, activeMap, colorAt, paint, fillAll, newMap, duplicateMap, renameMap,
     deleteMap, selectMap, pushToBoard, copyMapJson, importMapJson,
   } from "../lib/colorMaps.svelte";
 
@@ -20,21 +20,37 @@
   let customLevel = $state(12); // % brightness applied to the custom pick
   let labelMode = $state<"none" | "led" | "sensor" | "note">("none");
   let trueColor = $state(false);
-  let hovered = $state<number | null>(null);
-
-  const heldLed = $derived.by(() => {
-    const out = Array(NUM_KEYS).fill(false);
-    ui.held.forEach((h, s) => (out[LED_FOR_SENSOR[s]] = h));
-    return out;
-  });
+  let hovered = $state<ViewCell | null>(null);
 
   // Note names follow the active mapping's layout; hand-painted mappings fall
   // back to the Bosanquet default so the labels always mean something.
-  const noteNames = $derived.by(() => {
+  const nameFor = $derived.by(() => {
     const gen = activeMap().generator;
     const layout = LAYOUTS[gen?.layout ?? "bosanquet"];
     const offset = gen?.offset ?? ([0, 0] as [number, number]);
-    return LED_POS.map(([x, y]) => noteName(pitchAt(layout, x, y, offset)));
+    return (x: number, y: number) => noteName(pitchAt(layout, x, y, offset));
+  });
+
+  // One entry per key in the whole grid, positioned by absolute coordinate, so
+  // a tiled set of boards renders as the single continuous instrument it is.
+  const cells = $derived.by<ViewCell[]>(() => {
+    const m = activeMap();
+    return gridCells().map((c) => {
+      const color = colorAt(m, c.x, c.y);
+      const note = nameFor(c.x, c.y);
+      const label =
+        labelMode === "note" ? note
+        : labelMode === "sensor" ? String(c.sensor)
+        : labelMode === "led" ? String(c.led)
+        : undefined;
+      return {
+        key: c.key, x: c.x, y: c.y, color, label,
+        held: ui.held[c.key] === true,
+        boardUid: c.board.uid,
+        title: `${c.x},${c.y} · ${note} · LED ${c.led} · sensor ${c.sensor} · ${color}`
+             + (mesh.boards.length > 1 ? ` · board ${c.board.uid}` : ""),
+      };
+    });
   });
 
   function useCustom() {
@@ -63,9 +79,10 @@
     Key colors — {activeMap().name}
   </h2>
   <p class="m-0 mb-2.5 text-xs" style="color: var(--text-dim)">
-    Click or drag across the board to paint with the selected swatch. Edits save in this browser and
-    stream to the board live while connected; pressed keys show an outline. Octaves run horizontally;
-    colors are drawn as lit LEDs (hue at full legibility, real brightness as glow).
+    Click or drag to paint with the selected swatch. Edits save in this browser and stream to the
+    boards live while connected; pressed keys show an outline. Mappings are keyed by grid coordinate,
+    so a scheme covers every attached board and survives them being rearranged. Colors are drawn as
+    lit LEDs (hue at full legibility, real brightness as glow).
   </p>
 
   <div class="mb-3 flex flex-wrap items-center gap-2">
@@ -129,24 +146,22 @@
   </div>
 
   <BoardView
-    colors={activeMap().colors}
-    {heldLed}
-    labels={labelMode}
-    {noteNames}
+    {cells}
     {trueColor}
-    onpaint={(led) => paint(led, brush)}
-    onhover={(led) => (hovered = led)}
+    boardCaptions
+    onpaint={(c) => paint(c.x, c.y, brush)}
+    onhover={(c) => (hovered = c)}
   />
 
   <p class="mono m-0 mt-1 text-xs" style="color: var(--text-dim)">
     {#if hovered !== null}
-      {@const c = ledColor(activeMap().colors[hovered])}
-      LED <b style="color: var(--text)">{String(hovered).padStart(2, "0")}</b>
-      · sensor <b style="color: var(--text)">{String(SENSOR_FOR_LED[hovered]).padStart(2, "0")}</b>
+      {@const c = ledColor(hovered.color)}
+      <b style="color: var(--text)">{hovered.x},{hovered.y}</b>
+      {#if mesh.boards.length > 1}· board <b style="color: var(--text)">{hovered.boardUid}</b>{/if}
       · <b style="color: var(--text)">{c.hex}</b>
       · rgb({c.rgb.join(", ")})
       · <b style="color: var(--text)">{Math.round(c.intensity * 100)}%</b> brightness
-      · <b style="color: var(--accent)">{noteNames[hovered]}</b>
+      · <b style="color: var(--accent)">{nameFor(hovered.x, hovered.y)}</b>
     {:else}
       Hover a key for its exact stored value.
     {/if}
