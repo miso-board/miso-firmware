@@ -16,6 +16,14 @@
   let decim = $state("2");
   let activeTab = $state<"calibrate" | "colors" | "midi">("calibrate");
 
+  // Only the Calibrate tab consumes scan frames, and streaming them is what
+  // makes the LED chain flicker (the data line has no voltage margin — see the
+  // README). So stream only while that tab is showing.
+  $effect(() => {
+    if (!ui.connected) return;
+    void serial.send(activeTab === "calibrate" ? "s" : "x");
+  });
+
   function captureRest() {
     toast("Capturing rest — hands off the keys…");
     engine.captureRest(1000, (n) =>
@@ -68,7 +76,7 @@
     await serial.send("i");
     await serial.send("T"); // discover the grid before the first colour push
     await serial.send(`d${decim}\n`);
-    await serial.send("s");
+    if (activeTab === "calibrate") await serial.send("s");
     await pushToBoard(); // restore the active color mapping on the LEDs
   }
 
