@@ -10,11 +10,12 @@
   import PressScope from "./components/PressScope.svelte";
   import StatsTable from "./components/StatsTable.svelte";
   import ColorsTab from "./components/ColorsTab.svelte";
+  import PitchTab from "./components/PitchTab.svelte";
   import MidiMonitor from "./components/MidiMonitor.svelte";
-  import { load as loadColorMaps, pushToBoard } from "./lib/colorMaps.svelte";
+  import { load as loadPresets, pushAll, resetPushed } from "./lib/presets.svelte";
 
   let decim = $state("2");
-  let activeTab = $state<"calibrate" | "colors" | "midi">("calibrate");
+  let activeTab = $state<"calibrate" | "colors" | "pitch" | "midi">("calibrate");
 
   // Only the Calibrate tab consumes scan frames, and streaming them is what
   // makes the LED chain flicker (the data line has no voltage margin — see the
@@ -39,6 +40,11 @@
           if (parseMeshLine(line)) return;
           const info = line.match(/scan_hz=(\d+)/);
           if (info) ui.scanHz = +info[1];
+          // Capability gate for `P`: retuning needs 0.7.0. Sending a binary
+          // command to firmware that lacks it is worse than not sending it —
+          // the payload bytes get re-read as commands.
+          const fw = line.match(/fw=miso (\d+\.\d+\.\d+)/);
+          if (fw) ui.fwVersion = fw[1];
           const ev = line.match(
             /^EV (\d+) (DOWN|UP)(?: vel=(\d+) dt_us=(\d+))?(?: x=(-?\d+) y=(-?\d+))?/,
           );
@@ -73,11 +79,15 @@
     engine.resetTimeline();
     ui.connected = true;
     ui.scanHz = null;
+    ui.fwVersion = null;
+    resetPushed();
     await serial.send("i");
     await serial.send("T"); // discover the grid before the first colour push
     await serial.send(`d${decim}\n`);
     if (activeTab === "calibrate") await serial.send("s");
-    await pushToBoard(); // restore the active color mapping on the LEDs
+    // Restore the active preset: tuning first, so the first note played is
+    // already in tune, then the LEDs.
+    await pushAll();
   }
 
   async function disconnect() {
@@ -86,6 +96,8 @@
     engine.resetTimeline();
     clearHeld(); // no key-up is coming for anything still down
     resetMesh();
+    ui.fwVersion = null;
+    resetPushed(); // the board's tuning may be anything by the time we return
     startSim();
   }
 
@@ -102,7 +114,7 @@
   onMount(() => {
     ui.serialSupported = serial.serialSupported();
     engine.onTracesChanged(refreshTraces);
-    loadColorMaps();
+    loadPresets();
     startSim();
     const restTimer = setTimeout(captureRest, 800);
 
@@ -166,7 +178,7 @@
 </header>
 
 <nav class="flex gap-0.5 border-b px-5" style="background: var(--panel); border-color: var(--line)">
-  {#each [["calibrate", "Calibrate"], ["colors", "Key colors"], ["midi", "MIDI"]] as [id, label]}
+  {#each [["calibrate", "Calibrate"], ["colors", "Key colors"], ["pitch", "Pitch mapping"], ["midi", "MIDI"]] as [id, label]}
     <button
       class="cursor-pointer border-b-2 px-3.5 py-2 font-semibold"
       style="border-color: {activeTab === id ? 'var(--accent)' : 'transparent'};
@@ -176,9 +188,6 @@
       onclick={() => (activeTab = id as typeof activeTab)}
     >{label}</button>
   {/each}
-  <button class="cursor-default border-b-2 border-transparent px-3.5 py-2 font-semibold opacity-50" disabled style="color: var(--text-dim)">
-    Pitch mapping<span class="ml-1.5 text-[9px] uppercase tracking-widest" style="color: var(--accent)">soon</span>
-  </button>
 </nav>
 
 <main class="mx-auto max-w-[1180px] px-5 pt-4 pb-7">
@@ -327,6 +336,8 @@
   </div>
   {:else if activeTab === "colors"}
     <ColorsTab />
+  {:else if activeTab === "pitch"}
+    <PitchTab />
   {:else}
     <MidiMonitor />
   {/if}
@@ -335,7 +346,8 @@
 <footer class="mx-auto max-w-[1180px] px-5 pb-8 text-xs leading-relaxed" style="color: var(--text-dim)">
   Protocol: commands <code class="chip">i</code> info · <code class="chip">s</code>/<code class="chip">x</code>
   stream on/off · <code class="chip">d&lt;N&gt;</code> decimation · <code class="chip">l</code> LED toggle ·
-  <code class="chip">r</code> redo rest calibration · <code class="chip">C</code>+93B set LED colors (RGB, chain order).
+  <code class="chip">r</code> redo rest calibration · <code class="chip">C</code>+93B set LED colors (RGB, chain order) ·
+  <code class="chip">P</code>+16B set the tuning (int32 fifth millicents, 2×2 layout matrix, anchor).
   Scan frame: <code class="chip">A5 5A 01 · u32 t_µs · 31×u16 · u8 checksum</code> (little-endian,
   checksum = byte sum of payload). Firmware: <code class="chip">Core/Src/main.c</code> in the Miso repo.
 </footer>

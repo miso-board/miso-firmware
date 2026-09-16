@@ -37,6 +37,8 @@ export const ui = $state({
   serialSupported: true,
   serialBlocked: false, // SecurityError: embedded context without serial permission
   scanHz: null as number | null,
+  /** Firmware version from the INFO line's `fw=miso X.Y.Z`, null until seen. */
+  fwVersion: null as string | null,
   fps: 0,
   badFrames: 0,
   toast: "",
@@ -46,6 +48,24 @@ export const ui = $state({
   /** Currently-held keys anywhere in the grid, keyed "x,y". */
   held: {} as Record<string, boolean>,
 });
+
+/**
+ * Whether the attached firmware is at least this version.
+ *
+ * Capability gate for commands older firmware does not have. Unknown version
+ * reads as too old, because sending a binary command to a board that does not
+ * know it is worse than not sending it: the payload bytes get read as commands.
+ */
+export function fwAtLeast(major: number, minor: number, patch = 0): boolean {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(ui.fwVersion ?? "");
+  if (!m) return false;
+  const have = [+m[1], +m[2], +m[3]];
+  const want = [major, minor, patch];
+  for (let i = 0; i < 3; i++) {
+    if (have[i] !== want[i]) return have[i] > want[i];
+  }
+  return true;
+}
 
 export function pushEvent(ev: KeyEvent): void {
   ui.events.unshift(ev);

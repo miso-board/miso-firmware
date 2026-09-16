@@ -17,7 +17,9 @@
 // The `stat` line is always last, so it doubles as the commit point for a
 // snapshot — a half-parsed grid is never shown.
 
-import { LED_POS, SENSOR_FOR_LED, NUM_KEYS } from "./layout";
+import { LED_POS, SENSOR_FOR_LED, NUM_KEYS, cellKey } from "./layout";
+
+export { cellKey };
 
 /** Neighbour offsets, matching dir_vec[] in the firmware's mesh.c. */
 export const RIGHT: readonly [number, number] = [5, 2];
@@ -157,7 +159,6 @@ export function resetMesh(): void {
   mesh.stats = { missedDown: 0, fixedUp: 0, lostRelease: 0, geomErr: 0, multiMaster: 0 };
 }
 
-export const cellKey = (x: number, y: number): string => `${x},${y}`;
 
 /** Every key in the grid, in board order then LED-chain order. */
 export function gridCells(): Cell[] {

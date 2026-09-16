@@ -12,6 +12,17 @@
 //  - LED index: position in the SK6812 chain (serpentine, column by column)
 //  - grid coordinate: physical position, shared by a cell's sensor and LED
 
+/**
+ * Identity of one key in the whole grid, as a string usable as an object key.
+ *
+ * Boards tile on a lattice of determinant 31 — exactly the key count — so an
+ * absolute coordinate names exactly one key anywhere in the mesh. That is what
+ * lets both colour and pitch mappings be keyed by coordinate rather than by
+ * board and LED index. (Re-exported from mesh.svelte.ts, which is where callers
+ * historically imported it from.)
+ */
+export const cellKey = (x: number, y: number): string => `${x},${y}`;
+
 export const NUM_KEYS = 31;
 export const GRID_W = 7;
 export const GRID_H = 7;
@@ -52,9 +63,13 @@ export const SENSOR_POS: readonly (readonly [number, number])[] = LED_FOR_SENSOR
  * Octave direction in axial coordinates.
  *
  * Inferred from the Bosanquet boot pattern, whose accidental classes fall in
- * 3-wide bands of (x − 2y): that reads as (1,0) = whole tone = 5 steps of
- * 31-EDO and (0,1) = diatonic semitone = 3 steps, making (5,2) exactly 31
- * steps — one octave. Confirm this before the pitch mapping depends on it.
+ * 3-wide bands of (x − 2y): that reads as (1,0) = whole tone and (0,1) = a
+ * diatonic semitone, making (5,2) an octave. Confirmed against the hardware via
+ * the MIDI monitor, and the pitch mapping now depends on it.
+ *
+ * This is PHYSICAL geometry — how the board sits on screen — not pitch. It must
+ * not follow the chosen layout: under Wicki-Hayden the octave is not (5,2) in
+ * grid coordinates, but the board does not rotate.
  */
 export const OCTAVE_AXIAL: readonly [number, number] = [5, 2];
 

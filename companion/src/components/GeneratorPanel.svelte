@@ -1,15 +1,21 @@
 <script lang="ts">
-  import { LAYOUTS, accidentalLabel, noteName, pitchAt, type LayoutId } from "../lib/tuning";
+  import { LAYOUTS, accidentalLabel, noteName, pitchAt, CENTRE_KEY, type LayoutId } from "../lib/tuning";
   import { swatchStyle } from "../lib/ledColor";
+  import { DEFAULT_GENERATOR, type GeneratorParams } from "../lib/colorMaps";
   import {
-    activeMap, createProceduralMap, updateGenerator, DEFAULT_GENERATOR,
-  } from "../lib/colorMaps.svelte";
+    activeColors, createProceduralColorMap, updateColorGenerator,
+  } from "../lib/presets.svelte";
 
-  const gen = $derived(activeMap().generator);
+  const updateGenerator = (patch: Partial<GeneratorParams>) => updateColorGenerator(patch);
+
+  const gen = $derived(activeColors().generator);
   const layout = $derived(gen ? LAYOUTS[gen.layout] : LAYOUTS.bosanquet);
-  // The board's centre key, as a readable anchor for the offset controls.
-  const centreNote = $derived(
-    gen ? noteName(pitchAt(layout, 3, 3, gen.offset)) : "",
+  // Which note the colour rows are reckoned from at the board's centre key.
+  // This follows the COLOUR offset, not the preset's pitch mapping — the two are
+  // independent, so it is labelled as a colour reference rather than as the note
+  // the key sounds. The Pitch mapping tab is where sounding pitch lives.
+  const colourRefNote = $derived(
+    gen ? noteName(pitchAt(layout, CENTRE_KEY[0], CENTRE_KEY[1], gen.offset)) : "",
   );
 
   function setPaletteColor(i: number, hex: string) {
@@ -26,12 +32,12 @@
 
   function removeRow(i: number) {
     if (!gen || gen.palette.length <= 1) return;
-    updateGenerator({ palette: gen.palette.filter((_, j) => j !== i) });
+    updateGenerator({ palette: gen.palette.filter((_: string, j: number) => j !== i) });
   }
 
   function nudge(axis: 0 | 1, delta: number) {
     if (!gen) return;
-    const offset: [number, number] = [...gen.offset];
+    const offset: [number, number] = [gen.offset[0], gen.offset[1]];
     offset[axis] += delta;
     updateGenerator({ offset });
   }
@@ -49,9 +55,9 @@
     <p class="m-0 mb-2.5 text-xs" style="color: var(--text-dim)">
       Colour every key by the accidental of the note that lands on it — the key's Bosanquet row —
       computed with <b>meantonal</b>. Rows beyond your palette wrap back through it.
-      This mapping was painted by hand, so generating starts a new one.
+      This preset's colours were painted by hand, so generating replaces them.
     </p>
-    <button class="btn primary" onclick={() => createProceduralMap()}>New procedural mapping</button>
+    <button class="btn primary" onclick={() => createProceduralColorMap()}>Generate colour rows</button>
   {:else}
     <p class="m-0 mb-3 text-xs" style="color: var(--text-dim)">
       Each palette row is one accidental; rows past the end wrap back to the start.
@@ -96,8 +102,8 @@
       </div>
 
       <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
-        Centre key
-        <span class="mono text-base" style="color: var(--accent)">{centreNote}</span>
+        Colour reference
+        <span class="mono text-base" style="color: var(--accent)" title="Which note the colour rows are reckoned from — not necessarily what the key sounds">{colourRefNote}</span>
       </div>
 
       <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">

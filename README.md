@@ -122,6 +122,7 @@ interface on the same USB-C port:
 | `L` + `int16 x`, `int16 y`, 93 bytes | Set LED colors on the board at that grid origin, anywhere in the mesh |
 | `B!`    | Reboot into the USB DFU bootloader (two bytes, so a stray character can't misfire) |
 | `C` + 93 bytes | Set all LED background colors: 31 × RGB, LED-chain order (a stalled frame aborts after 200 ms) |
+| `P` + 16 bytes | Set the pitch map: `int32` fifth in millicents, `int16` m00 m01 m10 m11 (grid → `(w, h)` basis change), `int16` anchor w, h. Little-endian, validated before it is installed |
 
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
 (little-endian; checksum = byte sum of the payload).
@@ -197,32 +198,58 @@ hand-written in `USB_DEVICE/App/usbd_composite.c` (CubeMX only generates
 single-class devices); CDC keeps its original endpoints and its app-layer API,
 so the companion protocol was unaffected.
 
-Layout is **Bosanquet in 31-EDO**, with D4 on the centre key. Each key's pitch
-is derived with integer arithmetic only — MIDI wants a note number and a bend,
-never a frequency:
+The pitch map is **nine numbers pushed over `P`** and held in RAM. Two things
+are kept apart, because they are independent:
+
+A **layout** is a 2×2 integer basis change from the board's grid axes into
+meantonal's `(w, h)` — whole tones and diatonic semitones. The board's axial
+grid *already is* that basis (`+x` a whole tone, `+y` a diatonic semitone), so
+**Bosanquet is the identity** and only the anchor is left to choose.
+**Wicki-Hayden** is meantonal's `WICKI_FROM` composed with a vertical flip of
+the board, `w = x - 2y, h = -y`, i.e. the matrix `(1, -2, 0, -1)` — note that a
+vertical flip in a skewed axial basis is `(x, y) -> (x + y, -y)`, not `(x, -y)`;
+plain negation breaks hex adjacency and turns one diagonal into a major 6th.
+Because a layout lives in pitch space, it means the same thing in every tuning.
+
+A **tuning** is *one* number: the width of its fifth. Every tuning in the
+meantone family is determined by it, so cents are linear in it —
 
 ```
-w = x + 23 ,  h = y + 7             anchor only; no basis change
-step = 5w + 3h                      31-EDO step (whole tone 5, semitone 3)
-note = round(step * 12 / 31)        nearest 12-EDO MIDI note
-bend = 8192 + round((step*1200 - note*3100) * 8192 / (4800 * 31))
+(w, h) = M·(x, y) + anchor
+cents  = fifth·(2w - 5h) + 1200·(3h - w)      meantonal's GENERATORS_TO, written out
+note   = round(cents / 100)                   nearest 12-EDO MIDI note
+bend   = 8192 + round((cents - note*100) * 8192 / 4800)
 ```
 
-The board's axial grid *is* meantonal's `(w, h)` pitch basis — `+x` a whole
-tone, `+y` a diatonic semitone — so Bosanquet is the identity map and only the
-anchor is left to choose. That also makes the pitch mapping agree with the
-boot colour pattern, which groups keys by accidental along the same rows.
+— and an EDO is just one way to pick the fifth, `round(log2(1.5)·edo)·1200/edo`.
+That is why there is no per-EDO step lattice and no per-key table here: 16 bytes
+of parameters retune the whole instrument, evaluated at absolute coordinates so
+one frame covers every board in the mesh. The firmware carries `cents` in
+**millicents** to stay in integers; MIDI wants a note number and a bend, never a
+frequency, so no floating point is needed anywhere.
 
-The companion still carries **Wicki-Hayden** (meantonal's `WICKI_FROM` composed
-with a vertical flip of the board, `w = x - 2y`, `h = -y`) as an alternative for
-colour generation; note that a vertical flip in a skewed axial basis is
-`(x, y) -> (x + y, -y)`, not `(x, -y)` — plain negation breaks hex adjacency and
-turns one diagonal into a major 6th.
+The default is **Bosanquet in 31-EDO with D4 on the centre key** — fifth 696774
+millicents, identity matrix, anchor (23, 7) — which is **byte-identical to the
+hardcoded formula it replaced** for every key, so a board that never hears from
+the companion sounds exactly as it always did.
 
-The music theory behind those constants lives in the companion's
-`src/lib/tuning.ts`, which uses [meantonal](https://meantonal.org/) — the
-firmware only needs the reduced formulas. Both were cross-checked: identical
-note numbers for all 31 keys and identical bend values.
+`P` needs no mesh propagation, and deliberately gets none: MIDI is generated
+only by the USB-connected board, which already plays every key in the grid from
+absolute coordinates (`Miso_EmitKeyDown`), so the master is the only board that
+needs a tuning at all. Broadcasting would only create a way for a child's copy
+to drift from the master's.
+
+Retuning under a held key is safe without special handling: `mpe_voice_t` caches
+each voice's note number precisely so a note-off sends the note that was
+actually started.
+
+The music theory lives in the companion's `src/lib/tuning.ts`, which asks
+[meantonal](https://meantonal.org/) rather than reimplementing the firmware's
+arithmetic — so when the MIDI monitor finds them agreeing, that means the push
+arrived and was applied. The two are cross-checked on the host by
+`companion/scripts/check-firmware-pitch.py`, which extracts `pitch_for_xy`
+verbatim from `main.c`, compiles it, and diffs it against the companion over
+nine tunings, both layouts and a four-board grid.
 
 Output is **MPE lower zone** — master channel 1, member channels 2–16, so 15
 simultaneous notes each with their own pitch bend carrying the microtonal
@@ -547,10 +574,34 @@ re-triggering it on a colour push is one call if that turns out to be wanted.
 **Companion app** (`companion/`): Svelte 5 + TypeScript + Tailwind + [meantonal](https://meantonal.org/),
 built with Vite. It shows live per-key levels with min/max watermarks, per-key stats
 (rest / min / max / noise σ), and auto-triggered press-waveform capture with
-20→70% transit times — plus the **Key colors** tab: a click-to-paint view of
-the board (axial hex rendering) with named color mappings saved in
-the browser and streamed to the board live, either painted by hand or generated
-procedurally. Pitch mapping is next.
+20→70% transit times — plus the two tabs that set the instrument up.
+
+A **preset** is how the instrument is set up: an LED mapping *and* a pitch
+mapping, with room for further preset-scoped settings. One selector, shared by
+both tabs, because switching preset changes what the instrument looks like and
+what it plays together. The **Key colors** tab is a click-to-paint view of the
+board (axial hex rendering); the **Pitch mapping** tab shows what every key
+sounds — note name, MIDI number, bend, frequency — and pushes the tuning to the
+board over `P`. Both halves are keyed by absolute coordinate, generated
+procedurally or set per key, and evaluated lazily so a board attached later
+simply resolves.
+
+The two halves differ in one structural respect. A colour layer's generator is
+optional: hand-painting freezes it, because an unpainted coordinate can safely be
+black. A pitch map's generator is **mandatory and permanent** — a coordinate with
+no pitch is a silent key, and `P` carries parameters rather than a table, so
+freezing one would leave nothing to send. Pitch overrides are additive
+exceptions layered on top, and retuning never discards them.
+
+Storage moved to `miso-presets-v1`; a `miso-color-maps-v2` payload reads as a
+preset list whose pitch maps are the 31-EDO Bosanquet default — which is what the
+firmware already played, so migrating changes nothing about how a board sounds.
+The superseded keys are left in place as backups.
+
+Per-key pitch entry is modelled and persisted but has no editor yet: `P` pushes
+parameters, so an overridden key cannot be expressed in it, and carrying them
+needs either a sparse second command or a full per-board table. The procedural
+path came first deliberately.
 
 **It is grid-aware.** The app polls `T` once a second and models the discovered
 mesh in `companion/src/lib/mesh.svelte.ts`, so a tiled set of boards renders as
@@ -560,26 +611,29 @@ one. Key events carry their coordinate, the MIDI monitor checks incoming notes
 against the pitch at the *absolute* coordinate (so a note from a neighbouring
 board is verified like any other), and the header shows a live board count.
 
-Colour mappings are keyed by **absolute grid coordinate**, not LED index, so one
+Both mappings are keyed by **absolute grid coordinate**, not LED index, so one
 scheme covers however many boards are attached and survives them being added,
 removed or rearranged — which also matches how the procedural generator always
 worked, colouring by the accidental of the pitch at a coordinate. Pushing sends
 one `L` frame per board. Generated schemes are evaluated lazily rather than
 materialised, so attaching another board needs no regeneration.
 
-Storage moved to `miso-color-maps-v2` with automatic migration: a v1 31-entry
-LED-indexed array is read as a board at the origin, and the v1 key is left in
-place as a backup rather than deleted.
+Colour storage passed through `miso-color-maps-v2` on the way here, which read a
+v1 31-entry LED-indexed array as a board at the origin; both older keys are still
+read as a fallback and still left in place as backups.
 
 Two limits worth knowing. The **Calibrate tab is master-only** — the firmware
 forwards key events, not raw scans, and remote sensor data at full rate would be
 93 kB/s against a 46 kB/s link, so live levels, stats and press capture show only
-the USB board's own keys. And connecting to firmware older than 0.6.0 still
-works: with no topology seen, the app falls back to a single board at the origin
-and the original `C` colour frame.
+the USB board's own keys. And connecting to older firmware still works: with no
+topology seen, the app falls back to a single board at the origin and the
+original `C` colour frame, and `P` is withheld below 0.7.0 — that gate is
+load-bearing rather than polite, because a board that does not know `P` would
+read its 16 payload bytes as commands, and `C` (0x43) or `L` (0x4C) are entirely
+reachable values in a millicent count or a signed matrix entry.
 
-The **procedural generator** colours each key by the accidental of the note
-that lands on it — the key's Bosanquet row — via meantonal. That library
+The **procedural colour generator** colours each key by the accidental of the
+note that lands on it — the key's Bosanquet row — via meantonal. That library
 represents a pitch as a vector of whole steps and diatonic semitones above
 C₋₁, with the octave as (5,2) and a sharp as (1,−1): exactly this board's axial
 basis, so a grid coordinate is a pitch vector plus an anchor and
@@ -601,4 +655,17 @@ cd companion
 npm install
 npm run dev     # → http://localhost:5173, connects to the board
 npm run build   # dist/miso-companion.html (single file, publishable as artifact demo)
+npm run check:all   # types, then the pitch cross-checks below
 ```
+
+Three checks, because the pitch pipeline spans two languages and a wire format:
+
+| Command | What it proves |
+|---------|----------------|
+| `npm run check` | `svelte-check`: types across the app |
+| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192) |
+| `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `main.c`, compiles it with clang, and diffs it against the app over nine tunings × both layouts × a four-board grid — plus the byte-identical-default claim |
+
+The 12-TET case is the one to keep: at a 700¢ fifth a wrong coefficient would not
+collapse to equal temperament, a wrong anchor would disagree with meantonal's own
+`midi` accessor, and any rounding bias would show as a bend off 8192.

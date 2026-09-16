@@ -1,14 +1,13 @@
 <script lang="ts">
   import BoardView, { type ViewCell } from "./BoardView.svelte";
   import GeneratorPanel from "./GeneratorPanel.svelte";
-  import { LAYOUTS, pitchAt, noteName } from "../lib/tuning";
+  import PresetBar from "./PresetBar.svelte";
+  import { noteName, pitchOn } from "../lib/tuning";
+  import { colorAt } from "../lib/colorMaps";
   import { swatchStyle, ledColor } from "../lib/ledColor";
-  import { ui, toast } from "../lib/ui.svelte";
+  import { ui } from "../lib/ui.svelte";
   import { mesh, gridCells } from "../lib/mesh.svelte";
-  import {
-    colorState, activeMap, colorAt, paint, fillAll, newMap, duplicateMap, renameMap,
-    deleteMap, selectMap, pushToBoard, copyMapJson, importMapJson,
-  } from "../lib/colorMaps.svelte";
+  import { activePreset, activeColors, paint, fillAll } from "../lib/presets.svelte";
 
   // Presets pre-dimmed for SK6812s — full-brightness values are blinding.
   const PRESETS = [
@@ -22,19 +21,19 @@
   let trueColor = $state(false);
   let hovered = $state<ViewCell | null>(null);
 
-  // Note names follow the active mapping's layout; hand-painted mappings fall
-  // back to the Bosanquet default so the labels always mean something.
+  // Note names come from the preset's PITCH mapping, not from the colour
+  // generator's layout and offset. Those are independent — a preset can colour by
+  // Bosanquet rows while sounding Wicki-Hayden — so labelling keys from the
+  // colour side would name notes they do not play.
   const nameFor = $derived.by(() => {
-    const gen = activeMap().generator;
-    const layout = LAYOUTS[gen?.layout ?? "bosanquet"];
-    const offset = gen?.offset ?? ([0, 0] as [number, number]);
-    return (x: number, y: number) => noteName(pitchAt(layout, x, y, offset));
+    const pitch = activePreset().pitch;
+    return (x: number, y: number) => noteName(pitchOn(pitch, x, y));
   });
 
   // One entry per key in the whole grid, positioned by absolute coordinate, so
   // a tiled set of boards renders as the single continuous instrument it is.
   const cells = $derived.by<ViewCell[]>(() => {
-    const m = activeMap();
+    const m = activeColors();
     return gridCells().map((c) => {
       const color = colorAt(m, c.x, c.y);
       const note = nameFor(c.x, c.y);
@@ -64,11 +63,6 @@
         .join("");
   }
 
-  function importPrompt() {
-    const text = window.prompt("Paste a mapping JSON (miso-colors-1):");
-    if (text && !importMapJson(text)) toast("Couldn't parse that mapping JSON.");
-    else if (text) toast("Mapping imported.");
-  }
 </script>
 
 <section
@@ -76,7 +70,7 @@
   style="background: var(--panel); border-color: var(--line); box-shadow: var(--shadow)"
 >
   <h2 class="m-0 mb-1 text-[11px] font-semibold uppercase tracking-[0.14em]" style="color: var(--text-dim)">
-    Key colors — {activeMap().name}
+    Key colors — {activePreset().name}
   </h2>
   <p class="m-0 mb-2.5 text-xs" style="color: var(--text-dim)">
     Click or drag to paint with the selected swatch. Edits save in this browser and stream to the
@@ -85,29 +79,7 @@
     lit LEDs (hue at full legibility, real brightness as glow).
   </p>
 
-  <div class="mb-3 flex flex-wrap items-center gap-2">
-    <select class="btn" value={colorState.active} onchange={(e) => selectMap(+e.currentTarget.value)}>
-      {#each colorState.maps as m, i}<option value={i}>{m.name}</option>{/each}
-    </select>
-    <input
-      class="btn"
-      style="width: 150px"
-      value={activeMap().name}
-      onchange={(e) => renameMap(e.currentTarget.value || "Untitled")}
-      aria-label="Mapping name"
-    />
-    <button class="btn" onclick={newMap}>New</button>
-    <button class="btn" onclick={duplicateMap}>Duplicate</button>
-    <button class="btn" onclick={deleteMap}>Delete</button>
-    <div class="flex-1"></div>
-    <button class="btn" onclick={copyMapJson}>Copy JSON</button>
-    <button class="btn" onclick={importPrompt}>Import…</button>
-    <button
-      class="btn primary"
-      disabled={!ui.connected}
-      onclick={() => { void pushToBoard(); toast("Colors sent to board."); }}
-    >Send to board</button>
-  </div>
+  <PresetBar sends="colors" />
 
   <div class="mb-3 flex flex-wrap items-center gap-2">
     <span class="text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">Brush</span>
@@ -188,5 +160,4 @@
   }
   .btn:hover:not(:disabled) { border-color: var(--accent-dim); }
   .btn:disabled { opacity: 0.45; cursor: default; }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 </style>

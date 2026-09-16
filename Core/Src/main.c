@@ -67,20 +67,34 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.6.0"
+#define FW_VERSION          "miso 0.7.0"
 #define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
 // --- MIDI / MPE ---------------------------------------------------------
-// Bosanquet on a 31-EDO lattice. meantonal represents a pitch as
-// (w, h) = whole steps and diatonic semitones above C-1, and this board's grid
-// axes are already those axes, so the mapping is just the anchor: w = x + W0,
-// h = y + H0. The authoring-side source of truth is companion/src/lib/tuning.ts.
-#define TUNE_W0             23     // anchor: puts D4 on the centre key (3,3)
+// The pitch map is nine numbers, pushed by the companion over 'P' and held in
+// RAM. meantonal represents a pitch as (w, h) = whole steps and diatonic
+// semitones above C-1, and a LAYOUT is a 2x2 integer basis change from this
+// board's grid axes into those: identity is Bosanquet (+x a whole tone, +y a
+// diatonic semitone), and (1,-2,0,-1) is Wicki-Hayden.
+//
+// A TUNING is one number, the width of the fifth, because every tuning in the
+// meantone family is determined by it -- an EDO is just one way to choose it.
+// That is why no per-EDO step lattice and no per-key table are needed here:
+//
+//   cents(w, h) = fifth*(2w - 5h) + 1200*(3h - w)
+//
+// carried in MILLICENTS so it stays integer. The authoring-side source of truth
+// is companion/src/lib/tuning.ts, which asks meantonal instead; the two are
+// cross-checked by companion/scripts/check-tuning.mjs.
+#define TUNE_W0             23     // default anchor: puts D4 on the centre key (3,3)
 #define TUNE_H0             7
-#define EDO_STEPS           31     // divisions of the octave
-#define EDO_WHOLE_TONE      5      // 31-EDO steps in a whole tone
-#define EDO_DIATONIC_SEMI   3      // 31-EDO steps in a diatonic semitone
+#define TUNE_FIFTH_DEFAULT  696774 // 31-EDO: round(18 * 1200 / 31) millicents
+#define TUNE_FIFTH_MIN      685714 // below this a fifth has no diatonic scale
+#define TUNE_FIFTH_MAX      720000 // above this likewise
+#define TUNE_MATRIX_MAX     64     // sanity bound on a pushed basis change
+#define TUNE_ANCHOR_MAX     4096   // sanity bound on a pushed anchor
+#define PITCH_MSG_LEN       16     // payload bytes after 'P'
 #define MPE_MEMBER_FIRST    1      // MIDI channel index of member channel 1 (= channel 2)
 #define MPE_MEMBER_COUNT    15     // channels 2..16
 #define MPE_BEND_SEMITONES  48     // MPE default; 0.59 cents per bend unit
@@ -587,6 +601,17 @@ static volatile uint8_t  cq_head = 0, cq_tail = 0;
 static volatile uint16_t cq_fill = 0;     // bytes written into the head slot
 static volatile uint8_t  cq_active = 0;
 static volatile uint32_t cq_dropped = 0;  // queue full; surfaced by 'i'
+
+// The pushed pitch map. A single buffer rather than a queue: tuning parameters
+// are idempotent and last-write-wins, so there is nothing to lose by dropping an
+// older frame. The ISR only fills this and raises pq_ready; the main loop
+// installs it, because pitch_for_xy() runs from the main loop and must never
+// read a set being written under it.
+static volatile uint8_t  pq_buf[PITCH_MSG_LEN];
+static volatile uint8_t  pq_fill = 0;
+static volatile uint8_t  pq_active = 0;   // mid-frame, collecting payload bytes
+static volatile uint8_t  pq_ready = 0;    // a complete frame awaits the main loop
+static volatile uint32_t pq_rejected = 0; // failed validation; surfaced by 'i'
 static volatile uint32_t last_rx_tick = 0;
 
 // Binary scan frame: A5 5A 01 | u32 t_us | 31 x u16 raw | u8 checksum(payload)
@@ -698,30 +723,78 @@ static void midi_send(uint8_t cin, uint8_t status, uint8_t d1, uint8_t d2)
   USBD_MIDI_Send(pkt);
 }
 
-// Pitch for ANY absolute grid coordinate, in integers: 31-EDO step -> nearest
-// MIDI note plus a bend for the remainder. No floating point and no Hz: MIDI
-// wants note+bend. Taking a coordinate rather than a sensor index is what lets
-// the master sound keys that live on a neighbouring board.
+// The live pitch map. Seeded to Bosanquet in 31-EDO with D4 on the centre key,
+// which is what this board played before 'P' existed -- so a board that never
+// hears from the companion sounds exactly as it always did, and a fresh install
+// of the companion pushes these same values back.
+typedef struct {
+  int32_t fifth_milli;                  /* width of the fifth, millicents */
+  int16_t m00, m01, m10, m11;           /* grid -> (w, h) basis change */
+  int16_t aw, ah;                       /* anchor added after the map */
+} pitch_params_t;
+
+static volatile pitch_params_t pitch_params = {
+  TUNE_FIFTH_DEFAULT, 1, 0, 0, 1, TUNE_W0, TUNE_H0
+};
+
+// Pitch for ANY absolute grid coordinate, in integers: cents above C-1 ->
+// nearest MIDI note plus a bend for the remainder. No floating point and no Hz:
+// MIDI wants note+bend. Taking a coordinate rather than a sensor index is what
+// lets the master sound keys that live on a neighbouring board.
 // Returns 0 if the pitch falls outside MIDI range.
 static uint8_t pitch_for_xy(int32_t x, int32_t y, uint8_t *note_out, uint16_t *bend_out)
 {
-  // Bosanquet: the board's axial grid IS meantonal's (w, h) basis, so +x is a
-  // whole tone, +y a diatonic semitone and the identity needs no basis change.
-  int32_t w = x + TUNE_W0;
-  int32_t h = y + TUNE_H0;
-  int32_t step = EDO_WHOLE_TONE * w + EDO_DIATONIC_SEMI * h;
+  // Snapshot first: the main loop can install new parameters between any two
+  // reads, and a torn set would put w and h in different tunings.
+  pitch_params_t p = pitch_params;
 
-  // round(step * 12 / 31). div_round rather than the old (step*12+15)/31: on a
-  // multi-board grid a coordinate can be negative, and C division truncates
-  // toward zero, which would round the wrong way there.
-  int32_t note = div_round(step * 12, EDO_STEPS);
-  // Remaining offset, carried as cents x 31 to stay in integers.
-  int32_t off31 = step * 1200 - note * 100 * EDO_STEPS;
-  int32_t bend = 8192 + div_round(off31 * 8192, MPE_BEND_CENTS * EDO_STEPS);
+  int32_t w = p.m00 * x + p.m01 * y + p.aw;
+  int32_t h = p.m10 * x + p.m11 * y + p.ah;
+
+  // Millicents above C-1. Bounded well inside int32: the term is ~1e7 over a
+  // grid of any size a link can address.
+  int32_t cm = p.fifth_milli * (2 * w - 5 * h) + 1200000 * (3 * h - w);
+
+  // div_round rather than C division: on a multi-board grid a coordinate can be
+  // negative, and truncation toward zero would round the wrong way there.
+  int32_t note = div_round(cm, 100000);
+  int32_t rem  = cm - note * 100000;                 /* |rem| <= 50000 */
+  int32_t bend = 8192 + div_round(rem * 8192, MPE_BEND_CENTS * 1000);
 
   if (note < 0 || note > 127 || bend < 0 || bend > 16383) return 0;
   *note_out = (uint8_t)note;
   *bend_out = (uint16_t)bend;
+  return 1;
+}
+
+// Install a pushed pitch map, rejecting a frame that cannot be one. These bytes
+// come from a host, and a wild fifth or basis change would put every key out of
+// MIDI range and silence the instrument with no way to tell why.
+// Returns 0 if the frame was rejected.
+static uint8_t pitch_params_apply(const uint8_t *m)
+{
+  int32_t fifth = (int32_t)((uint32_t)m[0] | ((uint32_t)m[1] << 8)
+                            | ((uint32_t)m[2] << 16) | ((uint32_t)m[3] << 24));
+  if (fifth < TUNE_FIFTH_MIN || fifth > TUNE_FIFTH_MAX) return 0;
+
+  int16_t v[6];
+  for (int i = 0; i < 6; i++) {
+    v[i] = (int16_t)((uint16_t)m[4 + i * 2] | ((uint16_t)m[5 + i * 2] << 8));
+  }
+  for (int i = 0; i < 4; i++) {
+    if (v[i] < -TUNE_MATRIX_MAX || v[i] > TUNE_MATRIX_MAX) return 0;
+  }
+  if (v[0] * v[3] - v[1] * v[2] == 0) return 0;   /* singular: rows collapse */
+  for (int i = 4; i < 6; i++) {
+    if (v[i] < -TUNE_ANCHOR_MAX || v[i] > TUNE_ANCHOR_MAX) return 0;
+  }
+
+  pitch_params.fifth_milli = fifth;
+  pitch_params.m00 = v[0]; pitch_params.m01 = v[1];
+  pitch_params.m10 = v[2]; pitch_params.m11 = v[3];
+  pitch_params.aw  = v[4]; pitch_params.ah  = v[5];
+  // Sounding voices keep the note they started with (see mpe_voice_t), so a
+  // retune under a held key cannot strand it -- deliberately nothing to do here.
   return 1;
 }
 
@@ -936,6 +1009,9 @@ static void keys_process(uint32_t t_us)
 //            of the board at that grid origin, wherever it is in the mesh
 //   B!       reboot into the USB DFU bootloader (two bytes, to avoid misfires)
 //   C        followed by 93 bytes: RGB for all 31 LEDs, LED-chain order
+//   P        followed by 16 bytes: the pitch map -- int32 fifth in millicents,
+//            int16 m00, m01, m10, m11 (grid -> (w, h) basis change), int16
+//            anchor w, h. Little-endian, validated before it is installed.
 void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
 {
   static uint8_t collecting_decim = 0;
@@ -956,6 +1032,14 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
         // has not consumed. The slot is simply reused by the next frame.
         if (next != cq_tail) cq_head = next;
         else cq_dropped++;
+      }
+      continue;
+    }
+    if (pq_active) {
+      pq_buf[pq_fill++] = c;
+      if (pq_fill >= PITCH_MSG_LEN) {
+        pq_active = 0;
+        pq_ready = 1;
       }
       continue;
     }
@@ -1002,6 +1086,7 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
         break;
       }
       case 'L': cq_active = 1; cq_fill = 0; break;
+      case 'P': pq_active = 1; pq_fill = 0; break;
       case 'T': topo_req = 1; break;
       case 'p': collecting_thr = 1; thr_val = 0; break;
       case 'n': scan_enabled ^= 1; break;
@@ -1174,7 +1259,8 @@ int main(void)
       char line[224];
       snprintf(line, sizeof(line),
                "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u links=%c%c%c%c usb=%u cdrop=%lu "
-               "usbdef=%lu thr=%lu scan=%u ledchurn=%lu dmachurn=%lu\r\n",
+               "usbdef=%lu thr=%lu scan=%u ledchurn=%lu dmachurn=%lu "
+               "fifth=%ld M=%d,%d,%d,%d anchor=%d,%d preject=%lu\r\n",
                FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
                stream_on, led_viz_on,
                link_state_char(LINK_PORT_TOP), link_state_char(LINK_PORT_BOTTOM),
@@ -1182,7 +1268,10 @@ int main(void)
                link_self_has_usb(), (unsigned long)cq_dropped,
                (unsigned long)usb_defers,
                (unsigned long)scan_throttle_us, scan_enabled,
-               (unsigned long)led_churn, (unsigned long)dma_churn);
+               (unsigned long)led_churn, (unsigned long)dma_churn,
+               (long)pitch_params.fifth_milli,
+               pitch_params.m00, pitch_params.m01, pitch_params.m10, pitch_params.m11,
+               pitch_params.aw, pitch_params.ah, (unsigned long)pq_rejected);
       cdc_send_text(line);
     }
 
@@ -1225,8 +1314,15 @@ int main(void)
       topo_req = 0;
       mesh_dump();
     }
+    if (pq_ready) {
+      pq_ready = 0;
+      if (!pitch_params_apply((const uint8_t *)pq_buf)) pq_rejected++;
+    }
     if (cq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
       cq_active = 0;   // half-received frame: abandon the slot, keep the queue
+    }
+    if (pq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
+      pq_active = 0;   // likewise, so a truncated 'P' cannot wedge the parser
     }
 
     // LED rendering, decimated so the WS2812 DMA (~1.6 ms per refresh)

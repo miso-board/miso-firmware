@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/flatten.mjs",
-    "check": "svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check:tuning": "node --import ./scripts/ts-resolve.mjs scripts/check-tuning.mjs",
+    "check:firmware": "python3 scripts/check-firmware-pitch.py",
+    "check:all": "npm run check && npm run check:tuning && npm run check:firmware"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
