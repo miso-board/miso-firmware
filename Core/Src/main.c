@@ -445,6 +445,105 @@ uint32_t scan_hz = 0;  // measured full-scan rate, updated once per second
 // pattern and replaced by host color frames.
 static uint8_t led_background[NUM_LEDS][3];
 
+// --- Boot ripple -------------------------------------------------------------
+//
+// The colour mapping does not appear all at once: starting from a dark board,
+// a bright whitened wavefront sweeps across from left to right and leaves the
+// mapped colour behind it, so the board looks like it is waking up into its
+// mapping rather than switching into it.
+//
+// SWEEP AXIS. The board is a sheared axial hex grid, so "left to right" on the
+// physical board is not the x column index. Rendering rotates the grid until
+// the octave direction (5,2) lies horizontal -- the standard Bosanquet
+// orientation, which is how the board is physically laid out -- and under that
+// rotation the screen x of a key works out to exactly
+//
+//     screen_x = (4.5 / sqrt(117)) * (4x + 3y)
+//
+// so 4x + 3y IS the left-to-right coordinate and the sweep needs no
+// trigonometry, just that integer per LED. (Cross-checked against LED_PIXEL in
+// companion/src/lib/layout.ts, which derives the rotation independently: the
+// ratio is constant to nine decimal places across all 31 keys.)
+//
+// The 31 keys span 4x + 3y = 8 (at (2,0)) to 34 (at (4,6)), 26 units across 26
+// distinct values, so nearly every key gets its own arrival time.
+#define WAVE_POS_MIN    8u     // min 4x+3y over the 31 keys
+#define WAVE_POS_MAX    34u    // max
+#define WAVE_UNIT       256    // fixed-point sub-steps per grid unit
+#define WAVE_LEAD       (3 * WAVE_UNIT)   // dark -> crest, ahead of the front
+#define WAVE_TAIL       (7 * WAVE_UNIT)   // crest -> mapped colour, behind it
+#define WAVE_TRAVEL_MS  900u   // leading edge entering to trailing edge leaving
+#define WAVE_FRAME_MS   20u    // ~1.6 ms of that is the LED DMA itself
+#define WAVE_FRAMES     (WAVE_TRAVEL_MS / WAVE_FRAME_MS)
+#define WAVE_WHITE      150u   // crest level; the target colour is lifted to it
+
+// 4x + 3y per LED chain index: where each key sits along the sweep.
+static const uint8_t led_wave_pos[NUM_LEDS] = {
+  12,  9, 10, 13, 16, 19, 23, 20, 17, 14, 11,  8, 12, 15, 18, 21,
+  24, 27, 30, 34, 31, 28, 25, 22, 19, 23, 26, 29, 32, 33, 30,
+};
+
+// One frame of the ripple, with the front edge at `front` (fixed point).
+static void wave_frame(int32_t front)
+{
+  for (uint8_t l = 0; l < NUM_LEDS; l++) {
+    int32_t d = front - (int32_t)led_wave_pos[l] * WAVE_UNIT;
+    if (d <= -WAVE_LEAD) { set_pixel(l, 0, 0, 0); continue; }   // not reached yet
+
+    const uint8_t *t = led_background[l];
+
+    // Whiten towards a level that is never below the colour's own brightest
+    // channel, so the crest is always a lightened version of what it leaves
+    // behind and never -- for a bright mapping pushed by the host -- a dimmer
+    // one. At full weight every channel sits at `level`, i.e. white.
+    uint32_t level = WAVE_WHITE;
+    for (uint8_t c = 0; c < 3; c++) if (t[c] > level) level = t[c];
+
+    uint32_t w;   // weight of white over the mapped colour, 0..WAVE_UNIT
+    if (d < 0) {
+      // Leading ramp: black up into the crest, so nothing pops on. The colour
+      // is not mixed in yet -- this is the wave arriving, not the mapping.
+      uint32_t f = (uint32_t)(d + WAVE_LEAD) * WAVE_UNIT / WAVE_LEAD;
+      uint8_t v = (uint8_t)(level * f / WAVE_UNIT);
+      set_pixel(l, v, v, v);
+      continue;
+    }
+
+    if (d < WAVE_TAIL) {
+      // Trailing decay, squared: off the crest quickly, into the colour softly.
+      uint32_t u = (uint32_t)(WAVE_TAIL - d) * WAVE_UNIT / WAVE_TAIL;
+      w = u * u / WAVE_UNIT;
+    } else {
+      w = 0;    // settled: the mapping itself
+    }
+
+    uint8_t rgb[3];
+    for (uint8_t c = 0; c < 3; c++) {
+      rgb[c] = (uint8_t)(t[c] + (level - t[c]) * w / WAVE_UNIT);
+    }
+    set_pixel(l, rgb[0], rgb[1], rgb[2]);
+  }
+  show_leds();
+}
+
+// Animate led_background[] into life, left to right. Blocking, and deliberately
+// so: it runs before the scan loop, so the per-key rest calibration that opens
+// the loop still happens under a settled, static LED pattern. Calibrating while
+// a bright crest swept the board would fold the chain's own current draw --
+// which rides the same 3V3 rail as the Hall sensors -- into every key's rest
+// level.
+static void boot_wave_play(void)
+{
+  const int32_t start = (int32_t)WAVE_POS_MIN * WAVE_UNIT - WAVE_LEAD;
+  const int32_t span  = (int32_t)(WAVE_POS_MAX - WAVE_POS_MIN) * WAVE_UNIT
+                      + WAVE_LEAD + WAVE_TAIL;
+
+  for (uint32_t f = 0; f <= WAVE_FRAMES; f++) {
+    if (f) HAL_Delay(WAVE_FRAME_MS);
+    wave_frame(start + (int32_t)(span * f / WAVE_FRAMES));
+  }
+}
+
 // Incoming color frames are QUEUED, not single-buffered. The host sends one
 // frame per board back to back, so a single staging buffer meant the USB
 // interrupt began overwriting frame 2 while the main loop was still copying
@@ -945,33 +1044,23 @@ int main(void)
   link_init();
   mesh_init();
 
-  // Simple test patterns (shortened so flash-test cycles stay quick)
-  fill_solid(5, 0, 0);     // dim red
-  show_leds();
-  HAL_Delay(250);
-
-  fill_solid(0, 5, 0);     // dim green
-  show_leds();
-  HAL_Delay(250);
-
-  fill_solid(0, 0, 5);     // dim blue
-  show_leds();
-  HAL_Delay(250);
-
-  fill_solid(5, 5, 5);   // white
-  show_leds();
-  HAL_Delay(250);
-
+  // Boot colour pattern. It doubles as the initial background until a host
+  // pushes colors over CDC (led_data is GRB; led_background is RGB), so it is
+  // staged through led_data and copied out rather than written directly.
   fill_bosanquet(5, 5, 25, 5, 25, 5, 20, 20, 2, 25, 10, 2, 25, 2, 2);
-  show_leds();
-
-  // The boot pattern doubles as the initial background until a host pushes
-  // colors over CDC (led_data is GRB; led_background is RGB).
   for (int i = 0; i < NUM_LEDS; i++) {
     led_background[i][0] = led_data[i][1];
     led_background[i][1] = led_data[i][0];
     led_background[i][2] = led_data[i][2];
   }
+
+  // Start dark, then ripple that pattern into life from the left. This also
+  // replaces the old red/green/blue/white flash test: the crest is white, so
+  // every LED still has all three channels driven on the way past, and a dead
+  // one now shows up as a gap in a moving wave rather than in a static field.
+  fill_solid(0, 0, 0);
+  show_leds();
+  boot_wave_play();
 
   /* USER CODE END 2 */
 

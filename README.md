@@ -486,6 +486,52 @@ included so the curve can be refit offline), and falling below 30% fires
 strike velocity. Tuning constants (`KEY_*_POS`, `VEL_DT_FAST_US`,
 `VEL_DT_SLOW_US`) live at the top of `main.c`.
 
+### Startup ripple
+
+The board does not switch into its colour mapping, it wakes up into it. From a
+dark chain a bright whitened wavefront sweeps left to right over ~900 ms,
+leaving the mapped colour behind it: each key ramps up from black to a white
+crest, then decays into its own colour with a squared falloff. `boot_wave_play()`
+in `main.c`; the crest level, sweep duration and the widths of the leading ramp
+and trailing decay are the `WAVE_*` constants above it.
+
+**"Left to right" is `4x + 3y`, not the column index.** The grid is a sheared
+axial hex lattice, and the board is physically laid out in the standard
+Bosanquet orientation — the octave direction `(5, 2)` horizontal. Rotating the
+axial coordinates by that amount gives, exactly,
+
+    screen_x = (4.5 / sqrt(117)) * (4x + 3y)
+    screen_y = (1.5 * sqrt(3) / sqrt(117)) * (5y - 2x)
+
+so the sweep needs one integer per LED and no trigonometry. Cross-checked
+against `LED_PIXEL` in `companion/src/lib/layout.ts`, which derives the rotation
+independently: the ratio is constant to nine decimal places across all 31 keys.
+The keys span `4x + 3y` = 8 (at `(2,0)`) to 34 (at `(4,6)`) — 26 units over 26
+distinct values, so nearly every key arrives at its own moment.
+
+The crest whitens towards a level that is never below the colour's own
+brightest channel, so it stays a *lightened* version of what it leaves behind
+even for a bright mapping pushed by the host, rather than dipping below it.
+
+This replaced the old red/green/blue/white flash test at boot, and covers the
+same ground: the crest is white, so all three channels of every LED are driven
+as it passes, and a dead LED now reads as a gap in a moving wave rather than in
+a static field.
+
+The animation is **blocking, deliberately**. It runs before the scan loop, so
+the per-key rest calibration that opens that loop (`REST_CAL_SCANS`, ~56 ms)
+still happens under a settled, static pattern. Calibrating while a bright crest
+swept the board would fold the chain's own current draw — which rides the same
+3V3 rail as the Hall sensors — into every key's rest level.
+
+Two things it does not do. Boards in a tiled set each ripple **independently**,
+because links and topology are not up yet when it plays, so a wide grid shows
+several parallel sweeps rather than one crossing the whole instrument; a
+mesh-wide version would have to wait for discovery and then start on a shared
+deadline. And it plays at boot only — pushing a new colour map over `C`/`L`
+still swaps in place. `boot_wave_play()` reads `led_background[]` live, so
+re-triggering it on a colour push is one call if that turns out to be wanted.
+
 **Companion app** (`companion/`): Svelte 5 + TypeScript + Tailwind + [meantonal](https://meantonal.org/),
 built with Vite. It shows live per-key levels with min/max watermarks, per-key stats
 (rest / min / max / noise σ), and auto-triggered press-waveform capture with
