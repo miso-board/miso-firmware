@@ -47,6 +47,11 @@
 #define LED_CODE_0      45     // ~0.35 µs high
 #define LED_CODE_1      110    // ~0.8 µs high
 
+// Green level held on every LED while the board sits in DFU. Same scale as the
+// boot pattern (whose brightest channel is 25), kept well under it so it reads
+// as a standby glow rather than as the board playing.
+#define LED_DFU_GREEN   6
+
 // USB DFU bootloader entry
 #define BOOTLOADER_MAGIC        0x4D49534Fu  // "MISO"
 #define BOOTLOADER_SYSMEM_BASE  0x1FFF0000u  // STM32G4 system memory (ROM bootloader)
@@ -351,6 +356,27 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
     if (sum32(dma_buffer, DMA_BUF_LEN) != dma_sum_start) dma_churn++;
     led_dma_busy = 0;
   }
+}
+
+// Wait out an in-flight LED refresh (~1.9 ms), so a caller with no next frame
+// to fall back on isn't silently skipped by show_leds(). Bounded, because this
+// sits on the path into DFU and must never be the reason the board hangs there.
+static void led_dma_settle(void)
+{
+  uint32_t t0 = HAL_GetTick();
+  while (led_dma_busy && (HAL_GetTick() - t0) < 10u) { }
+}
+
+// Paint every LED dim green on the way into the ROM bootloader. The bootloader
+// never touches the chain and the reset doesn't cut its power, so whatever is
+// latched here stays lit for the whole DFU session: the board reads as waiting
+// for a firmware upload rather than as dead.
+static void led_dfu_indicate(void)
+{
+  led_dma_settle();
+  fill_solid(0, LED_DFU_GREEN, 0);
+  show_leds();
+  led_dma_settle();   // the frame has to reach the chain before the reset
 }
 
 void select_mux_channel(uint8_t channel)
@@ -1005,6 +1031,33 @@ int main(void)
   // closes below, the next boot enters the USB DFU bootloader.
   bootloader_flag = BOOTLOADER_MAGIC;
 
+  // We may have been entered by a jump rather than a reset, in which case the
+  // machine is NOT in its reset state and the code below would otherwise run
+  // on top of someone else's configuration.
+  //
+  // That is how flashing ends: STM32_Programmer_CLI's -g leaves DFU by jumping
+  // straight here, so everything the ROM bootloader set up is still live. Its
+  // PLL settings make SystemClock_Config() fail, which lands in
+  // Error_Handler(); its USB interrupt is still enabled in the NVIC, and a
+  // pending one fires into a handler whose driver state has not been
+  // initialised yet. Either way the board hangs before the boot ripple ever
+  // runs -- LEDs frozen on whatever DFU left on them -- and only a power cycle
+  // brings it back.
+  //
+  // Interrupts are silenced first, because one can fire the moment the vector
+  // table becomes ours. The clock tree is put back to reset values (HSI, PLL
+  // off) after HAL_Init, since HAL_RCC_DeInit times its waits with HAL_GetTick
+  // and needs SysTick running. Both are no-ops on a normal reset boot.
+  //
+  // Ordering note: all of this runs AFTER bootloader_check(), so a mistake in
+  // here can never take the double-tap DFU recovery path down with it.
+  __disable_irq();
+  for (uint32_t i = 0; i < (sizeof(NVIC->ICER) / sizeof(NVIC->ICER[0])); i++) {
+    NVIC->ICER[i] = 0xFFFFFFFFu;   // disable
+    NVIC->ICPR[i] = 0xFFFFFFFFu;   // and drop anything already pending
+  }
+  __enable_irq();
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -1013,6 +1066,11 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+
+  // The other half of the jump-entry cleanup above: back to HSI with the PLL
+  // off, so SystemClock_Config() below configures the PLL from reset values
+  // rather than failing on one that is already running.
+  HAL_RCC_DeInit();
 
   /* USER CODE END Init */
 
@@ -1150,6 +1208,7 @@ int main(void)
     if (dfu_req) {
       dfu_req = 0;
       cdc_send_text("DFU entering bootloader\r\n");
+      led_dfu_indicate();
       HAL_Delay(50);
       Bootloader_RequestDFU();
     }

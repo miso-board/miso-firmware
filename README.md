@@ -23,7 +23,19 @@ Then build and flash in one step:
 (Uses the ARM GCC and STM32CubeProgrammer CLI bundled inside STM32CubeIDE.app;
 the `-g` flag restarts the application after flashing.)
 
-Or send `B!` on the CDC port, which needs no button press at all. Both routes
+`-g` leaves DFU by **jumping** into the application rather than resetting, so
+the application starts on top of the bootloader's configuration: its PLL, which
+makes `SystemClock_Config()` fail into `Error_Handler()`, and its USB interrupt,
+which can fire before the driver behind the handler exists. The board used to
+hang there every time — LEDs frozen on whatever DFU left on them — and needed a
+power cycle after every flash. `main()` now silences the NVIC and calls
+`HAL_RCC_DeInit()` before configuring anything, which is a no-op on a normal
+reset boot; the application re-enumerates about ten seconds after flashing.
+
+Or send `B!` on the CDC port, which needs no button press at all. That route
+paints every LED dim green before resetting: the ROM bootloader never touches
+the LED chain and the reset does not cut its power, so the board glows green for
+the whole DFU session instead of looking dead. Both routes
 are kept deliberately: the serial command is the everyday one, but it is only
 reachable while the application still enumerates. The double tap runs from
 `bootloader_check()` before any clock or peripheral is configured, so it is the
