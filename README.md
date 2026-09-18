@@ -4,6 +4,66 @@ This repository is the firmware for Miso, a modular, isomorphic musical keyboard
 - A chain of 31 SK6812mini-e RGB LEDs that backlight the keys and allow users to see the key mapping they are currently using visually.
 - Four pogo pin connectors, 2 male and 2 female, to the top, bottom, left and right sides of the device which transmit +5V power and allow for UART communication with adjacent boards when connected together. The STM32G431KBU6 only has 3 built-in UART capable pin pairs, so one of these four UART connections will be achieved via bit-banging.
 
+## Bringing up a new board
+
+A new board needs **two independent things**, and flashing only does one of
+them. The firmware lives in main flash; the boot configuration lives in the
+option bytes, a separate area of the chip that `./flash-usb.sh` never touches.
+So a board running the newest firmware can still be temperamental on USB and
+pogo connection, because the fix for that is an option byte. Every chip needs it
+once, and a board that has only ever been flashed does not have it.
+
+The whole sequence is one command:
+
+    ./provision-board.sh
+
+It builds, flashes, then sets and verifies the option bytes, and is safe to
+re-run — the option bytes are only written when they are actually wrong. What it
+does, and what to do if you are working by hand instead:
+
+1. **Get it into DFU.** A board with firmware on it: send `B!` on the CDC port
+   (the scripts do this for you) or double-tap reset. A board with empty flash
+   has neither route, so use the 5-pin SWD header, or check whether it already
+   came up in DFU on its own — with the factory option bytes and a floating PB8
+   it often does.
+
+2. **Flash the firmware.**
+
+        ./flash-usb.sh
+
+   Builds and flashes in one step. See
+   [Flashing firmware over USB-C](#flashing-firmware-over-usb-c-no-swd-header-needed).
+
+3. **Set the option bytes.** The step flashing does *not* do. Put the board back
+   into DFU first, then:
+
+        STM32_Programmer_CLI -c port=usb1 -ob nSWBOOT0=0 nBOOT0=1
+
+   See [Required option bytes](#required-option-bytes-every-board-once) for the
+   polarity trap and why this is needed at all. Note the write prints alarming
+   errors that are expected — that section explains them.
+
+   **Do the firmware first, as above.** Writing the option bytes triggers an
+   option-byte-load reset, and with `nSWBOOT0 = 0` in effect that reset boots
+   main flash. On a board with empty flash nothing then runs: no CDC port for
+   `B!`, and no double-tap either, since `bootloader_check()` is itself firmware.
+   USB DFU is gone and only the SWD header can recover it. Flashing first means
+   that same reset lands in a working application.
+
+4. **Verify both.** Power-cycle the board — you will need to anyway, see
+   [Flashing firmware over USB-C](#flashing-firmware-over-usb-c-no-swd-header-needed),
+   as it does not reliably start the application by itself after a DFU session.
+   Then power-cycle a few more times, including a pogo hot-plug, since that was
+   always the worse case. It should enumerate as `Miso` every time:
+
+        ioreg -p IOUSB -w0 -l | grep -i '"USB Product Name"'
+
+   Read the option bytes back too (step 3's section shows how). Note that doing
+   so leaves the board in DFU again.
+
+If you skip step 3, the symptom is not an obvious failure: the board works most
+of the time and randomly comes up dark and apparently dead on replug.
+
 ## Flashing firmware over USB-C (no SWD header needed)
 
 The firmware supports entering the STM32G4's built-in ROM bootloader, which
@@ -26,11 +86,24 @@ the `-g` flag restarts the application after flashing.)
 `-g` leaves DFU by **jumping** into the application rather than resetting, so
 the application starts on top of the bootloader's configuration: its PLL, which
 makes `SystemClock_Config()` fail into `Error_Handler()`, and its USB interrupt,
-which can fire before the driver behind the handler exists. The board used to
-hang there every time — LEDs frozen on whatever DFU left on them — and needed a
-power cycle after every flash. `main()` now silences the NVIC and calls
-`HAL_RCC_DeInit()` before configuring anything, which is a no-op on a normal
-reset boot; the application re-enumerates about ten seconds after flashing.
+which can fire before the driver behind the handler exists. `main()` therefore
+silences the NVIC and calls `HAL_RCC_DeInit()` before configuring anything
+(`main.c`, just before `SystemClock_Config()`), which is a no-op on a normal
+reset boot.
+
+**In practice you still have to power-cycle the board after flashing.** That
+mitigation is not sufficient on its own: CubeProgrammer reports
+`Start operation achieved successfully`, and the board then sits there with USB
+down and the LEDs still dim green from the `B!` handoff — green being proof the
+application never ran, since its startup wave would have overwritten it. Unplug
+and replug and it comes straight up. Treat "no USB after flashing" as the normal
+outcome rather than a failed flash; it is not a bad flash and not an option-byte
+problem.
+
+This is a known rough edge, not a solved one. Diagnosing it properly means
+finding what the application inherits from the bootloader that surviving
+`HAL_RCC_DeInit()` does not cover — the USB peripheral and its clock being the
+obvious suspects, since USB is the thing that never comes back.
 
 Or send `B!` on the CDC port, which needs no button press at all. That route
 paints every LED dim green before resetting: the ROM bootloader never touches
@@ -97,6 +170,32 @@ Verified empirically on hardware, both directions:
 
 Getting it backwards is recoverable, since DFU stays reachable and the option
 bytes can just be rewritten, but it looks alarming.
+
+**Check what a chip currently has** (with it in DFU):
+
+    STM32_Programmer_CLI -c port=usb1 -ob displ
+
+An unfixed board shows `nSWBOOT0 : 0x1 (BOOT0 taken from PB8/BOOT0 pin)`; a
+fixed one shows `0x0 (BOOT0 taken from the option bit nBOOT0)`. `nBOOT0` is
+usually already `0x1` from the factory, so `nSWBOOT0` is the byte that actually
+changes — which is why the symptom is easy to misread as a firmware problem.
+
+**The write reports errors even when it succeeds.** Expect something like:
+
+    Unable to reconnect the target device: time out expired
+    Error: Downloading Option Bytes Data failed
+    Error: Uploading Option Bytes bank: 0 failed
+
+Writing option bytes triggers an option-byte-load reset. With `nSWBOOT0 = 0` now
+in effect the board reboots straight into main flash and leaves the DFU bus
+mid-operation, so CubeProgrammer's reconnect finds nothing and reports failure
+for a write that already landed. Ignore the errors and confirm with a readback:
+re-enter DFU and run `-ob displ` again. Do not re-run the write on the strength
+of the error message alone.
+
+Note that after an `-ob displ` the board stays in the ROM bootloader until
+something resets it, so seeing `DFU in FS Mode` right after a read is expected
+and is not evidence that the fix failed.
 
 Raising the brown-out threshold from its default of level 0 (~1.7 V)
 (`STM32_Programmer_CLI -c port=usb1 -ob BOR_LEV=4`) hardens the power-up further
