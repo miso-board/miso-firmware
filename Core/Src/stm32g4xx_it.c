@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "link.h"
+#include "softuart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -247,6 +248,25 @@ void USART1_IRQHandler(void)
 void USART2_IRQHandler(void)
 {
   link_irq_usart2();
+}
+
+/**
+  * @brief Software UART on the TOP link port: TX burst DMA, RX edge-capture
+  *        DMA, and TIM3's decode backstop. See softuart.c.
+  */
+void DMA1_Channel2_IRQHandler(void)
+{
+  softuart_irq_tx_dma();
+}
+
+void DMA1_Channel3_IRQHandler(void)
+{
+  softuart_irq_rx_dma();
+}
+
+void TIM3_IRQHandler(void)
+{
+  softuart_irq_rx_timer();
 }
 
 /* USER CODE END 1 */

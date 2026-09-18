@@ -20,10 +20,9 @@
   * parent only, so each arrives exactly once; colours travel down to children
   * only, which is acyclic.
   *
-  * NOTE: the TOP port has no UART (only three full-duplex pairs are bonded out
-  * on UFQFPN32), so vertical links cannot come up until it is bit-banged. This
-  * layer is written general over all four ports and needs no change when it
-  * lands -- but only horizontal chains work today.
+  * The TOP port has no USART (only three full-duplex pairs are bonded out on
+  * UFQFPN32) and runs on the software UART in softuart.c. This layer is
+  * written general over all four ports and does not distinguish it.
   ******************************************************************************
   */
 

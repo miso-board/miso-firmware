@@ -30,6 +30,7 @@
   */
 
 #include "link.h"
+#include "softuart.h"
 
 #include "main.h"
 #include "usbd_composite.h"
@@ -51,11 +52,12 @@
 #define LINK_TX_RING            256u   /* must be a power of two; holds a 98-byte colour frame */
 
 /* --- Port hardware map ------------------------------------------------------
- * Sides as wired on the PCB. TOP is the bit-banged port; its pins are not
- * assigned yet, so it carries no UART and link_tick() skips it. */
+ * Sides as wired on the PCB. TOP has no USART bonded out for it; uart == NULL
+ * routes it to the timer-driven software UART in softuart.c, which feeds the
+ * same rings, so everything above the driver seam below is shared. */
 
 typedef struct {
-  USART_TypeDef *uart;      /* NULL = not implemented */
+  USART_TypeDef *uart;      /* NULL = software UART (softuart.c) */
   IRQn_Type      irqn;
   GPIO_TypeDef  *tx_port;
   uint16_t       tx_pin;
@@ -65,7 +67,7 @@ typedef struct {
 } link_hw_t;
 
 static const link_hw_t link_hw[LINK_PORT_COUNT] = {
-  /* TOP    */ { NULL,    0,             NULL,  0,             0,                 NULL,  0             },
+  /* TOP    */ { NULL,    0,             GPIOB, GPIO_PIN_4,    GPIO_AF1_TIM16,    GPIOB, GPIO_PIN_5    },
   /* BOTTOM */ { LPUART1, LPUART1_IRQn,  GPIOA, GPIO_PIN_2,    GPIO_AF12_LPUART1, GPIOA, GPIO_PIN_3    },
   /* LEFT   */ { USART2,  USART2_IRQn,   GPIOB, GPIO_PIN_3,    GPIO_AF7_USART2,   GPIOA, GPIO_PIN_15   },
   /* RIGHT  */ { USART1,  USART1_IRQn,   GPIOA, GPIO_PIN_9,    GPIO_AF7_USART1,   GPIOA, GPIO_PIN_10   },
@@ -138,7 +140,7 @@ static void link_drive_on(link_port_t p)
 {
   link_t *L = &link[p];
   if (L->tx_driven) return;
-  link_hw[p].uart->ICR = USART_ICR_TCCF;
+  if (link_hw[p].uart) link_hw[p].uart->ICR = USART_ICR_TCCF;
   link_tx_drive(&link_hw[p]);
   L->tx_driven = 1;
 }
@@ -151,7 +153,47 @@ static void link_drive_off(link_port_t p)
   L->tx_driven = 0;
 }
 
+/* --- Driver seam --------------------------------------------------------------
+ * The three places the state machine touches the transmitter differ between a
+ * USART and the software UART. Everything else -- rings, parser, gating -- is
+ * shared, and the ISRs on both sides follow the same ring discipline. */
+
+static void link_hw_tx_kick(link_port_t p)
+{
+  USART_TypeDef *u = link_hw[p].uart;
+  if (u) u->CR1 |= USART_CR1_TXEIE;
+  else   softuart_tx_kick();
+}
+
+/* Ring drained and the last stop bit has left the pin. */
+static uint8_t link_hw_tx_done(link_port_t p)
+{
+  const link_t *L = &link[p];
+  USART_TypeDef *u = link_hw[p].uart;
+  if (L->tx_head != L->tx_tail) return 0;
+  return u ? ((u->ISR & USART_ISR_TC) != 0) : softuart_tx_idle();
+}
+
+static void link_hw_fence(link_port_t p, uint8_t on)
+{
+  const link_hw_t *hw = &link_hw[p];
+  if (hw->uart == NULL) { softuart_irq_mask(on); return; }
+  if (on) HAL_NVIC_DisableIRQ(hw->irqn);
+  else    HAL_NVIC_EnableIRQ(hw->irqn);
+}
+
 /* --- Interrupt handlers ------------------------------------------------------ */
+
+static void link_rx_put(link_t *L, uint8_t c)
+{
+  uint16_t next = (uint16_t)((L->rx_head + 1u) & (LINK_RX_RING - 1u));
+  if (next != L->rx_tail) {
+    L->rx_buf[L->rx_head] = c;
+    L->rx_head = next;
+  } else {
+    L->n_err++;   /* main loop fell behind; drop rather than stall */
+  }
+}
 
 static void link_isr(link_port_t p)
 {
@@ -164,16 +206,7 @@ static void link_isr(link_port_t p)
     L->n_err++;
   }
 
-  if (isr & USART_ISR_RXNE) {
-    uint8_t c = (uint8_t)u->RDR;
-    uint16_t next = (uint16_t)((L->rx_head + 1u) & (LINK_RX_RING - 1u));
-    if (next != L->rx_tail) {
-      L->rx_buf[L->rx_head] = c;
-      L->rx_head = next;
-    } else {
-      L->n_err++;   /* main loop fell behind; drop rather than stall */
-    }
-  }
+  if (isr & USART_ISR_RXNE) link_rx_put(L, (uint8_t)u->RDR);
 
   if ((isr & USART_ISR_TXE) && (u->CR1 & USART_CR1_TXEIE)) {
     if (L->tx_tail != L->tx_head) {
@@ -189,6 +222,27 @@ void link_irq_lpuart1(void) { link_isr(LINK_PORT_BOTTOM); }
 void link_irq_usart2(void)  { link_isr(LINK_PORT_LEFT); }
 void link_irq_usart1(void)  { link_isr(LINK_PORT_RIGHT); }
 
+/* Software UART hooks (TOP), from the DMA interrupts in softuart.c. */
+
+uint8_t link_soft_tx_pop(uint8_t *c)
+{
+  link_t *L = &link[LINK_PORT_TOP];
+  if (L->tx_tail == L->tx_head) return 0;
+  *c = L->tx_buf[L->tx_tail];
+  L->tx_tail = (uint16_t)((L->tx_tail + 1u) & (LINK_TX_RING - 1u));
+  return 1;
+}
+
+void link_soft_rx_push(uint8_t c)
+{
+  link_rx_put(&link[LINK_PORT_TOP], c);
+}
+
+void link_soft_rx_error(void)
+{
+  link[LINK_PORT_TOP].n_err++;
+}
+
 /* --- Sending ----------------------------------------------------------------- */
 
 int link_send(link_port_t p, uint8_t type, const uint8_t *payload, uint8_t len)
@@ -196,8 +250,6 @@ int link_send(link_port_t p, uint8_t type, const uint8_t *payload, uint8_t len)
   if (p >= LINK_PORT_COUNT || len > LINK_MAX_PAYLOAD) return 0;
 
   link_t *L = &link[p];
-  USART_TypeDef *u = link_hw[p].uart;
-  if (u == NULL) return 0;
 
   uint16_t need = (uint16_t)(5u + len);
   uint16_t used = (uint16_t)((L->tx_head - L->tx_tail) & (LINK_TX_RING - 1u));
@@ -221,7 +273,7 @@ int link_send(link_port_t p, uint8_t type, const uint8_t *payload, uint8_t len)
   L->tx_buf[h] = sum;   h = (uint16_t)((h + 1u) & (LINK_TX_RING - 1u));
 
   L->tx_head = h;
-  u->CR1 |= USART_CR1_TXEIE;
+  link_hw_tx_kick(p);
   L->n_tx++;
   return 1;
 }
@@ -252,17 +304,17 @@ static void link_teardown(link_port_t p, uint32_t tick)
 {
   link_t *L = &link[p];
   const link_hw_t *hw = &link_hw[p];
-  if (hw->uart == NULL) return;   /* TOP, once it is bit-banged, tears down elsewhere */
   uint8_t was_up = (L->state == LINK_UP);
   link_drive_off(p);
 
-  /* Fence the ISR out before touching both ends of a ring: caught mid-update
-   * it would write back a stale index and the ring would look full forever. */
-  HAL_NVIC_DisableIRQ(hw->irqn);
-  hw->uart->CR1 &= ~USART_CR1_TXEIE;
+  /* Fence the ISRs out before touching both ends of a ring: caught mid-update
+   * they would write back a stale index and the ring would look full forever. */
+  link_hw_fence(p, 1);
+  if (hw->uart) hw->uart->CR1 &= ~USART_CR1_TXEIE;
+  else          softuart_reset();
   L->tx_head = L->tx_tail = 0;
   L->rx_head = L->rx_tail = 0;
-  HAL_NVIC_EnableIRQ(hw->irqn);
+  link_hw_fence(p, 0);
 
   L->ps = 0;
   L->peer_uid[0] = L->peer_uid[1] = L->peer_uid[2] = 0;
@@ -386,7 +438,7 @@ static void link_port_tick(link_port_t p, uint32_t tick)
   const link_hw_t *hw = &link_hw[p];
   link_t *L = &link[p];
 
-  if (hw->uart == NULL) return;   /* TOP: bit-banged, not implemented yet */
+  if (hw->uart == NULL) softuart_rx_poll();   /* TOP: captured edges -> the ring */
 
   while (L->rx_tail != L->rx_head) {
     uint8_t c = L->rx_buf[L->rx_tail];
@@ -425,8 +477,7 @@ static void link_port_tick(link_port_t p, uint32_t tick)
     break;
 
   case LINK_PROBE:
-    if ((L->tx_head == L->tx_tail && (hw->uart->ISR & USART_ISR_TC)) ||
-        (tick - L->t_state > LINK_PROBE_TIMEOUT_MS)) {
+    if (link_hw_tx_done(p) || (tick - L->t_state > LINK_PROBE_TIMEOUT_MS)) {
       link_drive_off(p);
       L->state = LINK_DOWN;
       L->t_state = tick;
@@ -468,7 +519,11 @@ void link_init(void)
     L->t_last_rx = tick;
 
     const link_hw_t *hw = &link_hw[p];
-    if (hw->uart == NULL) continue;
+    if (hw->uart == NULL) {
+      softuart_init();      /* RX captures from here on; the TX pin stays ours */
+      link_tx_highz(hw);
+      continue;
+    }
 
     link_tx_highz(hw);   /* re-assert; HAL_UART_MspInit already did this */
     hw->uart->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF |
@@ -495,7 +550,6 @@ link_state_t link_state(link_port_t p)
 const char *link_state_name(link_port_t p)
 {
   if (p >= LINK_PORT_COUNT) return "?";
-  if (link_hw[p].uart == NULL) return "ABSENT";   /* matches the '-' that 'i' shows */
   return link_state_names[link[p].state];
 }
 
@@ -503,9 +557,6 @@ char link_state_char(link_port_t p)
 {
   static const char chars[] = { 'b', '.', 'p', 'h', 'U' };
   if (p >= LINK_PORT_COUNT) return '?';
-  /* No UART on this port yet (TOP, pending the bit-banged one). Reporting it as
-   * BLOCKED forever reads like a fault; '-' says "no hardware here". */
-  if (link_hw[p].uart == NULL) return '-';
   return chars[link[p].state];
 }
 

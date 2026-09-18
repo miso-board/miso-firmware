@@ -2,7 +2,7 @@ This repository is the firmware for Miso, a modular, isomorphic musical keyboard
 - An STM32G431KBU6 microcontroller as its brain.
 - Two CD74HC4067 analog multiplex chips connected to the 31 Texas Instruments DRV5055 Hall effect sensors that power the velocity-sensitive key detection.
 - A chain of 31 SK6812mini-e RGB LEDs that backlight the keys and allow users to see the key mapping they are currently using visually.
-- Four pogo pin connectors, 2 male and 2 female, to the top, bottom, left and right sides of the device which transmit +5V power and allow for UART communication with adjacent boards when connected together. The STM32G431KBU6 only has 3 built-in UART capable pin pairs, so one of these four UART connections will be achieved via bit-banging.
+- Four pogo pin connectors, 2 male and 2 female, to the top, bottom, left and right sides of the device which transmit +5V power and allow for UART communication with adjacent boards when connected together. The STM32G431KBU6 only has 3 built-in UART capable pin pairs, so the fourth (top) is a timer-and-DMA software UART.
 
 ## Bringing up a new board
 
@@ -383,14 +383,16 @@ pair. Sides map to peripherals as:
 
 | Side | Peripheral | TX | RX |
 |------|-----------|----|----|
-| top | *(bit-banged, pins not assigned yet)* | — | — |
+| top | software UART: TIM16 + TIM3 + DMA (`softuart.c`) | PB4 | PB5 |
 | bottom | LPUART1 | PA2 | PA3 |
 | left | USART2 | PB3 | PA15 |
 | right | USART1 | PA9 | PA10 |
 
-All three run at 460800 baud. Only three full-duplex pairs are bonded out on the
-UFQFPN32 package, so the fourth side will be bit-banged; its port exists in
-`Core/Src/link.c` with a null UART and is skipped until then.
+All four run at 460800 baud. Only three full-duplex pairs are bonded out on the
+UFQFPN32 package, so the top side is a software UART -- see
+[The top port is a software UART](#the-top-port-is-a-software-uart). Above the
+driver seam in `link.c` (rings, frame parser, state machine, hot-plug gating)
+the four ports are identical.
 
 ### Why TX pins idle in high-Z
 
@@ -467,6 +469,56 @@ in each signal line at the connector, which limits ESD-diode injection to well
 under 1 mA and kills the hazard regardless of what firmware is running — worth
 adding on the next board revision, not least because it also protects against a
 board flashed with an older build.
+
+### The top port is a software UART
+
+TX is PB4 and RX is PB5, neither of which reaches a USART on this package. Both
+directions are driven by timers and DMA so that no interrupt fires per bit: at
+460800 baud that would be one every 2.2 µs, and the Hall scan rate would pay for
+it. Sending costs one interrupt per 32 bytes; receiving costs none until
+something decodes.
+
+**TX: TIM16 in PWM mode, one period per bit.** PB4 is TIM16_CH1. `CCR1 = 0`
+holds the pin low for the whole period and `CCR1 > ARR` holds it high, so a
+byte is ten CCR1 values (start, eight data bits LSB first, stop). A DMA transfer
+on each update event writes the next value into the preloaded CCR1; the CPU
+encodes up to 32 bytes per burst and hears about it once, when the burst
+completes. Each burst ends with two idle words because a value transferred at
+update *k* is on the pin during period *k+1*: without them "complete" would
+arrive while the stop bit was still on the wire and `link.c` would put the pin
+back to high-Z half a bit early.
+
+**RX: TIM3 free-running, capturing every edge.** PB5 is TIM3's TI2. Channel 2
+captures both edges and a circular DMA streams the timestamps into a 256-entry
+ring; nothing else happens until something looks at it. The decoder
+(`softuart_decode.h`) runs from the link tick and, as a backstop, from the DMA
+half/complete interrupts and a 2.2 ms compare on TIM3 -- so it always runs
+well inside the counter's 17.7 ms wrap, and cannot lose the ring at full line
+rate if the main loop stalls.
+
+The ring holds edge *times* but not levels; two parity facts recover them. The
+level at any instant after a start edge is the parity of the edges since it,
+which is how bits are sampled. And whether a candidate edge was *falling* is
+the current line level flipped once per edge captured after it, which is what
+makes hunting after a framing error safe: without it a rising edge followed by
+idle decodes as a plausible byte and eats the real frame behind it. The current
+level comes from the timer rather than the pin -- channel 1 captures rising
+edges only, so the last edge was rising exactly when CCR1 and CCR2 agree.
+Reading the pin instead races the DMA, which lags each capture by a few bus
+cycles.
+
+The decoder is pure arithmetic with no hardware access, so it has a host test:
+
+    cc -I Core/Inc -o /tmp/test_decode tools/test_decode.c -lm && /tmp/test_decode
+
+covering back-to-back bytes, ±2% baud mismatch, ring and counter wrap, glitches
+before and between frames, and a lost edge (which corrupts what was captured
+before it and re-syncs after).
+
+Costs: 644 B for the TX burst buffer, 512 B for the edge ring, DMA1 channels 2
+and 3, TIM16 and TIM3. None of it is in the `.ioc`, deliberately, so a CubeMX
+regeneration cannot revert it -- but the `.ioc` therefore still shows those
+resources and PB4/PB5 as free. Do not assign them to anything else there.
 
 ## Multi-board grid (topology, events, colours)
 
@@ -572,13 +624,13 @@ Counters in `T` are the health readout — `missed_down`, `fixed_up`,
 `lost_release`, `geom_err`, `multi_master`. On a healthy link all but
 `lost_release` should stay at zero.
 
-### Limitation: no vertical links yet
+### Vertical links
 
-The TOP port has no UART (only three full-duplex pairs are bonded out on
-UFQFPN32), so a vertical pair cannot link at all — one board's BOTTOM would meet
-another's TOP. `k` and `i` show that port as `-` rather than a state. The mesh
-layer is written general over all four ports and needs no change when the
-bit-banged port lands; until then, only horizontal chains communicate.
+The TOP port runs on the software UART (see
+[The top port is a software UART](#the-top-port-is-a-software-uart)), so a
+vertical pair links exactly as a horizontal one does: one board's BOTTOM
+(LPUART1) meets another's TOP. `k` and `i` report it with the same states as
+the other three ports, and the mesh layer never distinguished it.
 
 ### Verified on hardware
 

@@ -23,8 +23,9 @@ extern "C" {
 
 #include <stdint.h>
 
-/* Physical sides. TOP is the bit-banged port (pins not assigned yet); its
- * descriptor exists but carries no UART, so link_tick() skips it. */
+/* Physical sides. TOP has no USART bonded out: it runs on the timer-driven
+ * software UART in softuart.c (TX PB4, RX PB5) behind the same state machine
+ * and rings as the other three. */
 typedef enum {
   LINK_PORT_TOP = 0,
   LINK_PORT_BOTTOM,
