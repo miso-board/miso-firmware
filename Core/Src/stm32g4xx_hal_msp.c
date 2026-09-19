@@ -481,9 +481,14 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* htim)
     // makes that worse: every edge spends longer in the indeterminate band,
     // which is exactly where system noise can flip a bit. Fastest slew shortens
     // that window as far as the silicon allows.
+    //
+    // The pull-down is for whenever the timer is not driving the pin (reset,
+    // and the 'f' diagnostic in main.c): the board has no pull on the data
+    // line, so without it the line floats, and a frame's 80 us latch period
+    // must not end on an undriven node. See led_line_hold_low() in main.c.
     GPIO_InitStruct.Pin = GPIO_PIN_8;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF6_TIM1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);

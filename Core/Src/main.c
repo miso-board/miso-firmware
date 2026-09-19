@@ -41,7 +41,7 @@
 #define NUM_LEDS        31
 #define BITS_PER_LED    24
 #define LED_RESET_WORDS 750    // trailing low period; latches the frame
-#define DMA_BUF_LEN     (NUM_LEDS * BITS_PER_LED + LED_RESET_WORDS)
+#define DMA_BUF_LEN     (NUM_LEDS * BITS_PER_LED + LED_RESET_WORDS)   // DMA beats, one per 1.25 us bit
 
 // Duty cycle values (adjust these if colours look wrong)
 #define LED_CODE_0      45     // ~0.35 µs high
@@ -136,7 +136,23 @@ DMA_HandleTypeDef hdma_tim1_ch1;
 // Lives in .noinit RAM: keeps its value across NRST resets, only lost on power-off.
 __attribute__((section(".noinit"))) static volatile uint32_t bootloader_flag;
 
-uint32_t dma_buffer[DMA_BUF_LEN];
+// 16-bit, because that is what the DMA channel is configured to read
+// (MemDataAlignment = HALFWORD, Miso.ioc).
+//
+// This used to be uint32_t, and that was the flicker. The DMA walked the array
+// two bytes at a time, so every second beat was the zero upper half of a word,
+// and Length is in beats -- 1494 beats covered only the first 747 entries:
+//
+//   per bit     2 beats / 2.5 us  instead of  1 beat / 1.25 us
+//   reset       3 words / 7.5 us  instead of  750 words / 937 us
+//   guarded     first half of the data instead of all of it
+//   total       1867.5 us either way, which is why nobody noticed
+//
+// An SK6812 latches a frame after the line is low for 80 us, so with only
+// 7.5 us of it driven, every frame was being latched by the floating line that
+// HAL_TIM_PWM_Stop_DMA() left behind (see led_line_hold_low). A latch with no
+// margin, next to the USB pins: hence flicker that tracked USB activity.
+static uint16_t dma_buffer[DMA_BUF_LEN] __attribute__((aligned(4)));
 uint8_t  led_data[NUM_LEDS][3];   // [G][R][B]
 uint16_t sensor_raw[31];
 /* USER CODE END PV */
@@ -329,13 +345,18 @@ static uint32_t sum32(const uint32_t *p, uint32_t n)
   return s;
 }
 
+static uint32_t dma_sum(void)
+{
+  return sum32((const uint32_t *)(const void *)dma_buffer, sizeof(dma_buffer) / 4);
+}
+
 /**
  * True only while the DMA is still clocking out LED DATA.
  *
  * The SK6812 encodes each bit as a pulse width, so one late DMA beat mis-sizes
  * that bit and every LED after it in the chain receives shifted data -- which is
- * why the corrupt region moves around. USB activity is what makes the beat late,
- * so the two must not overlap.
+ * why the corrupt region moves around. Keeping our own USB sends out of that
+ * window costs nothing, so they wait.
  *
  * The trailing reset words are deliberately excluded: the line is held low
  * throughout them, so a late beat there cannot corrupt anything. That keeps the
@@ -346,11 +367,84 @@ static uint8_t led_critical(void)
   return led_dma_busy && (__HAL_DMA_GET_COUNTER(&hdma_tim1_ch1) > LED_RESET_WORDS);
 }
 
+/*
+ * Between refreshes the data line is DRIVEN LOW, never released.
+ *
+ * HAL_TIM_PWM_Stop_DMA() clears CC1E and MOE, and with OSSI off that makes TIM1
+ * release PA8 altogether: the pin goes high-impedance, and with no pull on the
+ * board the LED data line then floats for the ~28 ms between one refresh and
+ * the next -- over 90% of the time.
+ *
+ * On its own that would be survivable; paired with the buffer-width bug above
+ * it was not, because the frame's 80 us latch period then fell almost entirely
+ * inside the floating stretch. The chain was committing each frame on an
+ * undriven node sitting next to the USB pins, with no noise margin at all.
+ *
+ * Note what this is NOT. The floating line does not pick up countable edges
+ * from USB traffic -- measured at zero over 15 s of streaming with the counter
+ * in led_edge_selftest() validated either side. It is the latch that was
+ * fragile, not the data.
+ *
+ * So the timer is never stopped. It runs on with CCR1 = 0, a 0% duty cycle,
+ * which holds the output at its inactive level with the driver on; only the DMA
+ * request is switched off. The pin also carries a pull-down for the moments the
+ * timer does not own it (reset, and the diagnostic below).
+ */
+static void led_line_hold_low(void)
+{
+  TIM1->CCR1  = 0;
+  TIM1->CCER |= TIM_CCER_CC1E;
+  TIM1->BDTR |= TIM_BDTR_MOE;
+  TIM1->CR1  |= TIM_CR1_CEN;
+}
+
+/* Diagnostic, toggled by 'f': release the line between refreshes exactly as
+ * the code used to (HAL_TIM_PWM_Stop_DMA, no pull), but with PA8 switched to
+ * an input that counts every edge on the floating line. 'i' reports the total
+ * as idleedges, and 'F' proves the counter can count before a zero from it is
+ * believed. Measured result: zero, quiet bus or streaming alike -- see the
+ * README. Kept because it is the only way to tell "the line is quiet" from
+ * "nothing is watching the line". */
+volatile uint8_t led_float_diag = 0;
+static volatile uint32_t led_idle_edges = 0;
+static uint8_t led_pin_listening = 0;
+
+static void led_pin_config(uint8_t listen)
+{
+  GPIO_InitTypeDef g = {0};
+  g.Pin = GPIO_PIN_8;
+  if (listen) {
+    g.Mode = GPIO_MODE_IT_RISING_FALLING;
+    g.Pull = GPIO_NOPULL;                   /* the old, floating, condition */
+    HAL_GPIO_Init(GPIOA, &g);
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_8);
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+  } else {
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+    EXTI->IMR1 &= ~GPIO_PIN_8;              /* HAL_GPIO_Init leaves the line armed */
+    g.Mode = GPIO_MODE_AF_PP;
+    g.Pull = GPIO_PULLDOWN;
+    g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Alternate = GPIO_AF6_TIM1;
+    HAL_GPIO_Init(GPIOA, &g);
+  }
+  led_pin_listening = listen;
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == GPIO_PIN_8) led_idle_edges++;
+}
+
 void show_leds(void)
 {
   if (led_dma_busy) return;
+  if (led_pin_listening) led_pin_config(0);   /* diagnostic had the line floating */
   prepare_dma_buffer();
-  if (HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, dma_buffer, DMA_BUF_LEN) != HAL_OK) {
+  if (HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1,
+                            (const uint32_t *)(const void *)dma_buffer,
+                            DMA_BUF_LEN) != HAL_OK) {
     return;
   }
   led_dma_busy = 1;
@@ -359,15 +453,22 @@ void show_leds(void)
                            sizeof(led_data) / 4);
   if (led_sum_prev && led_sum != led_sum_prev) led_churn++;
   led_sum_prev = led_sum;
-  dma_sum_start = sum32(dma_buffer, DMA_BUF_LEN);
+  dma_sum_start = dma_sum();
 }
 
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM1)
   {
-    HAL_TIM_PWM_Stop_DMA(&htim1, TIM_CHANNEL_1);
-    if (sum32(dma_buffer, DMA_BUF_LEN) != dma_sum_start) dma_churn++;
+    if (led_float_diag) {
+      HAL_TIM_PWM_Stop_DMA(&htim1, TIM_CHANNEL_1);   /* releases PA8, as it always did */
+      led_pin_config(1);
+    } else {
+      /* Only the request goes; the timer runs on at CCR1 = 0 and keeps the
+       * line driven low until the next refresh restarts the DMA. */
+      __HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_CC1);
+    }
+    if (dma_sum() != dma_sum_start) dma_churn++;
     led_dma_busy = 0;
   }
 }
@@ -644,6 +745,51 @@ static void cdc_send_text(const char *s)
   }
   memcpy(txt, s, n);
   CDC_Transmit_FS((uint8_t *)txt, (uint16_t)n);
+}
+
+/* Positive control for the idle-edge counter, run by 'F'.
+ *
+ * Zero edges is the answer the fix predicts, and it is also exactly what a
+ * diagnostic that never ran would print. So the count means nothing until
+ * something known-nonzero has been through it. EXTI watches the pin itself and
+ * does not care that the pin is configured as an output, so driving PA8
+ * directly sends a known number of edges through the same SYSCFG routing, EXTI
+ * mask, NVIC entry and callback that the real measurement uses.
+ *
+ * Expect edges = 2 x pulses. Materially fewer means the measurement is broken,
+ * not that the line is quiet. */
+volatile uint8_t led_selftest_req = 0;
+
+static void led_edge_selftest(void)
+{
+  const uint32_t pulses = 50;
+
+  led_dma_settle();                 /* don't fight an in-flight refresh */
+  uint8_t was_listening = led_pin_listening;
+  uint32_t before = led_idle_edges;
+
+  led_pin_config(1);                /* arm exactly as the diagnostic does */
+  uint32_t moder = GPIOA->MODER;
+  GPIOA->MODER = (moder & ~GPIO_MODER_MODE8_Msk)
+               | (0x1u << GPIO_MODER_MODE8_Pos);   /* general-purpose output */
+  for (uint32_t i = 0; i < pulses; i++) {
+    GPIOA->BSRR = GPIO_PIN_8;                      /* rising  */
+    delay_us(20);
+    GPIOA->BSRR = (uint32_t)GPIO_PIN_8 << 16u;     /* falling */
+    delay_us(20);
+  }
+  GPIOA->MODER = moder;
+  uint32_t after = led_idle_edges;
+
+  if (!was_listening) led_pin_config(0);
+  led_idle_edges = before;          /* don't pollute the real measurement */
+
+  char line[128];
+  snprintf(line, sizeof(line), "SELFTEST pulses=%lu edges=%lu expect=%lu %s\r\n",
+           (unsigned long)pulses, (unsigned long)(after - before),
+           (unsigned long)(pulses * 2u),
+           (after - before) >= pulses ? "OK" : "COUNTER-DEAD");
+  cdc_send_text(line);
 }
 
 // --- Velocity engine ---------------------------------------------------------
@@ -1008,6 +1154,8 @@ static void keys_process(uint32_t t_us)
 //   L        followed by int16 x, int16 y, then 93 RGB bytes: set the colors
 //            of the board at that grid origin, wherever it is in the mesh
 //   B!       reboot into the USB DFU bootloader (two bytes, to avoid misfires)
+//   f        toggle the LED line float diagnostic (see led_float_diag)
+//   F        self-test that diagnostic's edge counter (see led_edge_selftest)
 //   C        followed by 93 bytes: RGB for all 31 LEDs, LED-chain order
 //   P        followed by 16 bytes: the pitch map -- int32 fifth in millicents,
 //            int16 m00, m01, m10, m11 (grid -> (w, h) basis change), int16
@@ -1090,6 +1238,8 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       case 'T': topo_req = 1; break;
       case 'p': collecting_thr = 1; thr_val = 0; break;
       case 'n': scan_enabled ^= 1; break;
+      case 'f': led_float_diag ^= 1; break;
+      case 'F': led_selftest_req = 1; break;
       case 'M': mpe_setup_req = 1; break;
       case 'e': events_text_on ^= 1; break;
       default: break;  // ignore CR/LF and unknown bytes
@@ -1260,6 +1410,7 @@ int main(void)
       snprintf(line, sizeof(line),
                "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u links=%c%c%c%c usb=%u cdrop=%lu "
                "usbdef=%lu thr=%lu scan=%u ledchurn=%lu dmachurn=%lu "
+               "float=%u idleedges=%lu "
                "fifth=%ld M=%d,%d,%d,%d anchor=%d,%d preject=%lu\r\n",
                FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
                stream_on, led_viz_on,
@@ -1269,6 +1420,7 @@ int main(void)
                (unsigned long)usb_defers,
                (unsigned long)scan_throttle_us, scan_enabled,
                (unsigned long)led_churn, (unsigned long)dma_churn,
+               led_float_diag, (unsigned long)led_idle_edges,
                (long)pitch_params.fifth_milli,
                pitch_params.m00, pitch_params.m01, pitch_params.m10, pitch_params.m11,
                pitch_params.aw, pitch_params.ah, (unsigned long)pq_rejected);
@@ -1313,6 +1465,10 @@ int main(void)
     if (topo_req) {
       topo_req = 0;
       mesh_dump();
+    }
+    if (led_selftest_req) {
+      led_selftest_req = 0;
+      led_edge_selftest();
     }
     if (pq_ready) {
       pq_ready = 0;
@@ -1700,6 +1856,13 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM1_Init 2 */
+
+  // Own the output before the pin is handed to the timer below, so PA8 is
+  // never high-impedance from here on. The edge counter for the 'f'
+  // diagnostic is set up now too; it stays disabled until the diagnostic
+  // wants it.
+  led_line_hold_low();
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);   // with the link UARTs, below USB_LP
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);

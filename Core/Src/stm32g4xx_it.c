@@ -269,4 +269,13 @@ void TIM3_IRQHandler(void)
   softuart_irq_rx_timer();
 }
 
+/**
+  * @brief PA8 edge counter for the LED-line float diagnostic ('f' in main.c).
+  *        Only enabled while that diagnostic has the line floating.
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_8);
+}
+
 /* USER CODE END 1 */

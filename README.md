@@ -226,38 +226,86 @@ interface on the same USB-C port:
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
 (little-endian; checksum = byte sum of the payload).
 
-### The LED data line has no voltage margin
+### The LED data line: flicker while the companion streams
 
-The SK6812's input-high threshold is 0.7 x VDD = **3.5 V**, and PA8 can only
-drive 3.3 V. Only the *first* LED in the chain sees that marginal signal --
-every one after it gets a regenerated 5 V copy -- so a single misread bit at
-that first input corrupts every LED downstream of it, which is why a corrupt
-region appears at a random point and moves around.
+Symptom: while the companion is streaming, part of the chain on the USB board
+flickers, with the corrupt region appearing at a random point and moving
+around; it stops the instant streaming stops. It surfaced when `-Os` doubled
+the scan rate and with it the stream frame rate (decimation is per *scan*).
 
-This was latent until `-Os` doubled the scan rate, which doubled the stream
-frame rate with it (decimation is per *scan*), and the extra system activity
-was enough to start tipping it. Symptom: while the companion is streaming, part
-of the chain flickers; it stops the instant streaming stops.
+**The cause was a type.** `dma_buffer` was declared `uint32_t` while the DMA
+channel is configured for **half-word** memory reads (`MemDataAlignment =
+DMA_MDATAALIGN_HALFWORD`, from the `.ioc`). So the DMA walked the array two
+bytes at a time and every second beat it fetched was the zero upper half of a
+word. `Length` is in beats, so 1494 beats consumed only the first 747 of the
+1494 entries. What actually went down the wire:
 
-**PA8 is set to `GPIO_SPEED_FREQ_VERY_HIGH`**, not CubeMX's default `LOW`
-(`stm32g4xx_hal_msp.c`, `TIM1_MspPostInit`). Slow slew keeps every edge in the
-indeterminate band for longer, which is exactly where noise flips a bit. Fastest
-slew took the worst case from constant flicker to occasional. It does not fix
-the underlying level problem.
+| | intended | what the old code sent |
+|---|---|---|
+| per data bit | 1 beat, 1.25 µs | 2 beats, **2.5 µs** (pulse, then a forced low) |
+| trailing reset | 750 beats, 937 µs | **3 words = 7.5 µs** of driven low |
+| `led_critical()` covered | all 744 data bits | the **first half** only |
+| total refresh | 1867.5 µs | 1867.5 µs |
 
-**The real fix is hardware**, and belongs on the next board revision: either a
-level shifter (74AHCT125 or similar) on the data line, or a series Schottky in
-the LED chain's 5 V feed to drop it to ~4.4 V, which brings their threshold to
-~3.1 V and gives the 3.3 V driver genuine margin. Note the diode carries the
-whole chain's current -- size it for the full LED load, not a signal diode.
+The total duration is identical either way, which is why the "~1.9 ms per
+refresh" in the comments matched measurement and the bug stayed invisible.
 
-**How this was established, in case it recurs.** The `i` line carries
-`ledchurn` (times `led_data` changed between refreshes) and `dmachurn` (times
-`dma_buffer` was altered mid-transfer). Both stayed at zero through two minutes
-of visible flickering, proving the bytes leaving the MCU were correct and
-correctly transmitted -- so the fault had to be on the wire, not in memory or
-DMA timing. `p<N>` throttles the scan loop and `n` stops the Hall scan, which
-between them separate "how fast we run" from "what we run" without a reflash.
+The damage is the **latch**. An SK6812 commits a frame when the line is held
+low for ≥80 µs, and only 7.5 µs of that was ever *driven*. The rest came from
+what happened next: `HAL_TIM_PWM_Stop_DMA()` clears the channel enable and the
+main output, and with OSSI off TIM1 then releases PA8 altogether -- high
+impedance, and the board has no pull on the line. So every frame was latched by
+a **floating** node that happened to sit low for long enough, ~28 ms of every
+30 ms, on a pin two away from the USB pair (PA11/PA12). That is a latch with no
+noise margin at all, and it is the USB correlation: more bus activity, more
+chances for the undriven latch window to be spoiled.
+
+Both halves are fixed. The buffer is `uint16_t`, so bits are 1.25 µs and the
+reset is a full 937 µs. And the timer is never stopped -- it runs on at
+CCR1 = 0, which holds the output actively driven low, with only the DMA request
+switched off (`led_line_hold_low()` in `main.c`). PA8 also carries a pull-down
+for the moments the timer does not own it.
+
+Also kept from the first attempt: **PA8 is `GPIO_SPEED_FREQ_VERY_HIGH`**, not
+CubeMX's default `LOW` (`stm32g4xx_hal_msp.c`, `TIM1_MspPostInit`). That took
+the worst case from constant flicker to occasional on its own.
+
+The level margin is still genuinely thin -- the SK6812's input-high threshold
+is 0.7 x VDD = **3.5 V** and PA8 drives 3.3 V -- so the next board revision
+should still get a level shifter (74AHCT125 or similar) on the data line, or a
+series Schottky in the LED chain's 5 V feed to drop it to ~4.4 V (sized for the
+whole chain's current, not a signal diode). But that is now a margin problem on
+a properly driven signal, not a marginal signal on top of an undriven latch.
+
+#### What was ruled out, and how
+
+A theory worth recording because it is wrong: that the floating line was
+*picking up USB edges directly*, each one read by the LED as a data bit.
+
+`f` on the CDC port toggles a diagnostic that restores the old behaviour
+exactly -- PA8 released between refreshes, no pull -- but with the pin switched
+to an input that counts every edge on it. `i` then reports `float=` and
+`idleedges=`. `F` is the control that makes those numbers mean anything: it
+drives 50 known pulses through the same routing, mask, NVIC entry and callback,
+and prints `SELFTEST pulses=50 edges=100 expect=100 OK`. Without it, a zero
+reading is indistinguishable from a diagnostic that never ran.
+
+Measured with the counter validated before and after, 15 s per phase:
+
+| condition | idle edges |
+|---|---|
+| line floating, bus quiet | 0 |
+| line floating, board streaming ~1100 frames/s | 0 |
+
+So the floating line picks up **nothing** a logic input can see. The
+disturbance that spoils an 80 µs latch on a high-impedance node is far smaller
+than a full swing across the STM32's Schmitt trigger, which is why the latch
+was fragile while the edge count stayed at zero. Keep `F` in mind generally:
+`ledchurn` and `dmachurn` stayed at zero through two minutes of flickering and
+were read as "the bytes are right, so the fault is on the wire" -- correct as
+far as it went, but it pointed at the voltage level when the defect was in the
+waveform. `p<N>` throttles the scan loop and `n` stops the Hall scan, which
+separate "how fast we run" from "what we run" without a reflash.
 
 ### Build optimisation level matters more than anything else
 
