@@ -18,6 +18,7 @@
 #define MESH_ANNOUNCE_MS        250u   /* tree beacon, root -> leaves */
 #define MESH_STATE_MS           100u   /* held-key sync, leaves -> root */
 #define MESH_BOARD_TIMEOUT_MS   500u   /* no KEYSTATE this long = board gone */
+#define MESH_COLORGEN_MS        1000u  /* colour-generator beacon, parent -> children */
 
 #define MESH_NO_PARENT          LINK_PORT_COUNT
 #define MESH_DEPTH_NONE         0xFFu
@@ -28,6 +29,7 @@
 #define KEYEV_LEN   16   /* origin32 | seq8 | sensor8 | x16 | y16 | kind8 | vel8 | dt32 */
 #define KST_LEN     12   /* origin32 | ox16 | oy16 | held32 */
 #define COLOR_LEN   (4 + MESH_RGB_BYTES)   /* dx16 | dy16 | rgb[93] */
+#define CGEN_LEN    (1 + MESH_CGEN_BYTES)  /* seq8 | params[40] */
 
 /* --- Geometry -------------------------------------------------------------- */
 
@@ -81,7 +83,23 @@ typedef struct {
 } board_t;
 
 static board_t  boards[MESH_MAX_BOARDS];
-static uint32_t t_announce, t_state, now_tick;
+
+/* The colour generator this board currently holds, and the sequence number it
+ * came with. Held here rather than in main.c because this layer is what re-sends
+ * it, and because the seq is a property of the distribution, not of the colours.
+ *
+ * cgen_seq is only meaningful alongside cgen_have: a board with no set holds no
+ * seq, so a beacon carrying seq 0 is still new to it. */
+static uint8_t  cgen_params[MESH_CGEN_BYTES];
+static uint8_t  cgen_seq;
+static uint8_t  cgen_have;
+static int16_t  cgen_ox, cgen_oy;   /* the offset we last painted at */
+static uint8_t  cgen_painted;
+
+static void cgen_apply(void);            /* defined below; on_announce uses both */
+static void cgen_send_port(link_port_t p);
+
+static uint32_t t_announce, t_state, t_cgen, now_tick;
 static uint32_t n_missed_down, n_fixed_up, n_geom_err, n_multi_master, n_lost_release;
 
 /* --- Little-endian packing -------------------------------------------------- */
@@ -184,6 +202,22 @@ static void become_master(void)
   parent_port = MESH_NO_PARENT;
   my_ox = my_oy = 0;
   my_depth = 0;
+
+  /* Start beaconing immediately, from our own compiled-in generator, rather than
+   * waiting for a 'K' that may never come. Two things follow. A child gets the
+   * parameters the moment it is adopted, so it leaves its boot wait early instead
+   * of sitting dark for the whole ceiling. And the grid provably runs ONE
+   * generator -- the master's -- rather than relying on every board having the
+   * same default compiled in, which stops being true the moment two firmware
+   * versions are mixed in one grid. */
+  if (!cgen_have) {
+    Miso_PackColorGen(cgen_params);
+    cgen_seq = 1;
+    cgen_have = 1;
+    cgen_ox = 0;
+    cgen_oy = 0;
+    cgen_painted = 1;
+  }
 }
 
 static void on_announce(link_port_t p, const uint8_t *d, uint8_t len)
@@ -210,9 +244,16 @@ static void on_announce(link_port_t p, const uint8_t *d, uint8_t len)
   }
 
   /* A neighbour naming us as its parent makes this port a child. */
+  port_role_t was = portst[p].role;
   if (r_parent == my_uid)      portst[p].role = ROLE_CHILD;
   else if (p == parent_port)   portst[p].role = ROLE_PARENT;
   else                         portst[p].role = ROLE_PEER;
+
+  /* A board that has just adopted us is dark, waiting for exactly this. Sending
+   * it here rather than leaving it to the next beacon is what keeps a hot-plugged
+   * board inside its boot wait, so it ripples up into the right colours instead
+   * of into the compiled-in default. */
+  if (portst[p].role == ROLE_CHILD && was != ROLE_CHILD) cgen_send_port(p);
 
   int16_t cand_ox = (int16_t)(r_ox - dir_vec[p][0]);
   int16_t cand_oy = (int16_t)(r_oy - dir_vec[p][1]);
@@ -240,6 +281,18 @@ static void on_announce(link_port_t p, const uint8_t *d, uint8_t len)
     my_oy = cand_oy;
     my_depth = cand_depth;
     portst[p].role = ROLE_PARENT;
+
+    /* Our colours are a function of where we are, so MOVING invalidates them
+     * even though the parameters have not changed: unplugged from one edge of the
+     * grid and replugged on another, the master's seq is untouched and would
+     * never repaint us.
+     *
+     * Against the offset we last painted at, not against the one we just had, so
+     * that a link that dropped and came back in the same place repaints nothing
+     * -- and a board hand-painted by 'L' in the meantime keeps its paint. */
+    if (cgen_have && (!cgen_painted || cand_ox != cgen_ox || cand_oy != cgen_oy)) {
+      cgen_apply();
+    }
   } else if (my_depth != MESH_DEPTH_NONE &&
              (cand_ox != my_ox || cand_oy != my_oy)) {
     /* A non-tree edge implies an offset too, and in a valid grid it must agree
@@ -336,6 +389,73 @@ static void on_color(link_port_t p, const uint8_t *d, uint8_t len)
   }
 }
 
+/* Paint from the held generator, remembering where we were when we did -- but
+ * only if it actually took, so a set main.c refuses cannot leave us believing we
+ * are painted and skipping the repaint on a later move. */
+static void cgen_apply(void)
+{
+  if (!Miso_ApplyColorGen(cgen_params)) return;
+  cgen_ox = my_ox;
+  cgen_oy = my_oy;
+  cgen_painted = 1;
+}
+
+static void cgen_send_port(link_port_t p)
+{
+  if (!cgen_have || link_state(p) != LINK_UP) return;
+
+  uint8_t d[CGEN_LEN];
+  d[0] = cgen_seq;
+  memcpy(d + 1, cgen_params, MESH_CGEN_BYTES);
+  link_send(p, LINK_MSG_COLORGEN, d, sizeof(d));
+}
+
+/* Beacon the held generator to every child. Costs 47 bytes on the wire per port
+ * -- ~1 ms of a 460800 link once a second -- which is why it can simply repeat
+ * instead of carrying an ack. */
+static void cgen_send_children(void)
+{
+  for (link_port_t q = 0; q < LINK_PORT_COUNT; q++) {
+    if (portst[q].role != ROLE_CHILD) continue;
+    cgen_send_port(q);
+  }
+}
+
+static void on_colorgen(link_port_t p, const uint8_t *d, uint8_t len)
+{
+  if (len < CGEN_LEN) return;
+  /* Colours flow down only. Taking this from anywhere else would let a cycle in
+   * the grid hand us a set that is on its way somewhere, or loop one back. */
+  if (p != parent_port) return;
+
+  /* Apply when the PARAMETERS differ, or when the seq does. Both, because they
+   * answer different questions, and either alone is wrong:
+   *
+   *   - content differs -> new colours, apply. This is what makes the seq's
+   *     8-bit wraparound harmless. It is reachable: the companion debounces a
+   *     dragged slider at 100 ms, so ~26 s of dragging is 256 pushes, and a child
+   *     unplugged across exactly that many would otherwise see its own seq come
+   *     back around and ignore a genuinely different set.
+   *   - seq differs -> something was pushed even though it is the same set, which
+   *     is how a board hand-painted by 'L' is pulled back onto the generator.
+   *
+   * Neither -> the periodic beacon, which must NOT repaint: that is what leaves
+   * an 'L' applied since the last push alone. */
+  uint8_t seq = d[0];
+  if (cgen_have && seq == cgen_seq &&
+      memcmp(cgen_params, d + 1, MESH_CGEN_BYTES) == 0) {
+    return;
+  }
+  memcpy(cgen_params, d + 1, MESH_CGEN_BYTES);
+  cgen_seq  = seq;
+  cgen_have = 1;
+  cgen_apply();
+
+  /* Straight on down, so a deep grid repaints in one hop rather than one beacon
+   * period per level. The periodic beacon is the backstop, not the fast path. */
+  cgen_send_children();
+}
+
 static void mesh_rx(link_port_t p, uint8_t type, const uint8_t *payload, uint8_t len)
 {
   switch (type) {
@@ -343,6 +463,7 @@ static void mesh_rx(link_port_t p, uint8_t type, const uint8_t *payload, uint8_t
   case LINK_MSG_KEYEV:    on_keyev(p, payload, len);    break;
   case LINK_MSG_KEYSTATE: on_keystate(p, payload, len); break;
   case LINK_MSG_COLOR:    on_color(p, payload, len);    break;
+  case LINK_MSG_COLORGEN: on_colorgen(p, payload, len); break;
   default: break;
   }
 }
@@ -427,6 +548,25 @@ void mesh_set_colors(int16_t x, int16_t y, const uint8_t *rgb)
   }
 }
 
+void mesh_set_colorgen(const uint8_t *params)
+{
+  memcpy(cgen_params, params, MESH_CGEN_BYTES);
+  /* Bump unconditionally, even for an identical set: the seq is what tells a
+   * child that something was pushed, and a board hand-painted since needs to be
+   * brought back onto the generator by a re-push of the same parameters. */
+  cgen_seq++;
+  cgen_have = 1;
+  /* main.c has already applied and rendered these; just record where, so the
+   * move check in on_announce() has a baseline (the master is always (0,0)). */
+  cgen_ox = my_ox;
+  cgen_oy = my_oy;
+  cgen_painted = 1;
+  cgen_send_children();
+}
+
+uint8_t mesh_has_colorgen(void) { return cgen_have; }
+uint8_t mesh_colorgen_seq(void) { return cgen_seq; }
+
 int16_t mesh_offset_x(void) { return my_ox; }
 int16_t mesh_offset_y(void) { return my_oy; }
 uint8_t mesh_is_master(void) { return is_master; }
@@ -464,6 +604,14 @@ void mesh_tick(uint32_t tick)
     for (link_port_t p = 0; p < LINK_PORT_COUNT; p++) {
       if (link_state(p) == LINK_UP) link_send(p, LINK_MSG_ANNOUNCE, d, sizeof(d));
     }
+  }
+
+  /* Re-beacon the colour generator down the tree. Idempotent by the seq check on
+   * the far side, so this covers a dropped frame and a child that has only just
+   * come up, with nothing tracking who has been told. */
+  if (cgen_have && (tick - t_cgen) >= MESH_COLORGEN_MS) {
+    t_cgen = tick;
+    cgen_send_children();
   }
 
   if ((tick - t_state) >= MESH_STATE_MS) {
@@ -525,6 +673,22 @@ void mesh_dump(void)
              (unsigned long)(now_tick - boards[i].last_seen));
     Miso_SendText(line);
   }
+
+  /* Before the stat line, which the companion uses as the commit point for a
+   * topology snapshot. */
+  if (cgen_have) {
+    snprintf(line, sizeof(line),
+             "MESH cgen seq=%u M=%d,%d,%d,%d anchor=%d,%d start=%d n=%u flags=%u bright=%u\r\n",
+             cgen_seq,
+             get16(cgen_params), get16(cgen_params + 2),
+             get16(cgen_params + 4), get16(cgen_params + 6),
+             get16(cgen_params + 8), get16(cgen_params + 10),
+             (int)(int8_t)cgen_params[12], cgen_params[13],
+             cgen_params[14], cgen_params[15]);
+  } else {
+    snprintf(line, sizeof(line), "MESH cgen none\r\n");
+  }
+  Miso_SendText(line);
 
   snprintf(line, sizeof(line),
            "MESH stat missed_down=%lu fixed_up=%lu lost_release=%lu geom_err=%lu multi_master=%lu\r\n",

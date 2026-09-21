@@ -55,6 +55,7 @@ typedef enum {
 #define LINK_MSG_KEYEV      0x14
 #define LINK_MSG_KEYSTATE   0x15
 #define LINK_MSG_COLOR      0x16
+#define LINK_MSG_COLORGEN   0x17
 
 /* Large enough for a whole colour frame in one message (4 bytes of target
  * coordinate + 93 of RGB = 97), so the mesh layer needs no fragmentation.
@@ -75,6 +76,12 @@ uint8_t         link_peer_port(link_port_t p);
 uint8_t         link_peer_has_usb(link_port_t p);
 
 void link_stats(link_port_t p, uint32_t *rx, uint32_t *tx, uint32_t *err);
+
+/* Which of the four things `err` counts actually happened. A single total cannot
+ * distinguish a noisy line from a ring we overfilled ourselves, and those want
+ * opposite fixes. */
+void link_err_breakdown(link_port_t p, uint32_t *uart, uint32_t *rxfull,
+                        uint32_t *txfull, uint32_t *sum);
 
 /* Application delivery. link.c handles HELLO/HELLO_ACK/PING itself and passes
  * every other frame type to this handler; without one they are dropped. */

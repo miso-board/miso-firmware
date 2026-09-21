@@ -10,7 +10,8 @@
 // procedural generator already worked: it colours a key by the accidental of
 // the pitch at its coordinate, which is a function of absolute position.
 
-import { NUM_KEYS, LED_POS, cellKey } from "./layout";
+import { MapVec } from "meantonal";
+import { LED_POS, cellKey } from "./layout";
 import { LAYOUTS, pitchAt, type LayoutId } from "./tuning";
 import { scaleHex, mixWhite, parseHex } from "./ledColor";
 
@@ -84,16 +85,6 @@ export function colorAt(m: ColorLayer, x: number, y: number): string {
   return "#000000";
 }
 
-// Mirrors the firmware boot pattern (fill_bosanquet groups by LED index),
-// so a fresh install starts from what the board already shows.
-const BOSANQUET_GROUPS: Record<string, number[]> = {
-  "#190202": [0, 5, 6, 18, 19], // double-flat
-  "#190a02": [1, 3, 4, 7, 16, 17, 20], // flat
-  "#141402": [2, 8, 9, 15, 21, 22, 28], // natural
-  "#051905": [10, 13, 14, 23, 26, 27, 29], // sharp
-  "#050519": [11, 12, 24, 25, 30], // double-sharp
-};
-
 /** An LED-indexed array from the old storage format is a board at the origin. */
 export function coloursFromLedArray(arr: string[]): Record<string, string> {
   const out: Record<string, string> = {};
@@ -102,15 +93,6 @@ export function coloursFromLedArray(arr: string[]): Record<string, string> {
     if (pos) out[cellKey(pos[0], pos[1])] = String(hex);
   });
   return out;
-}
-
-/** The board's boot colours, as a hand-painted layer. */
-export function bosanquetDefaultColors(): ColorLayer {
-  const arr = Array(NUM_KEYS).fill("#000000");
-  for (const [hex, leds] of Object.entries(BOSANQUET_GROUPS)) {
-    for (const l of leds) arr[l] = hex;
-  }
-  return { colors: coloursFromLedArray(arr) };
 }
 
 /** 93 RGB bytes for one board, in LED-chain order, from absolute coordinates. */
@@ -127,4 +109,66 @@ export function rgbForBoard(
     into[at + led * 3 + 1] = g;
     into[at + led * 3 + 2] = b;
   });
+}
+
+// --- The `K` wire frame ------------------------------------------------------
+
+/** Palette entries the firmware's frame can carry. */
+export const COLORGEN_PAL_MAX = 8;
+
+export const COLORGEN_FRAME_LEN = 41; // 'K' + 40 payload bytes
+
+/**
+ * The generator parameters, as the firmware wants them — the colour counterpart
+ * of `pitchFrame`.
+ *
+ * 'K' · int16 m00, m01, m10, m11 · int16 aw, ah · int8 start accidental ·
+ * u8 palette length · u8 flags · u8 brightness · 8 × RGB, little-endian.
+ *
+ * Forty bytes replace the 93-per-board table `L` sends, and because the firmware
+ * evaluates them at absolute coordinates, one frame colours every board in the
+ * mesh — including one attached later, which is the point: the parameters travel
+ * down the tree, so a board hot-plugged with no host connected still comes up in
+ * the right colours.
+ *
+ * Two things are folded on the way out. `offset` disappears into the anchor,
+ * since `M·(v + o) + a` is `M·v + (M·o + a)` — so the wire carries the same six
+ * integers of geometry `P` does. `brightness` does NOT fold into the palette,
+ * because `lightenCDE` is applied per key BEFORE scaling and rounds on the way
+ * (see `generateColorAt`), so pre-scaling would shift some channels by a count.
+ *
+ * Returns null when the scheme cannot be expressed as parameters: a layer with
+ * no generator (hand-painted), or a palette longer than the frame can carry. The
+ * caller falls back to per-board `L` frames.
+ */
+export function colorgenFrame(p: GeneratorParams): Uint8Array | null {
+  if (p.palette.length < 1 || p.palette.length > COLORGEN_PAL_MAX) return null;
+
+  const layout = LAYOUTS[p.layout];
+  const o = layout.matrix.map(new MapVec(p.offset[0], p.offset[1]));
+
+  const frame = new Uint8Array(COLORGEN_FRAME_LEN);
+  frame[0] = 0x4b; // 'K'
+  const dv = new DataView(frame.buffer);
+  // Signed: Wicki-Hayden's matrix is (1, −2, 0, −1).
+  dv.setInt16(1, layout.matrix.m00, true);
+  dv.setInt16(3, layout.matrix.m01, true);
+  dv.setInt16(5, layout.matrix.m10, true);
+  dv.setInt16(7, layout.matrix.m11, true);
+  dv.setInt16(9, o.x + layout.anchor.w, true);
+  dv.setInt16(11, o.y + layout.anchor.h, true);
+  dv.setInt8(13, p.startAccidental);
+  frame[14] = p.palette.length;
+  frame[15] = p.lightenCDE ? 0x01 : 0x00;
+  frame[16] = Math.round(p.brightness);
+
+  // At FULL brightness: the board scales, so that it can apply the C/D/E tint
+  // first and round exactly where the host does.
+  p.palette.forEach((hex, i) => {
+    const [r, g, b] = parseHex(hex);
+    frame[17 + i * 3] = r;
+    frame[17 + i * 3 + 1] = g;
+    frame[17 + i * 3 + 2] = b;
+  });
+  return frame;
 }

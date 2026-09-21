@@ -107,6 +107,12 @@ typedef struct {
   uint8_t  peer_fw, peer_port, peer_has_usb;
 
   uint32_t n_rx, n_tx, n_err;
+  /* n_err is the total; these say WHICH, because the four causes want different
+   * fixes and a single number cannot tell them apart. n_uart is the line itself
+   * (framing/noise/overrun), n_rxfull means the main loop fell behind draining
+   * the ring, n_txfull means we offered frames faster than the port could send
+   * them, and n_sum is a corrupt or resynced frame. */
+  uint32_t n_uart, n_rxfull, n_txfull, n_sum;
 } link_t;
 
 static link_t link[LINK_PORT_COUNT];
@@ -192,6 +198,7 @@ static void link_rx_put(link_t *L, uint8_t c)
     L->rx_head = next;
   } else {
     L->n_err++;   /* main loop fell behind; drop rather than stall */
+    L->n_rxfull++;
   }
 }
 
@@ -204,6 +211,7 @@ static void link_isr(link_port_t p)
   if (isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE)) {
     u->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF | USART_ICR_PECF;
     L->n_err++;
+    L->n_uart++;
   }
 
   if (isr & USART_ISR_RXNE) link_rx_put(L, (uint8_t)u->RDR);
@@ -255,6 +263,7 @@ int link_send(link_port_t p, uint8_t type, const uint8_t *payload, uint8_t len)
   uint16_t used = (uint16_t)((L->tx_head - L->tx_tail) & (LINK_TX_RING - 1u));
   if (used + need >= LINK_TX_RING) {
     L->n_err++;
+    L->n_txfull++;
     return 0;   /* drop rather than block the scan loop */
   }
 
@@ -402,7 +411,7 @@ static void link_feed(link_port_t p, uint8_t c, uint32_t tick)
     L->ps = 3;
     break;
   case 3:
-    if (c > LINK_MAX_PAYLOAD) { L->n_err++; L->ps = 0; break; }
+    if (c > LINK_MAX_PAYLOAD) { L->n_err++; L->n_sum++; L->ps = 0; break; }
     L->p_len = c;
     L->p_sum = (uint8_t)(L->p_sum + c);
     L->p_count = 0;
@@ -415,7 +424,7 @@ static void link_feed(link_port_t p, uint8_t c, uint32_t tick)
     break;
   case 5:
     if (c == L->p_sum) link_on_frame(p, tick);
-    else               L->n_err++;
+    else               { L->n_err++; L->n_sum++; }
     L->ps = 0;
     break;
   default:
@@ -587,6 +596,16 @@ void link_stats(link_port_t p, uint32_t *rx, uint32_t *tx, uint32_t *err)
   if (rx)  *rx  = link[p].n_rx;
   if (tx)  *tx  = link[p].n_tx;
   if (err) *err = link[p].n_err;
+}
+
+void link_err_breakdown(link_port_t p, uint32_t *uart, uint32_t *rxfull,
+                        uint32_t *txfull, uint32_t *sum)
+{
+  if (p >= LINK_PORT_COUNT) return;
+  if (uart)   *uart   = link[p].n_uart;
+  if (rxfull) *rxfull = link[p].n_rxfull;
+  if (txfull) *txfull = link[p].n_txfull;
+  if (sum)    *sum    = link[p].n_sum;
 }
 
 void link_set_rx_handler(link_rx_handler_t cb)

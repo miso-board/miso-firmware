@@ -209,7 +209,7 @@ interface on the same USB-C port:
 
 | Command | Effect |
 |---------|--------|
-| `i`     | Info line: firmware version, measured scan Hz, stream state |
+| `i`     | Info line: firmware version, measured scan Hz, stream state, `cmode=proc\|expl` |
 | `s` / `x` | Start / stop streaming scan frames |
 | `d<N>`  | Stream every Nth scan (default 2) |
 | `l`     | Toggle the LED velocity feedback (off for clean noise measurements) |
@@ -222,6 +222,7 @@ interface on the same USB-C port:
 | `B!`    | Reboot into the USB DFU bootloader (two bytes, so a stray character can't misfire) |
 | `C` + 93 bytes | Set all LED background colors: 31 × RGB, LED-chain order (a stalled frame aborts after 200 ms) |
 | `P` + 16 bytes | Set the pitch map: `int32` fifth in millicents, `int16` m00 m01 m10 m11 (grid → `(w, h)` basis change), `int16` anchor w, h. Little-endian, validated before it is installed |
+| `K` + 40 bytes | Set the **colour generator**: `int16` m00 m01 m10 m11, `int16` anchor w, h, `int8` start accidental, `u8` palette length, `u8` flags, `u8` brightness percent, then 8 × RGB. Little-endian, validated, and propagated down the mesh |
 
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
 (little-endian; checksum = byte sum of the payload).
@@ -510,6 +511,28 @@ topology discovery, addressing and key-event forwarding come next.
 `k` over CDC dumps every port's state, peer UID, and RX/TX/error counts; `i`
 adds a compact `links=TBLR` summary using the characters above.
 
+`err` is a total, and on its own it cannot tell you what to fix, so `k` breaks it
+down into the four things that increment it:
+
+| Field | Means | Points at |
+|-------|-------|-----------|
+| `uart` | ORE/FE/NE/PE on the peripheral | the line: noise, crosstalk, a connector |
+| `sum` | checksum mismatch, or an impossible length | usually a *consequence* of `uart` corrupting a byte mid-frame |
+| `rxfull` | the RX ring filled before the main loop drained it | the scan loop is being starved |
+| `txfull` | `link_send` found no room in the TX ring | we are offering frames faster than the port sends them |
+
+The distinction matters because the fixes are opposite. Measured on a three-board
+grid: `uart=70 sum=65 rxfull=0 txfull=0` on one right-hand connector — a physical
+problem on that connector (the hardware note above is the fix), not a firmware one.
+Under 60 colour-generator pushes at 10/s, the worst case a dragged slider produces,
+`txfull` stayed at 0 and `err` did not move at all.
+
+One thing to know when reading `k` on a noisy link: the peer UID there is latched
+from the HELLO at handshake, and a plain byte-sum checksum lets a corrupted one
+through about one time in 256. The mesh layer does not use it — `mesh.c` takes peer
+identity from `ANNOUNCE` and cross-checks the implied offset — so `T` can show the
+right UID while `k` shows a mangled one, and topology is unaffected.
+
 ### Hardware note
 
 Firmware gating fixes the symptom. The robust fix is a ~1–4.7 kΩ series resistor
@@ -661,8 +684,9 @@ timeout covers boards further away.
 
 | Command | Effect |
 |---------|--------|
-| `T` | Dump topology: own offset/depth/role, port roles, known boards, counters |
+| `T` | Dump topology: own offset/depth/role, port roles, known boards, the held colour generator, counters |
 | `L` + `int16 x`, `int16 y`, 93 bytes | Set colours on the board at that grid origin, wherever it is in the mesh |
+| `K` + 40 bytes | Set the colour generator for the **whole grid**; beaconed down the tree, each board evaluating its own keys |
 
 `C` keeps its exact meaning ("this board"), so the companion needs no change.
 `EV` lines gained trailing `x=` and `y=` fields; the existing prefix is
@@ -679,6 +703,65 @@ The TOP port runs on the software UART (see
 vertical pair links exactly as a horizontal one does: one board's BOTTOM
 (LPUART1) meets another's TOP. `k` and `i` report it with the same states as
 the other three ports, and the mesh layer never distinguished it.
+
+### Colours are parameters too, and they propagate
+
+A board's colours are a function of *where it is*, and only the master knows
+that. So a board that booted into its own pattern and was then slotted into a
+grid used to sit there wrong until the companion pushed again — and with no
+companion connected, it stayed wrong. The colour path had no acknowledgement and
+no retry either, so a frame dropped by a full TX ring was simply lost.
+
+`K` fixes this the way `P` fixed tuning: **40 bytes of generator parameters
+instead of a table**. A key's colour is the palette entry for the accidental of
+the note that lands on it, and the accidental follows from the absolute
+coordinate, so one small block covers a grid of any size and each board works out
+its own 31 keys. The maths the board needs on top of `pitch_for_xy`'s `(w, h)` is
+three lines, taken from meantonal:
+
+    chroma     = 2w - 5h
+    accidental = floor((chroma + 1) / 7)      the Bosanquet row
+    pc7        = mod7(w + h)                  letter index, C D E = 0 1 2
+
+A tuning is not involved, because an accidental is a *spelling*: the same colours
+mean the same thing in every tuning, which is why `K` and `P` are independent.
+
+Unlike `P`, which deliberately gets no propagation — only the master sounds notes
+— `K` travels **down the whole tree**, because every board lights its own LEDs.
+It is beaconed to children every second, carrying a sequence number bumped
+whenever the master installs a new set. The repetition is what makes the path
+reliable with no ack anywhere: a lost frame self-heals, and a child that has just
+come `LINK_UP` is served without anything tracking whether it was told.
+
+Two invariants hold the rest of it together.
+
+**A board applies a beacon only when the seq differs from the one it holds.** A
+board hand-painted by `L` since the last push would otherwise be repainted a
+second later. `L` marks that board `cmode=expl` without touching the seq, so the
+beacon passes over it; the companion pushes `K` first, then `L` only for boards
+carrying overrides, so the paint lands on top of the generated base.
+
+**A board repaints when it moves, against the offset it last painted at** — not
+against the one it last had. Unplugged from one edge of the grid and replugged on
+another, the master's seq is untouched and nothing else would repaint it; but a
+link that merely dropped and came back in the same place repaints nothing, which
+is what lets hand-painted keys survive a flaky connector.
+
+The default parameters are **byte-identical to the hardcoded pattern they
+replaced**, for all 31 keys, so flashing this firmware cannot change how a board
+looks until something pushes a `K`. That is asserted, not asserted-by-comment:
+`companion/scripts/check-firmware-colors.py` extracts the generator verbatim from
+`main.c`, compiles it, and diffs it against the companion's own `generateColorAt`
+over 320 generators on a four-board grid. Note what that script does *not*
+contain, unlike its pitch counterpart: any copy of the firmware's arithmetic. The
+reference is the real authoring path, so a pass means the two implementations
+agree rather than that two transcriptions of one formula match.
+
+One rounding subtlety is load-bearing enough to be worth naming. The C/D/E tint
+is applied per key *before* brightness scaling and rounds on the way, so
+brightness cannot be folded into the palette on the host — the palette travels at
+full brightness and the board scales it. Reversing the two steps shifts some
+channels by a count, which the cross-check catches on 6,240 of its cases.
 
 ### Verified on hardware
 
@@ -733,6 +816,18 @@ crest, then decays into its own colour with a squared falloff. `boot_wave_play()
 in `main.c`; the crest level, sweep duration and the widths of the leading ramp
 and trailing decay are the `WAVE_*` constants above it.
 
+The mapping it wakes up *into* is generated, not stored, so a board in a grid has
+to know where it is first — see
+[Colours are parameters too](#colours-are-parameters-too-and-they-propagate). A
+board that is not yet the master therefore **holds dark for up to
+`COLORGEN_WAIT_MS` (1200 ms)**, ticking the link and mesh layers, until either a
+parent hands it the generator or USB makes it the master; only then does it paint
+`led_background[]` and ripple. Link bring-up measures ~500–700 ms, so the ceiling
+is a backstop rather than the usual cost, and between those two exits they cover
+every way a board can actually be powered: over USB, or from a neighbour through
+the pogo pins. Waking up dark for half a second beats rippling up into the wrong
+colours and snapping out of them a moment later.
+
 **"Left to right" is `4x + 3y`, not the column index.** The grid is a sheared
 axial hex lattice, and the board is physically laid out in the standard
 Bosanquet orientation — the octave direction `(5, 2)` horizontal. Rotating the
@@ -762,13 +857,14 @@ still happens under a settled, static pattern. Calibrating while a bright crest
 swept the board would fold the chain's own current draw — which rides the same
 3V3 rail as the Hall sensors — into every key's rest level.
 
-Two things it does not do. Boards in a tiled set each ripple **independently**,
-because links and topology are not up yet when it plays, so a wide grid shows
-several parallel sweeps rather than one crossing the whole instrument; a
-mesh-wide version would have to wait for discovery and then start on a shared
-deadline. And it plays at boot only — pushing a new colour map over `C`/`L`
-still swaps in place. `boot_wave_play()` reads `led_background[]` live, so
-re-triggering it on a colour push is one call if that turns out to be wanted.
+Two things it does not do. Boards in a tiled set each ripple **independently**:
+a child now waits for its colours before starting, but it starts as soon as they
+arrive rather than on a deadline shared with its siblings, so a wide grid still
+shows several parallel sweeps rather than one crossing the whole instrument. A
+mesh-wide version would have to agree a start tick across the tree. And it plays
+at boot only — pushing a new colour map over `C`/`L`/`K` still swaps in place.
+`boot_wave_play()` reads `led_background[]` live, so re-triggering it on a colour
+push is one call if that turns out to be wanted.
 
 **Companion app** (`companion/`): Svelte 5 + TypeScript + Tailwind + [meantonal](https://meantonal.org/),
 built with Vite. It shows live per-key levels with min/max watermarks, per-key stats
@@ -813,23 +909,34 @@ board is verified like any other), and the header shows a live board count.
 Both mappings are keyed by **absolute grid coordinate**, not LED index, so one
 scheme covers however many boards are attached and survives them being added,
 removed or rearranged — which also matches how the procedural generator always
-worked, colouring by the accidental of the pitch at a coordinate. Pushing sends
-one `L` frame per board. Generated schemes are evaluated lazily rather than
-materialised, so attaching another board needs no regeneration.
+worked, colouring by the accidental of the pitch at a coordinate. Generated
+schemes are evaluated lazily rather than materialised, so attaching another board
+needs no regeneration — and since 0.8.0 a generated colour scheme is not
+evaluated here at all but pushed as parameters and evaluated *on* each board.
 
 Colour storage passed through `miso-color-maps-v2` on the way here, which read a
 v1 31-entry LED-indexed array as a board at the origin; both older keys are still
 read as a fallback and still left in place as backups.
+
+The **default preset is now procedural** rather than a frozen 31-entry copy of the
+firmware's boot pattern. The two agree byte for byte on a board at the origin — the
+default palette was chosen so they would, and `check:colors` holds both sides to it
+— but a table keyed by the origin board's coordinates paints the origin's rows onto
+every board in a tiled grid instead of each board's own. Being procedural is also
+what lets it go out as one `K` frame and keep working with the app closed. The
+groups the frozen layer used now live in `check-firmware-colors.py` as the legacy
+reference, which is where `check-firmware-pitch.py` keeps its equivalent.
 
 Two limits worth knowing. The **Calibrate tab is master-only** — the firmware
 forwards key events, not raw scans, and remote sensor data at full rate would be
 93 kB/s against a 46 kB/s link, so live levels, stats and press capture show only
 the USB board's own keys. And connecting to older firmware still works: with no
 topology seen, the app falls back to a single board at the origin and the
-original `C` colour frame, and `P` is withheld below 0.7.0 — that gate is
-load-bearing rather than polite, because a board that does not know `P` would
-read its 16 payload bytes as commands, and `C` (0x43) or `L` (0x4C) are entirely
-reachable values in a millicent count or a signed matrix entry.
+original `C` colour frame; `P` is withheld below 0.7.0 and `K` below 0.8.0 — those
+gates are load-bearing rather than polite, because a board that does not know the
+command would read its 16 or 40 payload bytes as commands, and `C` (0x43) or `L`
+(0x4C) are entirely reachable values in a millicent count, a signed matrix entry
+or a palette channel.
 
 The **procedural colour generator** colours each key by the accidental of the
 note that lands on it — the key's Bosanquet row — via meantonal. That library
@@ -844,6 +951,18 @@ placement offset and LED brightness are all adjustable, and the whole scheme
 streams to the board as you tweak it. Board rendering, note names and the
 layout bases live in `companion/src/lib/tuning.ts`.
 
+Where that scheme is *evaluated* depends on what it is. A purely procedural layer
+goes to the board as one 40-byte `K` frame and is evaluated there, per key, on
+every board in the grid — so the app can be closed and a board attached later
+still comes up right. A hand-painted or mixed layer cannot be expressed in
+parameters, so it is rendered here and sent as a 93-byte `L` frame per board,
+after the `K` so paint lands on top of the generated base. `colorgenFrame` in
+`colorMaps.ts` is the one place that folds the generator into wire bytes; it
+returns `null` for a palette longer than the eight entries the frame carries, and
+`pushColors()` then falls back to `L` frames. Because only the second case needs
+the host, the 1 Hz topology poll re-pushes on a grid change *only* when
+`colorsAreSelfSufficient()` is false.
+
 For live board data, run it locally in Chrome (Web Serial needs a top-level
 secure page; the published Claude artifact is wrapped in an iframe that
 doesn't delegate serial access, so the artifact copy is a simulated demo
@@ -854,16 +973,18 @@ cd companion
 npm install
 npm run dev     # → http://localhost:5173, connects to the board
 npm run build   # dist/miso-companion.html (single file, publishable as artifact demo)
-npm run check:all   # types, then the pitch cross-checks below
+npm run check:all   # types, then the cross-checks below
 ```
 
-Three checks, because the pitch pipeline spans two languages and a wire format:
+Four checks, because the pitch and colour pipelines each span two languages and a
+wire format:
 
 | Command | What it proves |
 |---------|----------------|
 | `npm run check` | `svelte-check`: types across the app |
 | `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192) |
 | `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `main.c`, compiles it with clang, and diffs it against the app over nine tunings × both layouts × a four-board grid — plus the byte-identical-default claim |
+| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 320 generators × a four-board grid — plus the byte-identical-boot-pattern claim, and eight validation cases |
 
 The 12-TET case is the one to keep: at a 700¢ fifth a wrong coefficient would not
 collapse to equal temperament, a wrong anchor would disagree with meantonal's own

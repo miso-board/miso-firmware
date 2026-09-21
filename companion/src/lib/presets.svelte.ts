@@ -28,7 +28,7 @@ import {
 } from "./tuning";
 import {
   DEFAULT_GENERATOR,
-  bosanquetDefaultColors,
+  colorgenFrame,
   coloursFromLedArray,
   generateColorAt,
   rgbForBoard,
@@ -55,8 +55,33 @@ export interface Preset {
 /** Firmware that understands the `P` tuning frame. */
 export const PITCH_PUSH_FW = [0, 7, 0] as const;
 
+/** Firmware that understands the `K` colour-generator frame. */
+export const COLORGEN_PUSH_FW = [0, 8, 0] as const;
+
+/**
+ * The out-of-the-box preset.
+ *
+ * Its colours are the GENERATOR. This used to be a frozen 31-entry layer
+ * mirroring the firmware's boot pattern by LED index; the two agree byte for byte
+ * on a board at the origin — `DEFAULT_GENERATOR` was chosen so they would, and
+ * `check-firmware-colors.py` holds both sides to it — but a table keyed by the
+ * origin board's coordinates paints the origin's rows onto every board in a tiled
+ * grid rather than each board's own. The generator is also what lets the whole
+ * scheme go out as one `K` frame and keep working after this app is closed.
+ */
 function defaultPreset(): Preset {
-  return { name: "Bosanquet", colors: bosanquetDefaultColors(), pitch: defaultPitchMap() };
+  return {
+    name: "Bosanquet",
+    colors: {
+      colors: {},
+      generator: {
+        ...DEFAULT_GENERATOR,
+        palette: [...DEFAULT_GENERATOR.palette],
+        offset: [...DEFAULT_GENERATOR.offset] as [number, number],
+      },
+    },
+    pitch: defaultPitchMap(),
+  };
 }
 
 export const presetState = $state({
@@ -70,6 +95,8 @@ export const presetState = $state({
    * so instead of looking broken.
    */
   pushedPitch: null as string | null,
+  /** The colour-generator frame the board is believed to be running, as hex. */
+  pushedColorgen: null as string | null,
 });
 
 export function activePreset(): Preset {
@@ -334,9 +361,20 @@ export function selectPreset(index: number): void {
 // --- pushing to the boards -------------------------------------------------
 
 /**
- * Push the active preset's colours to every board in the grid.
+ * Push the active preset's colours.
  *
- * `L` addresses a board by its grid origin, so one frame goes out per board.
+ * Two routes, and which one is taken matters for more than bandwidth.
+ *
+ * `K` sends the GENERATOR — forty bytes the firmware evaluates per key at
+ * absolute coordinates, propagated down the mesh tree. It is preferred whenever
+ * the mapping is procedural, because it is the only route that keeps working
+ * once we are gone: a board hot-plugged or power-cycled later learns its colours
+ * from its parent, at its own grid offset, with no host in the loop.
+ *
+ * `L` sends a rendered 93-byte table per board, which is the only way to express
+ * hand-painted keys. It is sent for boards carrying explicit colours, AFTER the
+ * `K` frame so it lands on top of the generated base rather than under it.
+ *
  * Firmware predating the mesh has neither `L` nor `T`, so when no topology has
  * been seen we fall back to the original `C` frame for the attached board.
  */
@@ -352,6 +390,16 @@ export async function pushColors(): Promise<void> {
     return;
   }
 
+  const gen = canPushColorgen() && m.generator ? colorgenFrame(m.generator) : null;
+  if (gen) {
+    await sendBytes(gen);
+    presetState.pushedColorgen = frameHex(gen);
+  }
+
+  // With the generator pushed and nothing painted over it, the boards have
+  // everything they need — including the ones not attached yet.
+  if (gen && Object.keys(m.colors).length === 0) return;
+
   for (const board of mesh.boards) {
     const frame = new Uint8Array(1 + 4 + NUM_KEYS * 3);
     frame[0] = 0x4c; // 'L'
@@ -361,6 +409,28 @@ export async function pushColors(): Promise<void> {
     rgbForBoard(m, board.ox, board.oy, frame, 5);
     await sendBytes(frame);
   }
+}
+
+/**
+ * True when every board's colours follow from parameters the boards themselves
+ * hold, so a board arriving later needs nothing from us.
+ *
+ * What the grid-change watcher in App.svelte keys off: a hand-painted or mixed
+ * layer still has to be re-pushed when the topology changes.
+ */
+export function colorsAreSelfSufficient(): boolean {
+  const m = activeColors();
+  return (
+    canPushColorgen() &&
+    !!m.generator &&
+    Object.keys(m.colors).length === 0 &&
+    colorgenFrame(m.generator) !== null
+  );
+}
+
+/** True when the attached firmware understands `K`. */
+export function canPushColorgen(): boolean {
+  return ui.connected && fwAtLeast(...COLORGEN_PUSH_FW);
 }
 
 /** True when the attached firmware understands `P`. */
@@ -426,6 +496,7 @@ export function schedulePush(what: { colors?: boolean; pitch?: boolean }): void 
 /** Forget what the board is running — on disconnect, where it may change. */
 export function resetPushed(): void {
   presetState.pushedPitch = null;
+  presetState.pushedColorgen = null;
 }
 
 // --- interchange -----------------------------------------------------------

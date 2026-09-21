@@ -12,7 +12,13 @@
   import ColorsTab from "./components/ColorsTab.svelte";
   import PitchTab from "./components/PitchTab.svelte";
   import MidiMonitor from "./components/MidiMonitor.svelte";
-  import { load as loadPresets, pushAll, resetPushed } from "./lib/presets.svelte";
+  import {
+    load as loadPresets,
+    pushAll,
+    pushColors,
+    resetPushed,
+    colorsAreSelfSufficient,
+  } from "./lib/presets.svelte";
 
   let decim = $state("2");
   let activeTab = $state<"calibrate" | "colors" | "pitch" | "midi">("calibrate");
@@ -119,6 +125,11 @@
     const restTimer = setTimeout(captureRest, 800);
 
     let lastCount = 0;
+    // The grid we last pushed colours for. A procedural preset needs no watching
+    // — the boards hold the generator and colour themselves, which is the whole
+    // point of `K` — but a hand-painted one only exists as rendered tables here,
+    // so a board that appears has to be sent its own.
+    let lastGrid = "";
     const secTimer = setInterval(() => {
       ui.fps = engine.frameCounter - lastCount;
       lastCount = engine.frameCounter;
@@ -126,6 +137,15 @@
       if (ui.connected) {
         void serial.send("i");
         void serial.send("T"); // boards can be hot-plugged at any time
+
+        const grid = mesh.boards.map((b) => `${b.ox},${b.oy}`).join(" ");
+        if (grid !== lastGrid) {
+          // Only after the first snapshot: connect() already pushed for it.
+          if (lastGrid !== "" && !colorsAreSelfSufficient()) void pushColors();
+          lastGrid = grid;
+        }
+      } else {
+        lastGrid = "";
       }
     }, 1000);
     const rowTimer = setInterval(refreshRows, 200);

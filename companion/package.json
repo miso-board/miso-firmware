@@ -9,7 +9,8 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "check:tuning": "node --import ./scripts/ts-resolve.mjs scripts/check-tuning.mjs",
     "check:firmware": "python3 scripts/check-firmware-pitch.py",
-    "check:all": "npm run check && npm run check:tuning && npm run check:firmware"
+    "check:colors": "python3 scripts/check-firmware-colors.py",
+    "check:all": "npm run check && npm run check:tuning && npm run check:firmware && npm run check:colors"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.3",

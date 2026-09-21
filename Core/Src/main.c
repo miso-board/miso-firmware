@@ -67,7 +67,7 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.7.0"
+#define FW_VERSION          "miso 0.8.0"
 #define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
@@ -103,6 +103,31 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define MIDI_CIN_NOTE_ON    0x09
 #define MIDI_CIN_CC         0x0B
 #define MIDI_CIN_PITCHBEND  0x0E
+
+// --- Procedural colour mapping ------------------------------------------
+// Colour has the same shape as pitch above: parameters, not a table. A key is
+// coloured by the ACCIDENTAL of the note that lands on it -- its Bosanquet row
+// -- which is a function of the absolute grid coordinate, so one small block of
+// parameters colours a grid of any size and a board evaluates its own keys.
+//
+// The (w, h) arithmetic is the same as pitch_for_xy()'s; on top of it, taken
+// straight from meantonal (see companion/src/lib/colorMaps.ts, the authoring
+// side, which asks the library instead):
+//
+//   chroma     = 2w - 5h
+//   accidental = floor((chroma + 1) / 7)        the row
+//   pc7        = mod7(w + h)                    letter index, C D E = 0 1 2
+//
+// A tuning is not involved: an accidental is a spelling, so the colours mean the
+// same thing in every tuning. Unlike 'P', these parameters DO travel down the
+// mesh (every board lights its own LEDs, while only the master sounds notes).
+#define COLORGEN_PAL_MAX      8    // palette entries; rows beyond it wrap
+#define COLORGEN_MSG_LEN      40   // payload bytes after 'K'
+_Static_assert(COLORGEN_MSG_LEN == MESH_CGEN_BYTES,
+               "mesh.h's MESH_CGEN_BYTES must match COLORGEN_MSG_LEN");
+#define COLORGEN_LIGHTEN_CDE  0x01 // flags bit 0: tint C, D, E paler as a landmark
+#define COLORGEN_CDE_PCT      35   // how far toward white that tint goes
+#define COLORGEN_WAIT_MS      1200 // boot: longest a child waits for colours before rippling
 
 // Velocity engine. Positions are normalized per key: 0 = rest, 1 = calibrated
 // full press. Thresholds chosen against measured spans of 510-700 counts with
@@ -228,60 +253,6 @@ void fill_solid(uint8_t r, uint8_t g, uint8_t b)
 {
   for (int i = 0; i < NUM_LEDS; i++) {
     set_pixel(i, r, g, b);
-  }
-}
-
-void fill_bosanquet(
-		uint8_t ds_r, uint8_t ds_g, uint8_t ds_b,
-		uint8_t s_r, uint8_t s_g, uint8_t s_b,
-		uint8_t n_r, uint8_t n_g, uint8_t n_b,
-		uint8_t f_r, uint8_t f_g, uint8_t f_b,
-		uint8_t df_r, uint8_t df_g, uint8_t df_b)
-{
-  for (int i = 0; i < NUM_LEDS; i++) {
-	switch (i) {
-	case 0:
-	case 5:
-	case 6:
-	case 18:
-	case 19:
-		set_pixel(i, df_r, df_g, df_b);
-		break;
-	case 1:
-	case 3:
-	case 4:
-	case 7:
-	case 16:
-	case 17:
-	case 20:
-        set_pixel(i, f_r, f_g, f_b);
-        break;
-	case 2:
-	case 8:
-	case 9:
-	case 15:
-	case 21:
-	case 22:
-	case 28:
-		set_pixel(i, n_r, n_g, n_b);
-		break;
-	case 10:
-	case 13:
-	case 14:
-	case 23:
-	case 26:
-	case 27:
-	case 29:
-		set_pixel(i, s_r, s_g, s_b);
-		break;
-	case 11:
-	case 12:
-	case 24:
-	case 25:
-	case 30:
-		set_pixel(i, ds_r, ds_g, ds_b);
-		break;
-    }
   }
 }
 
@@ -713,6 +684,14 @@ static volatile uint8_t  pq_fill = 0;
 static volatile uint8_t  pq_active = 0;   // mid-frame, collecting payload bytes
 static volatile uint8_t  pq_ready = 0;    // a complete frame awaits the main loop
 static volatile uint32_t pq_rejected = 0; // failed validation; surfaced by 'i'
+
+// The pushed colour generator, single-buffered for the same reason: 'K' carries
+// parameters, which are idempotent and last-write-wins.
+static volatile uint8_t  kq_buf[COLORGEN_MSG_LEN];
+static volatile uint8_t  kq_fill = 0;
+static volatile uint8_t  kq_active = 0;
+static volatile uint8_t  kq_ready = 0;
+static volatile uint32_t kq_rejected = 0; // failed validation; surfaced by 'i'
 static volatile uint32_t last_rx_tick = 0;
 
 // Binary scan frame: A5 5A 01 | u32 t_us | 31 x u16 raw | u8 checksum(payload)
@@ -736,7 +715,7 @@ static void stream_frame(uint32_t t_us)
 // free up; data is copied to a static buffer that stays valid during TX.
 static void cdc_send_text(const char *s)
 {
-  static char txt[224];
+  static char txt[288];
   size_t n = strlen(s);
   if (n > sizeof(txt)) n = sizeof(txt);
   uint32_t t0 = HAL_GetTick();
@@ -944,6 +923,161 @@ static uint8_t pitch_params_apply(const uint8_t *m)
   return 1;
 }
 
+// ============================ Procedural colour ==============================
+// The same idea as the pitch map above, and the same shape on the wire: a small
+// block of parameters, evaluated at an ABSOLUTE grid coordinate, so one push
+// colours a grid of any size and every board can work out its own keys.
+
+// The live colour generator. Seeded to the pattern this board showed before 'K'
+// existed -- Bosanquet rows in red / orange / yellow / green / blue at 10%
+// brightness -- so a board that never hears from the companion looks exactly as
+// it always did. companion/scripts/check-firmware-colors.py asserts that byte
+// for byte against the hardcoded fill_bosanquet() this replaced.
+typedef struct {
+  int16_t m00, m01, m10, m11;   /* grid -> (w, h) basis change */
+  int16_t aw, ah;               /* anchor, with the generator's (x, y) offset folded in */
+  int8_t  start_acc;            /* the accidental that receives pal[0] */
+  uint8_t pal_n;                /* 1..COLORGEN_PAL_MAX */
+  uint8_t flags;                /* COLORGEN_LIGHTEN_CDE */
+  uint8_t brightness;           /* percent, 1..100 */
+  uint8_t pal[COLORGEN_PAL_MAX][3];   /* RGB at FULL brightness */
+} colorgen_params_t;
+
+static volatile colorgen_params_t colorgen = {
+  1, 0, 0, 1, TUNE_W0, TUNE_H0,
+  -2,   /* pal[0] is the double-flat row */
+  5, 0, 10,
+  { {250, 20, 20}, {250, 100, 20}, {200, 200, 20}, {50, 250, 50}, {50, 50, 250} },
+};
+
+// Whether led_background[] is generated from those parameters or was written
+// verbatim by a 'C'/'L' frame. The master reports it on the 'i' line, and it is
+// what a future per-key editor branches on.
+enum { COLOR_MODE_PROCEDURAL = 0, COLOR_MODE_EXPLICIT };
+static volatile uint8_t color_mode = COLOR_MODE_PROCEDURAL;
+
+// Floor division and non-negative modulo. C's / and % truncate toward zero,
+// which is the wrong rounding for an accidental: a grid coordinate on a
+// neighbouring board is routinely negative, and floor((-1+1)/7) must be 0 while
+// (-6)/7 in C is 0 too but (-8)/7 is -1 where floor wants -2.
+static int32_t floor_div(int32_t num, int32_t den)
+{
+  int32_t q = num / den;
+  if ((num % den) != 0 && ((num < 0) != (den < 0))) q--;
+  return q;
+}
+
+static int32_t mod_pos(int32_t v, int32_t m)
+{
+  int32_t r = v % m;
+  return (r < 0) ? r + m : r;
+}
+
+// Round to nearest on non-negative operands, matching JavaScript's Math.round
+// (which the companion's toHex() applies) so the two sides agree byte for byte.
+static uint8_t round_pct(uint32_t num, uint32_t den)
+{
+  uint32_t v = (num + den / 2) / den;
+  return (uint8_t)((v > 255u) ? 255u : v);
+}
+
+// Colour for ANY absolute grid coordinate. Taking a coordinate rather than an
+// LED index is what lets a board in the middle of a grid colour itself.
+static void colorgen_for_xy(int32_t x, int32_t y, uint8_t *rgb)
+{
+  // Snapshot first: a 'K' frame can be installed between any two reads, and a
+  // torn set would mix one palette with another's geometry.
+  colorgen_params_t p = colorgen;
+
+  int32_t w = p.m00 * x + p.m01 * y + p.aw;
+  int32_t h = p.m10 * x + p.m11 * y + p.ah;
+
+  int32_t acc = floor_div(2 * w - 5 * h + 1, 7);   /* the Bosanquet row */
+  int32_t pc7 = mod_pos(w + h, 7);                 /* letter index, C D E = 0 1 2 */
+
+  uint8_t n = (p.pal_n == 0 || p.pal_n > COLORGEN_PAL_MAX) ? 1 : p.pal_n;
+  uint8_t idx = (uint8_t)mod_pos(acc - p.start_acc, n);   /* rows beyond the palette wrap */
+
+  uint8_t lighten = (p.flags & COLORGEN_LIGHTEN_CDE) && pc7 < 3;
+  for (int c = 0; c < 3; c++) {
+    uint32_t v = p.pal[idx][c];
+    // Lighten first, then scale -- the order the companion's generator uses,
+    // rounding at both steps as its toHex() does. Reversing them would differ
+    // by a count on some channels, and this is checked byte for byte.
+    if (lighten) {
+      v = round_pct(v * (100 - COLORGEN_CDE_PCT) + 255u * COLORGEN_CDE_PCT, 100);
+    }
+    rgb[c] = round_pct(v * p.brightness, 100);
+  }
+}
+
+// Paint every key of THIS board from the generator, at its discovered place in
+// the grid. led_background is RGB and indexed by LED, while the coordinates are
+// per sensor, so it walks sensors and uses led_for_sensor[].
+static void colorgen_render(void)
+{
+  int16_t ox = mesh_offset_x(), oy = mesh_offset_y();
+  for (uint8_t s = 0; s < NUM_SENSORS; s++) {
+    colorgen_for_xy(sensor_grid[s][0] + ox, sensor_grid[s][1] + oy,
+                    led_background[led_for_sensor[s]]);
+  }
+}
+
+// Install a pushed generator, rejecting a frame that cannot be one. These bytes
+// come from a host, and a wild basis change would put every key on one row --
+// a uniformly coloured board with no way to tell why.
+// Returns 0 if the frame was rejected.
+static uint8_t colorgen_params_apply(const uint8_t *m)
+{
+  int16_t v[6];
+  for (int i = 0; i < 6; i++) {
+    v[i] = (int16_t)((uint16_t)m[i * 2] | ((uint16_t)m[i * 2 + 1] << 8));
+  }
+  for (int i = 0; i < 4; i++) {
+    if (v[i] < -TUNE_MATRIX_MAX || v[i] > TUNE_MATRIX_MAX) return 0;
+  }
+  if (v[0] * v[3] - v[1] * v[2] == 0) return 0;   /* singular: every row collapses onto one */
+  for (int i = 4; i < 6; i++) {
+    if (v[i] < -TUNE_ANCHOR_MAX || v[i] > TUNE_ANCHOR_MAX) return 0;
+  }
+
+  uint8_t pal_n = m[13];
+  if (pal_n == 0 || pal_n > COLORGEN_PAL_MAX) return 0;
+  uint8_t brightness = m[15];
+  if (brightness == 0 || brightness > 100) return 0;
+
+  colorgen.m00 = v[0]; colorgen.m01 = v[1];
+  colorgen.m10 = v[2]; colorgen.m11 = v[3];
+  colorgen.aw  = v[4]; colorgen.ah  = v[5];
+  colorgen.start_acc  = (int8_t)m[12];
+  colorgen.pal_n      = pal_n;
+  colorgen.flags      = m[14];
+  colorgen.brightness = brightness;
+  for (uint8_t i = 0; i < COLORGEN_PAL_MAX; i++) {
+    for (int c = 0; c < 3; c++) colorgen.pal[i][c] = m[16 + i * 3 + c];
+  }
+  return 1;
+}
+
+// Serialise the live generator back into the 40 wire bytes, so the master can
+// hand what it holds to the mesh layer without keeping a second copy.
+static void colorgen_params_pack(uint8_t *m)
+{
+  colorgen_params_t p = colorgen;
+  const int16_t v[6] = { p.m00, p.m01, p.m10, p.m11, p.aw, p.ah };
+  for (int i = 0; i < 6; i++) {
+    m[i * 2]     = (uint8_t)v[i];
+    m[i * 2 + 1] = (uint8_t)((uint16_t)v[i] >> 8);
+  }
+  m[12] = (uint8_t)p.start_acc;
+  m[13] = p.pal_n;
+  m[14] = p.flags;
+  m[15] = p.brightness;
+  for (uint8_t i = 0; i < COLORGEN_PAL_MAX; i++) {
+    for (int c = 0; c < 3; c++) m[16 + i * 3 + c] = p.pal[i][c];
+  }
+}
+
 static void midi_reset_voices(void)
 {
   memset(mpe_voice, 0, sizeof(mpe_voice));
@@ -1066,6 +1200,22 @@ void Miso_EmitKeyUp(uint8_t sensor, int16_t x, int16_t y)
 void Miso_ApplyColors(const uint8_t *rgb)
 {
   memcpy(led_background, rgb, sizeof(led_background));
+  // A hand-painted board stops being procedural. It keeps the generator seq it
+  // already holds, so the master's repeating beacon does not paint over this.
+  color_mode = COLOR_MODE_EXPLICIT;
+}
+
+uint8_t Miso_ApplyColorGen(const uint8_t *p)
+{
+  if (!colorgen_params_apply(p)) return 0;
+  color_mode = COLOR_MODE_PROCEDURAL;
+  colorgen_render();
+  return 1;
+}
+
+void Miso_PackColorGen(uint8_t *p)
+{
+  colorgen_params_pack(p);
 }
 
 void Miso_SensorCoord(uint8_t sensor, int8_t *x, int8_t *y)
@@ -1160,6 +1310,10 @@ static void keys_process(uint32_t t_us)
 //   P        followed by 16 bytes: the pitch map -- int32 fifth in millicents,
 //            int16 m00, m01, m10, m11 (grid -> (w, h) basis change), int16
 //            anchor w, h. Little-endian, validated before it is installed.
+//   K        followed by 40 bytes: the colour generator -- int16 m00, m01, m10,
+//            m11, int16 anchor w, h, int8 start accidental, u8 palette length,
+//            u8 flags, u8 brightness percent, then 8 x RGB at full brightness.
+//            Little-endian, validated, and propagated down the mesh.
 void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
 {
   static uint8_t collecting_decim = 0;
@@ -1188,6 +1342,14 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       if (pq_fill >= PITCH_MSG_LEN) {
         pq_active = 0;
         pq_ready = 1;
+      }
+      continue;
+    }
+    if (kq_active) {
+      kq_buf[kq_fill++] = c;
+      if (kq_fill >= COLORGEN_MSG_LEN) {
+        kq_active = 0;
+        kq_ready = 1;
       }
       continue;
     }
@@ -1235,6 +1397,7 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       }
       case 'L': cq_active = 1; cq_fill = 0; break;
       case 'P': pq_active = 1; pq_fill = 0; break;
+      case 'K': kq_active = 1; kq_fill = 0; break;
       case 'T': topo_req = 1; break;
       case 'p': collecting_thr = 1; thr_val = 0; break;
       case 'n': scan_enabled ^= 1; break;
@@ -1337,22 +1500,33 @@ int main(void)
   link_init();
   mesh_init();
 
-  // Boot colour pattern. It doubles as the initial background until a host
-  // pushes colors over CDC (led_data is GRB; led_background is RGB), so it is
-  // staged through led_data and copied out rather than written directly.
-  fill_bosanquet(5, 5, 25, 5, 25, 5, 20, 20, 2, 25, 10, 2, 25, 2, 2);
-  for (int i = 0; i < NUM_LEDS; i++) {
-    led_background[i][0] = led_data[i][1];
-    led_background[i][1] = led_data[i][0];
-    led_background[i][2] = led_data[i][2];
-  }
-
-  // Start dark, then ripple that pattern into life from the left. This also
-  // replaces the old red/green/blue/white flash test: the crest is white, so
-  // every LED still has all three channels driven on the way past, and a dead
-  // one now shows up as a gap in a moving wave rather than in a static field.
+  // Start dark. The ripple below wakes the board up into its colour mapping,
+  // and it also replaces the old red/green/blue/white flash test: the crest is
+  // white, so every LED still has all three channels driven on the way past,
+  // and a dead one shows up as a gap in a moving wave rather than in a static
+  // field.
   fill_solid(0, 0, 0);
   show_leds();
+
+  // A board in a grid does not know its own place yet, and its colours are a
+  // function of it -- so wait, dark, for a parent to hand over the generator
+  // rather than rippling up into the wrong pattern and snapping a second later.
+  //
+  // Two exits besides the timeout, and between them they cover every way a
+  // board can actually be powered: USB makes us master at (0,0), and a pogo
+  // connector brings a parent with the parameters. Link bring-up measures
+  // ~500-700 ms, so the ceiling is a backstop, not the usual cost.
+  uint32_t wait_t0 = HAL_GetTick();
+  while (!mesh_is_master() && !mesh_has_colorgen() &&
+         (HAL_GetTick() - wait_t0) < COLORGEN_WAIT_MS) {
+    link_tick(HAL_GetTick());
+    mesh_tick(HAL_GetTick());
+  }
+
+  // Now paint the mapping at whatever place in the grid we settled on. Anything
+  // that arrived during the wait is already in colorgen; otherwise these are the
+  // compiled-in defaults, which reproduce the pattern this board always showed.
+  colorgen_render();
   boot_wave_play();
 
   /* USER CODE END 2 */
@@ -1406,12 +1580,15 @@ int main(void)
 
     if (info_req) {
       info_req = 0;
-      char line[224];
+      // 288, not 224: the line runs to ~219 bytes at its nominal values, and the
+      // counters on it are unbounded.
+      char line[288];
       snprintf(line, sizeof(line),
                "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u links=%c%c%c%c usb=%u cdrop=%lu "
                "usbdef=%lu thr=%lu scan=%u ledchurn=%lu dmachurn=%lu "
                "float=%u idleedges=%lu "
-               "fifth=%ld M=%d,%d,%d,%d anchor=%d,%d preject=%lu\r\n",
+               "fifth=%ld M=%d,%d,%d,%d anchor=%d,%d preject=%lu "
+               "cmode=%s cseq=%u kreject=%lu\r\n",
                FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
                stream_on, led_viz_on,
                link_state_char(LINK_PORT_TOP), link_state_char(LINK_PORT_BOTTOM),
@@ -1423,7 +1600,9 @@ int main(void)
                led_float_diag, (unsigned long)led_idle_edges,
                (long)pitch_params.fifth_milli,
                pitch_params.m00, pitch_params.m01, pitch_params.m10, pitch_params.m11,
-               pitch_params.aw, pitch_params.ah, (unsigned long)pq_rejected);
+               pitch_params.aw, pitch_params.ah, (unsigned long)pq_rejected,
+               (color_mode == COLOR_MODE_PROCEDURAL) ? "proc" : "expl",
+               mesh_colorgen_seq(), (unsigned long)kq_rejected);
       cdc_send_text(line);
     }
 
@@ -1432,13 +1611,18 @@ int main(void)
       for (link_port_t lp = 0; lp < LINK_PORT_COUNT; lp++) {
         uint32_t rx = 0, tx = 0, err = 0;
         link_stats(lp, &rx, &tx, &err);
-        char line[128];
+        uint32_t e_uart = 0, e_rxfull = 0, e_txfull = 0, e_sum = 0;
+        link_err_breakdown(lp, &e_uart, &e_rxfull, &e_txfull, &e_sum);
+        char line[160];
         snprintf(line, sizeof(line),
-                 "LINK %-6s %-9s peer=%08lX pp=%u usb=%u rx=%lu tx=%lu err=%lu\r\n",
+                 "LINK %-6s %-9s peer=%08lX pp=%u usb=%u rx=%lu tx=%lu err=%lu"
+                 " (uart=%lu rxfull=%lu txfull=%lu sum=%lu)\r\n",
                  link_port_name(lp), link_state_name(lp),
                  (unsigned long)link_peer_uid(lp)[0], link_peer_port(lp),
                  link_peer_has_usb(lp),
-                 (unsigned long)rx, (unsigned long)tx, (unsigned long)err);
+                 (unsigned long)rx, (unsigned long)tx, (unsigned long)err,
+                 (unsigned long)e_uart, (unsigned long)e_rxfull,
+                 (unsigned long)e_txfull, (unsigned long)e_sum);
         cdc_send_text(line);
       }
     }
@@ -1474,11 +1658,26 @@ int main(void)
       pq_ready = 0;
       if (!pitch_params_apply((const uint8_t *)pq_buf)) pq_rejected++;
     }
+    if (kq_ready) {
+      kq_ready = 0;
+      if (colorgen_params_apply((const uint8_t *)kq_buf)) {
+        color_mode = COLOR_MODE_PROCEDURAL;
+        colorgen_render();
+        // Hand the accepted parameters to the mesh, which bumps the sequence
+        // number and beacons them down the tree so every board repaints itself.
+        mesh_set_colorgen((const uint8_t *)kq_buf);
+      } else {
+        kq_rejected++;
+      }
+    }
     if (cq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
       cq_active = 0;   // half-received frame: abandon the slot, keep the queue
     }
     if (pq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
       pq_active = 0;   // likewise, so a truncated 'P' cannot wedge the parser
+    }
+    if (kq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
+      kq_active = 0;   // and a truncated 'K'
     }
 
     // LED rendering, decimated so the WS2812 DMA (~1.6 ms per refresh)
