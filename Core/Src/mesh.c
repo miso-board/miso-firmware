@@ -28,6 +28,17 @@
 #define ANN_LEN     17   /* root32 | src32 | parent32 | ox16 | oy16 | depth8 */
 #define KEYEV_LEN   16   /* origin32 | seq8 | sensor8 | x16 | y16 | kind8 | vel8 | dt32 */
 #define KST_LEN     12   /* origin32 | ox16 | oy16 | held32 */
+#define KST_LEN_V2  13   /* ... | cgen8: the colour-generator seq this board holds,
+                          * or CGEN_SEQ_NONE. Appended, and the length check on
+                          * receive still accepts KST_LEN, so a pre-0.8.0 board
+                          * keeps working and simply never reports one. */
+/* Two distinct answers, because they mean opposite things when a colour push
+ * looks like it did not arrive. SILENT means the board never reported at all, so
+ * it predates 0.8.0 and cannot receive a generator; NONE means it is new enough
+ * to report and is telling us it has no generator yet, which points at the
+ * propagation path instead. Both are skipped when a seq is bumped. */
+#define CGEN_SEQ_NONE   0xFEu   /* reported: "I have no generator" */
+#define CGEN_SEQ_SILENT 0xFFu   /* not reported: pre-0.8.0 board */
 #define COLOR_LEN   (4 + MESH_RGB_BYTES)   /* dx16 | dy16 | rgb[93] */
 #define CGEN_LEN    (1 + MESH_CGEN_BYTES)  /* seq8 | params[40] */
 
@@ -80,6 +91,9 @@ typedef struct {
   uint32_t held;
   uint32_t last_seen;
   uint8_t  last_seq, have_seq;
+  uint8_t  cgen;     /* the generator seq it reports, or one of the two markers
+                      * above. Compare against ours to see at a glance whether a
+                      * colour push actually reached it. */
 } board_t;
 
 static board_t  boards[MESH_MAX_BOARDS];
@@ -143,6 +157,7 @@ static board_t *board_get(uint32_t uid)
       memset(&boards[i], 0, sizeof(boards[i]));
       boards[i].used = 1;
       boards[i].uid = uid;
+      boards[i].cgen = CGEN_SEQ_SILENT;   /* not "seq 0": we have not heard yet */
       return &boards[i];
     }
   }
@@ -369,6 +384,7 @@ static void on_keystate(link_port_t p, const uint8_t *d, uint8_t len)
   b->ox = get16(d + 4);
   b->oy = get16(d + 6);
   b->last_seen = now_tick;
+  b->cgen = (len >= KST_LEN_V2) ? d[12] : CGEN_SEQ_SILENT;
   board_reconcile(b, get32(d + 8));
 }
 
@@ -555,6 +571,8 @@ void mesh_set_colorgen(const uint8_t *params)
    * child that something was pushed, and a board hand-painted since needs to be
    * brought back onto the generator by a re-push of the same parameters. */
   cgen_seq++;
+  /* Both markers are reserved values in the KEYSTATE byte. */
+  while (cgen_seq == CGEN_SEQ_NONE || cgen_seq == CGEN_SEQ_SILENT) cgen_seq++;
   cgen_have = 1;
   /* main.c has already applied and rendered these; just record where, so the
    * move check in on_announce() has a baseline (the master is always (0,0)). */
@@ -622,6 +640,7 @@ void mesh_tick(uint32_t tick)
       if (self) {
         self->ox = 0; self->oy = 0;
         self->held = Miso_LocalHeldMask();
+        self->cgen = cgen_have ? cgen_seq : CGEN_SEQ_NONE;
         self->last_seen = tick;
       }
       /* Anything that stopped reporting is gone -- release its notes. This is
@@ -634,11 +653,12 @@ void mesh_tick(uint32_t tick)
       }
     } else if (my_depth != MESH_DEPTH_NONE && parent_port != MESH_NO_PARENT &&
                link_state(parent_port) == LINK_UP) {
-      uint8_t d[KST_LEN];
+      uint8_t d[KST_LEN_V2];
       put32(d, my_uid);
       put16(d + 4, my_ox);
       put16(d + 6, my_oy);
       put32(d + 8, Miso_LocalHeldMask());
+      d[12] = cgen_have ? cgen_seq : CGEN_SEQ_NONE;
       link_send(parent_port, LINK_MSG_KEYSTATE, d, sizeof(d));
     }
   }
@@ -666,10 +686,14 @@ void mesh_dump(void)
 
   for (uint8_t i = 0; i < MESH_MAX_BOARDS; i++) {
     if (!boards[i].used) continue;
+    char cg[8];
+    if (boards[i].cgen == CGEN_SEQ_SILENT)    snprintf(cg, sizeof(cg), "old");
+    else if (boards[i].cgen == CGEN_SEQ_NONE) snprintf(cg, sizeof(cg), "none");
+    else snprintf(cg, sizeof(cg), "%u", boards[i].cgen);
     snprintf(line, sizeof(line),
-             "MESH board=%08lX off=%d,%d held=%08lX age=%lu\r\n",
+             "MESH board=%08lX off=%d,%d held=%08lX cgen=%s age=%lu\r\n",
              (unsigned long)boards[i].uid, boards[i].ox, boards[i].oy,
-             (unsigned long)boards[i].held,
+             (unsigned long)boards[i].held, cg,
              (unsigned long)(now_tick - boards[i].last_seen));
     Miso_SendText(line);
   }

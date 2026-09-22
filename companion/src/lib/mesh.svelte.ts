@@ -31,6 +31,12 @@ export interface Board {
   oy: number;
   /** 31-bit held mask by sensor index, as the firmware reports it. */
   held: number;
+  /**
+   * The colour-generator sequence number this board reports holding, or null
+   * when it has none or is too old to say. Comparing it across boards is how you
+   * see whether a colour push actually reached the whole grid.
+   */
+  cgen: number | null;
   /** Milliseconds since the master last heard from this board. */
   ageMs: number;
   self: boolean;
@@ -62,7 +68,7 @@ export interface Cell {
   sensor: number;
 }
 
-const SOLO: Board = { uid: "—", ox: 0, oy: 0, held: 0, ageMs: 0, self: true };
+const SOLO: Board = { uid: "—", ox: 0, oy: 0, held: 0, cgen: null, ageMs: 0, self: true };
 
 export const mesh = $state({
   /** Never empty: falls back to a single board at the origin. */
@@ -108,14 +114,21 @@ export function parseMeshLine(line: string): boolean {
     return true;
   }
 
-  const board = line.match(/^MESH board=(\w+) off=(-?\d+),(-?\d+) held=([0-9a-fA-F]+) age=(\d+)/);
+  // `cgen=` is optional: firmware before 0.8.0 does not report which colour
+  // generator a board holds, and must still be discovered.
+  const board = line.match(
+    /^MESH board=(\w+) off=(-?\d+),(-?\d+) held=([0-9a-fA-F]+)(?: cgen=(\d+|none|old))? age=(\d+)/,
+  );
   if (board) {
     pendingBoards.push({
       uid: board[1],
       ox: num(board[2]),
       oy: num(board[3]),
       held: num(board[4], 16),
-      ageMs: num(board[5]),
+      cgen: board[5] === undefined || board[5] === "none" || board[5] === "old"
+        ? null
+        : num(board[5]),
+      ageMs: num(board[6]),
       self: board[1] === pendingSelf,
     });
     return true;

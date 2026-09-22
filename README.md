@@ -684,7 +684,7 @@ timeout covers boards further away.
 
 | Command | Effect |
 |---------|--------|
-| `T` | Dump topology: own offset/depth/role, port roles, known boards, the held colour generator, counters |
+| `T` | Dump topology: own offset/depth/role, port roles, known boards (each with the colour generator it holds), the held colour generator, counters |
 | `L` + `int16 x`, `int16 y`, 93 bytes | Set colours on the board at that grid origin, wherever it is in the mesh |
 | `K` + 40 bytes | Set the colour generator for the **whole grid**; beaconed down the tree, each board evaluating its own keys |
 
@@ -740,6 +740,20 @@ board hand-painted by `L` since the last push would otherwise be repainted a
 second later. `L` marks that board `cmode=expl` without touching the seq, so the
 beacon passes over it; the companion pushes `K` first, then `L` only for boards
 carrying overrides, so the paint lands on top of the generated base.
+
+Whether a push actually arrived is visible rather than inferred. Every board
+reports the generator seq it holds in its `KEYSTATE`, and `T` prints it per board:
+
+| `cgen=` | Means |
+|---------|-------|
+| a number | that board holds that generator; matching the master's `MESH cgen seq=` means the push arrived |
+| `none` | the board is new enough to report and has no generator yet — look at propagation |
+| `old` | the board never reported, so it predates 0.8.0 and cannot receive one at all — flash it |
+
+The distinction between the last two matters: they look identical on the LEDs (the
+board sits in its compiled-in pattern) and have completely different causes. The
+byte is appended to `KEYSTATE`, and the length check on receive still accepts the
+old 12, so a pre-0.8.0 board keeps working and simply never reports one.
 
 **A board repaints when it moves, against the offset it last painted at** — not
 against the one it last had. Unplugged from one edge of the grid and replugged on
