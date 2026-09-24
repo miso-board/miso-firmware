@@ -201,7 +201,7 @@ Raising the brown-out threshold from its default of level 0 (~1.7 V)
 (`STM32_Programmer_CLI -c port=usb1 -ob BOR_LEV=4`) hardens the power-up further
 by holding the MCU in reset until VDD is properly established.
 
-## Sensor streaming & the companion app
+## Sensor streaming and the CDC command set
 
 The firmware scans all 31 Hall sensors in a tight loop — **~2276 Hz measured**,
 439 µs per scan, reported by the `i` command — and exposes a USB CDC serial
@@ -394,10 +394,9 @@ actually started.
 The music theory lives in the companion's `src/lib/tuning.ts`, which asks
 [meantonal](https://meantonal.org/) rather than reimplementing the firmware's
 arithmetic — so when the MIDI monitor finds them agreeing, that means the push
-arrived and was applied. The two are cross-checked on the host by
-`companion/scripts/check-firmware-pitch.py`, which extracts `pitch_for_xy`
-verbatim from `main.c`, compiles it, and diffs it against the companion over
-nine tunings, both layouts and a four-board grid.
+arrived and was applied. That the two agree at all is held by
+[`check-firmware-pitch.py`](companion/scripts/check-firmware-pitch.py); see
+[Cross-checks](#cross-checks).
 
 Output is **MPE lower zone** — master channel 1, member channels 2–16, so 15
 simultaneous notes each with their own pitch bend carrying the microtonal
@@ -763,13 +762,13 @@ is what lets hand-painted keys survive a flaky connector.
 
 The default parameters are **byte-identical to the hardcoded pattern they
 replaced**, for all 31 keys, so flashing this firmware cannot change how a board
-looks until something pushes a `K`. That is asserted, not asserted-by-comment:
-`companion/scripts/check-firmware-colors.py` extracts the generator verbatim from
-`main.c`, compiles it, and diffs it against the companion's own `generateColorAt`
-over 320 generators on a four-board grid. Note what that script does *not*
-contain, unlike its pitch counterpart: any copy of the firmware's arithmetic. The
-reference is the real authoring path, so a pass means the two implementations
-agree rather than that two transcriptions of one formula match.
+looks until something pushes a `K`. That is asserted, not asserted-by-comment —
+[`check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) holds
+this generator to it, and note what that script does *not* contain, unlike its
+pitch counterpart: any copy of the firmware's arithmetic. It diffs against the
+companion's real authoring path, so a pass means the two implementations agree
+rather than that two transcriptions of one formula match. See
+[Cross-checks](#cross-checks).
 
 One rounding subtlety is load-bearing enough to be worth naming. The C/D/E tint
 is applied per key *before* brightness scaling and rounds on the way, so
@@ -880,126 +879,66 @@ at boot only — pushing a new colour map over `C`/`L`/`K` still swaps in place.
 `boot_wave_play()` reads `led_background[]` live, so re-triggering it on a colour
 push is one call if that turns out to be wanted.
 
-**Companion app** (`companion/`): Svelte 5 + TypeScript + Tailwind + [meantonal](https://meantonal.org/),
-built with Vite. It shows live per-key levels with min/max watermarks, per-key stats
-(rest / min / max / noise σ), and auto-triggered press-waveform capture with
-20→70% transit times — plus the two tabs that set the instrument up.
+## Companion app
 
-A **preset** is how the instrument is set up: an LED mapping *and* a pitch
-mapping, with room for further preset-scoped settings. One selector, shared by
-both tabs, because switching preset changes what the instrument looks like and
-what it plays together. The **Key colors** tab is a click-to-paint view of the
-board (axial hex rendering); the **Pitch mapping** tab shows what every key
-sounds — note name, MIDI number, bend, frequency — and pushes the tuning to the
-board over `P`. Both halves are keyed by absolute coordinate, generated
-procedurally or set per key, and evaluated lazily so a board attached later
-simply resolves.
+A companion webapp lives in [`companion/`](companion/README.md) and talks to the
+board over the CDC port documented above. It is the authoring tool for the two
+things the firmware holds as parameters rather than tables — the pitch map (`P`)
+and the colour generator (`K`) — and it is also the diagnostic front end for the
+sensor stream, showing live per-key levels, per-key noise statistics and captured
+press waveforms.
 
-The two halves differ in one structural respect. A colour layer's generator is
-optional: hand-painting freezes it, because an unpainted coordinate can safely be
-black. A pitch map's generator is **mandatory and permanent** — a coordinate with
-no pitch is a silent key, and `P` carries parameters rather than a table, so
-freezing one would leave nothing to send. Pitch overrides are additive
-exceptions layered on top, and retuning never discards them.
+Three reasons the firmware side cares about it:
 
-Storage moved to `miso-presets-v1`; a `miso-color-maps-v2` payload reads as a
-preset list whose pitch maps are the 31-EDO Bosanquet default — which is what the
-firmware already played, so migrating changes nothing about how a board sounds.
-The superseded keys are left in place as backups.
+- **It is where a tuning or a colour scheme comes from.** The board ships with
+  defaults that are byte-identical to the hardcoded patterns they replaced, so it
+  plays and lights correctly having never met the app; but every change to either
+  arrives as a `P` or `K` frame from here.
+- **It is grid-aware.** It polls `T` once a second, models the mesh, and pushes
+  colours addressed to boards by their absolute grid origin. A tiled set renders
+  as the single continuous instrument it is.
+- **It carries the only automated check on this firmware's arithmetic.** See
+  [Cross-checks](#cross-checks) below.
 
-Per-key pitch entry is modelled and persisted but has no editor yet: `P` pushes
-parameters, so an overridden key cannot be expressed in it, and carrying them
-needs either a sparse second command or a full per-board table. The procedural
-path came first deliberately.
+It refuses to send commands a board is too old to understand — see
+[Firmware version gating](companion/README.md#firmware-version-gating), which is
+a safety mechanism rather than a courtesy.
 
-**It is grid-aware.** The app polls `T` once a second and models the discovered
-mesh in `companion/src/lib/mesh.svelte.ts`, so a tiled set of boards renders as
-the single continuous instrument it is — one SVG, every key placed by its
-absolute coordinate, with each board captioned by UID when there is more than
-one. Key events carry their coordinate, the MIDI monitor checks incoming notes
-against the pitch at the *absolute* coordinate (so a note from a neighbouring
-board is verified like any other), and the header shows a live board count.
+See [`companion/README.md`](companion/README.md) for how to run it, what it
+stores, and how it is built.
 
-Both mappings are keyed by **absolute grid coordinate**, not LED index, so one
-scheme covers however many boards are attached and survives them being added,
-removed or rearranged — which also matches how the procedural generator always
-worked, colouring by the accidental of the pitch at a coordinate. Generated
-schemes are evaluated lazily rather than materialised, so attaching another board
-needs no regeneration — and since 0.8.0 a generated colour scheme is not
-evaluated here at all but pushed as parameters and evaluated *on* each board.
+### Cross-checks
 
-Colour storage passed through `miso-color-maps-v2` on the way here, which read a
-v1 31-entry LED-indexed array as a board at the origin; both older keys are still
-read as a fallback and still left in place as backups.
+The firmware's pitch and colour arithmetic each exist a second time, in
+TypeScript, on the other side of the wire. Two scripts in the companion hold the
+two implementations to each other by extracting this repository's C **verbatim**,
+compiling it on the host, and diffing it against the app:
 
-The **default preset is now procedural** rather than a frozen 31-entry copy of the
-firmware's boot pattern. The two agree byte for byte on a board at the origin — the
-default palette was chosen so they would, and `check:colors` holds both sides to it
-— but a table keyed by the origin board's coordinates paints the origin's rows onto
-every board in a tiled grid instead of each board's own. Being procedural is also
-what lets it go out as one `K` frame and keep working with the app closed. The
-groups the frozen layer used now live in `check-firmware-colors.py` as the legacy
-reference, which is where `check-firmware-pitch.py` keeps its equivalent.
+| Script | Extracts from `main.c` | Proves |
+|---|---|---|
+| [`companion/scripts/check-firmware-pitch.py`](companion/scripts/check-firmware-pitch.py) | `div_round`, `pitch_for_xy`, `pitch_params_apply` | 2,232 cases over nine tunings × both layouts × a four-board grid agree with the app, and the 31-EDO default is byte-identical to the step-lattice formula it replaced (124 keys) |
+| [`companion/scripts/check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) | `colorgen_params_t`, `floor_div`, `mod_pos`, `round_pct`, `colorgen_for_xy`, `colorgen_params_apply` | 39,680 cases over 320 generators × a four-board grid agree with the app, the default generator is byte-identical to `fill_bosanquet()` (31 keys), and eight malformed frames are refused |
 
-Two limits worth knowing. The **Calibrate tab is master-only** — the firmware
-forwards key events, not raw scans, and remote sensor data at full rate would be
-93 kB/s against a 46 kB/s link, so live levels, stats and press capture show only
-the USB board's own keys. And connecting to older firmware still works: with no
-topology seen, the app falls back to a single board at the origin and the
-original `C` colour frame; `P` is withheld below 0.7.0 and `K` below 0.8.0 — those
-gates are load-bearing rather than polite, because a board that does not know the
-command would read its 16 or 40 payload bytes as commands, and `C` (0x43) or `L`
-(0x4C) are entirely reachable values in a millicent count, a signed matrix entry
-or a palette channel.
+Both run from the companion, and both need `clang` and Node 24:
 
-The **procedural colour generator** colours each key by the accidental of the
-note that lands on it — the key's Bosanquet row — via meantonal. That library
-represents a pitch as a vector of whole steps and diatonic semitones above
-C₋₁, with the octave as (5,2) and a sharp as (1,−1): exactly this board's axial
-basis, so a grid coordinate is a pitch vector plus an anchor and
-`pitch.accidental` *is* the row. A palette of N colours covers N contiguous
-accidentals and wraps for rows beyond it (3 colours over the Miso's 5 rows
-gives red green blue red green). Layout (Bosanquet, or Wicki-Hayden via
-meantonal's own `WICKI_FROM` basis change), the starting accidental, an (x, y)
-placement offset and LED brightness are all adjustable, and the whole scheme
-streams to the board as you tweak it. Board rendering, note names and the
-layout bases live in `companion/src/lib/tuning.ts`.
+    cd companion && npm run check:firmware && npm run check:colors
 
-Where that scheme is *evaluated* depends on what it is. A purely procedural layer
-goes to the board as one 40-byte `K` frame and is evaluated there, per key, on
-every board in the grid — so the app can be closed and a board attached later
-still comes up right. A hand-painted or mixed layer cannot be expressed in
-parameters, so it is rendered here and sent as a 93-byte `L` frame per board,
-after the `K` so paint lands on top of the generated base. `colorgenFrame` in
-`colorMaps.ts` is the one place that folds the generator into wire bytes; it
-returns `null` for a palette longer than the eight entries the frame carries, and
-`pushColors()` then falls back to `L` frames. Because only the second case needs
-the host, the 1 Hz topology poll re-pushes on a grid change *only* when
-`colorsAreSelfSufficient()` is false.
+They matter because nothing at runtime can tell you the two sides agree. A board
+plays a note; without these there is no way to know it is the note the app
+intended. **Run them after any change to `pitch_for_xy`, `colorgen_for_xy`, their
+`_apply` validators, or the `P`/`K` frame layouts** — a change on either side
+that the other does not match is exactly what they exist to catch.
 
-For live board data, run it locally in Chrome (Web Serial needs a top-level
-secure page; the published Claude artifact is wrapped in an iframe that
-doesn't delegate serial access, so the artifact copy is a simulated demo
-only):
+They are also the reason the companion lives in this repository. Extracting it
+was tried, in `3db6f26`, and reverted: six of the eight commits that had ever
+touched the companion also touched firmware source, and the split left these
+scripts unable to find `main.c`.
 
-```sh
-cd companion
-npm install
-npm run dev     # → http://localhost:5173, connects to the board
-npm run build   # dist/miso-companion.html (single file, publishable as artifact demo)
-npm run check:all   # types, then the cross-checks below
-```
+### One duplication nothing checks
 
-Four checks, because the pitch and colour pipelines each span two languages and a
-wire format:
-
-| Command | What it proves |
-|---------|----------------|
-| `npm run check` | `svelte-check`: types across the app |
-| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192) |
-| `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `main.c`, compiles it with clang, and diffs it against the app over nine tunings × both layouts × a four-board grid — plus the byte-identical-default claim |
-| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 320 generators × a four-board grid — plus the byte-identical-boot-pattern claim, and eight validation cases |
-
-The 12-TET case is the one to keep: at a 700¢ fifth a wrong coefficient would not
-collapse to equal temperament, a wrong anchor would disagree with meantonal's own
-`midi` accessor, and any rounding bias would show as a bend off 8192.
+`led_for_sensor[]` in `Core/Src/main.c` and `LED_FOR_SENSOR` in
+`companion/src/lib/layout.ts` are the same physical fact — which LED sits at
+which sensor — traced from the board by hand on 2026-09-08 and written down
+twice. Unlike pitch and colour, **there is no cross-check holding them
+together.** Change one and you must change the other; nothing will tell you if
+you don't, and the symptom is lit keys in the wrong places rather than an error.
