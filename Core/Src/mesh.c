@@ -115,6 +115,13 @@ static void cgen_send_port(link_port_t p);
 
 static uint32_t t_announce, t_state, t_cgen, now_tick;
 static uint32_t n_missed_down, n_fixed_up, n_geom_err, n_multi_master, n_lost_release;
+/* n_ev_nolink: a key event with nowhere to go (no parent, or the parent port not
+ * UP) -- it was silently discarded before. n_ev_txfull: link_send refused it,
+ * which for a KEYEV means both redundant copies were refused, since one making
+ * it through is enough. n_ev_dup: the second copy arriving intact and being
+ * suppressed, i.e. the redundancy doing nothing because nothing was lost -- so
+ * this one is expected to be large and is not a fault. */
+static uint32_t n_ev_nolink, n_ev_txfull, n_ev_dup;
 
 /* --- Little-endian packing -------------------------------------------------- */
 
@@ -349,7 +356,7 @@ static void on_keyev(link_port_t p, const uint8_t *d, uint8_t len)
   if (b) {
     /* The tree delivers each event once; a duplicate only appears if the tree
      * reconfigured mid-flight. */
-    if (b->have_seq && b->last_seq == seq) return;
+    if (b->have_seq && b->last_seq == seq) { n_ev_dup++; return; }
     b->last_seq = seq;
     b->have_seq = 1;
     b->last_seen = now_tick;
@@ -514,10 +521,38 @@ void mesh_init(void)
   link_set_down_handler(mesh_link_down);
 }
 
-void mesh_key_down(uint8_t sensor, int16_t x, int16_t y, uint8_t vel, uint32_t dt_us)
+/* Send one key event toward the master, twice.
+ *
+ * A key event is the one frame on this link whose loss is audible and
+ * unrecoverable. Everything else here is periodic and self-healing: a lost PING
+ * is replaced 50 ms later, a lost ANNOUNCE 250 ms later, a lost COLORGEN beacon
+ * a second later. A lost KEYEV is a dead note, permanently -- board_reconcile()
+ * will notice and count it in missed_down but deliberately will not fabricate
+ * the note, because the velocity is gone.
+ *
+ * Measured on a three-board chain, the master's right port showed
+ * `err=698 (uart=375 ... sum=323)` with `rxfull=0 txfull=0` -- around a 3% frame
+ * error rate, entirely from corruption rather than from any queue we overflowed,
+ * and `missed_down=151` dead notes to go with it. At that rate a single copy
+ * loses a note every second or two of hard trilling, which is what a player
+ * feels as a dead key.
+ *
+ * Sending the frame twice takes that to ~0.1%, and it needs nothing new on the
+ * receiving side: the duplicate suppression in on_keyev() already discards a
+ * repeat of the previous seq, and link_send is FIFO so the two copies stay
+ * adjacent. Cost is 21 extra bytes per event against a 46 kB/s link -- less than
+ * the colour beacon already spends every second.
+ *
+ * This is a mitigation, not a cure. The durable fix for a connector at 3% is the
+ * series resistors in the README's hardware note; this just stops a marginal
+ * connector from being something you can hear. */
+static void keyev_send(uint8_t sensor, int16_t x, int16_t y,
+                       uint8_t kind, uint8_t vel, uint32_t dt_us)
 {
-  if (is_master) { Miso_EmitKeyDown(sensor, x, y, vel, dt_us); return; }
-  if (parent_port == MESH_NO_PARENT || link_state(parent_port) != LINK_UP) return;
+  if (parent_port == MESH_NO_PARENT || link_state(parent_port) != LINK_UP) {
+    n_ev_nolink++;
+    return;
+  }
 
   uint8_t d[KEYEV_LEN];
   put32(d, my_uid);
@@ -525,27 +560,27 @@ void mesh_key_down(uint8_t sensor, int16_t x, int16_t y, uint8_t vel, uint32_t d
   d[5] = sensor;
   put16(d + 6, x);
   put16(d + 8, y);
-  d[10] = 1;
+  d[10] = kind;
   d[11] = vel;
   put32(d + 12, dt_us);
-  link_send(parent_port, LINK_MSG_KEYEV, d, sizeof(d));
+
+  /* Both copies carry the same seq, which is what makes the second one free to
+   * discard. Only a failure of both is a lost event worth counting. */
+  int a = link_send(parent_port, LINK_MSG_KEYEV, d, sizeof(d));
+  int b = link_send(parent_port, LINK_MSG_KEYEV, d, sizeof(d));
+  if (!a && !b) n_ev_txfull++;
+}
+
+void mesh_key_down(uint8_t sensor, int16_t x, int16_t y, uint8_t vel, uint32_t dt_us)
+{
+  if (is_master) { Miso_EmitKeyDown(sensor, x, y, vel, dt_us); return; }
+  keyev_send(sensor, x, y, 1, vel, dt_us);
 }
 
 void mesh_key_up(uint8_t sensor, int16_t x, int16_t y)
 {
   if (is_master) { Miso_EmitKeyUp(sensor, x, y); return; }
-  if (parent_port == MESH_NO_PARENT || link_state(parent_port) != LINK_UP) return;
-
-  uint8_t d[KEYEV_LEN];
-  put32(d, my_uid);
-  d[4] = key_seq++;
-  d[5] = sensor;
-  put16(d + 6, x);
-  put16(d + 8, y);
-  d[10] = 0;
-  d[11] = 0;
-  put32(d + 12, 0);
-  link_send(parent_port, LINK_MSG_KEYEV, d, sizeof(d));
+  keyev_send(sensor, x, y, 0, 0, 0);
 }
 
 void mesh_set_colors(int16_t x, int16_t y, const uint8_t *rgb)
@@ -719,5 +754,14 @@ void mesh_dump(void)
            (unsigned long)n_missed_down, (unsigned long)n_fixed_up,
            (unsigned long)n_lost_release,
            (unsigned long)n_geom_err, (unsigned long)n_multi_master);
+  Miso_SendText(line);
+
+  /* evdup is the redundancy working and is expected to be roughly the event
+   * count; it falling well below that is the interesting case, because it means
+   * first copies are arriving where second ones did not. */
+  snprintf(line, sizeof(line),
+           "MESH ev dup=%lu nolink=%lu txfull=%lu\r\n",
+           (unsigned long)n_ev_dup, (unsigned long)n_ev_nolink,
+           (unsigned long)n_ev_txfull);
   Miso_SendText(line);
 }

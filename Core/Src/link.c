@@ -107,12 +107,21 @@ typedef struct {
   uint8_t  peer_fw, peer_port, peer_has_usb;
 
   uint32_t n_rx, n_tx, n_err;
-  /* n_err is the total; these say WHICH, because the four causes want different
-   * fixes and a single number cannot tell them apart. n_uart is the line itself
-   * (framing/noise/overrun), n_rxfull means the main loop fell behind draining
-   * the ring, n_txfull means we offered frames faster than the port could send
-   * them, and n_sum is a corrupt or resynced frame. */
-  uint32_t n_uart, n_rxfull, n_txfull, n_sum;
+  /* n_err is the total; these say WHICH, because the causes want different fixes
+   * and a single number cannot tell them apart. n_rxfull means the main loop
+   * fell behind draining the ring, n_txfull means we offered frames faster than
+   * the port could send them, and n_sum is a corrupt or resynced frame.
+   *
+   * The line itself is split in two, because ORE and FE/NE/PE were previously
+   * one `n_uart` and they point in opposite directions. n_frame is the WIRE:
+   * framing, noise or parity, i.e. the signal arrived wrong -- a connector,
+   * crosstalk, the hardware note's series resistors. n_ore is US: the receive
+   * ISR did not read RDR before the next byte landed on top of it, which at
+   * 460800 baud is a 17.4 us budget, so it indicts interrupt latency rather
+   * than the cable. Anything at preempt priority 0 that runs longer than a byte
+   * time -- the LED DMA completion handler's dma_sum() over 747 words is the
+   * one to suspect -- produces ORE on a perfectly good link. */
+  uint32_t n_ore, n_frame, n_rxfull, n_txfull, n_sum;
 } link_t;
 
 static link_t link[LINK_PORT_COUNT];
@@ -211,7 +220,10 @@ static void link_isr(link_port_t p)
   if (isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE)) {
     u->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF | USART_ICR_PECF;
     L->n_err++;
-    L->n_uart++;
+    /* Counted apart: ORE is our latency, FE/NE/PE is the wire. Both can be set
+     * in one ISR entry, so both are counted rather than one winning. */
+    if (isr & USART_ISR_ORE)                                    L->n_ore++;
+    if (isr & (USART_ISR_FE | USART_ISR_NE | USART_ISR_PE))      L->n_frame++;
   }
 
   if (isr & USART_ISR_RXNE) link_rx_put(L, (uint8_t)u->RDR);
@@ -598,11 +610,12 @@ void link_stats(link_port_t p, uint32_t *rx, uint32_t *tx, uint32_t *err)
   if (err) *err = link[p].n_err;
 }
 
-void link_err_breakdown(link_port_t p, uint32_t *uart, uint32_t *rxfull,
-                        uint32_t *txfull, uint32_t *sum)
+void link_err_breakdown(link_port_t p, uint32_t *ore, uint32_t *frame,
+                        uint32_t *rxfull, uint32_t *txfull, uint32_t *sum)
 {
   if (p >= LINK_PORT_COUNT) return;
-  if (uart)   *uart   = link[p].n_uart;
+  if (ore)    *ore    = link[p].n_ore;
+  if (frame)  *frame  = link[p].n_frame;
   if (rxfull) *rxfull = link[p].n_rxfull;
   if (txfull) *txfull = link[p].n_txfull;
   if (sum)    *sum    = link[p].n_sum;

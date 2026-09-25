@@ -842,10 +842,21 @@ static int32_t div_round(int32_t num, int32_t den)
   return (num >= 0) ? (num + den / 2) / den : (num - den / 2) / den;
 }
 
+/* Every way a note can be lost or altered on this board, counted. All three were
+ * silent returns, which is why a dropped note used to be invisible from `i`:
+ * n_mdrop is the USB-MIDI queue rejecting a packet (63 usable slots), n_nopitch
+ * is pitch_for_xy refusing a coordinate as out of MIDI range, and n_retrigger is
+ * midi_note_on finding the key already sounding and releasing it first.
+ *
+ * Distinct from the `preject`/`kreject` already on the INFO line, which count
+ * incoming P and K frames refused by validation -- a different failure. On a
+ * healthy board all three of these stay at zero. */
+static uint32_t n_mdrop, n_nopitch, n_retrigger;
+
 static void midi_send(uint8_t cin, uint8_t status, uint8_t d1, uint8_t d2)
 {
   const uint8_t pkt[4] = { cin, status, d1, d2 };  // cable 0
-  USBD_MIDI_Send(pkt);
+  if (!USBD_MIDI_Send(pkt)) n_mdrop++;
 }
 
 // The live pitch map. Seeded to Bosanquet in 31-EDO with D4 on the centre key,
@@ -1105,11 +1116,27 @@ static void midi_note_on(int16_t x, int16_t y, uint8_t vel)
 {
   uint8_t note;
   uint16_t bend;
-  if (!pitch_for_xy(x, y, &note, &bend)) return;
+  if (!pitch_for_xy(x, y, &note, &bend)) { n_nopitch++; return; }
   uint32_t id = key_id(x, y);
 
+  /* A key we already believe is sounding. This used to `return`, which made any
+   * leaked voice a permanently mute key: midi_note_off() below frees a slot only
+   * when it finds a matching key_id, so a note-off that never arrived (a KEYEV
+   * lost on a pogo link), or one whose coordinates moved under a re-parent, left
+   * the slot active forever and every later press of that key was swallowed
+   * here, silently and uncounted.
+   *
+   * So release it and fall through to a fresh allocation instead. A genuine
+   * duplicate event now costs an inaudible note-off rather than a dead key, and
+   * a leaked voice self-corrects on the next press. */
   for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
-    if (mpe_voice[c].active && mpe_voice[c].key == id) return;   // already sounding
+    if (mpe_voice[c].active && mpe_voice[c].key == id) {
+      midi_send(MIDI_CIN_NOTE_OFF,
+                (uint8_t)(0x80 | (MPE_MEMBER_FIRST + c)), mpe_voice[c].note, 0);
+      mpe_voice[c].active = 0;
+      n_retrigger++;
+      break;
+    }
   }
 
   // Least-recently-used free channel, stealing the oldest voice if all busy.
@@ -1580,15 +1607,16 @@ int main(void)
 
     if (info_req) {
       info_req = 0;
-      // 288, not 224: the line runs to ~219 bytes at its nominal values, and the
-      // counters on it are unbounded.
-      char line[288];
+      // 352, not 288: the line runs to ~250 bytes at its nominal values after
+      // mdrop/retrig/nopitch joined it, and the counters on it are unbounded.
+      char line[352];
       snprintf(line, sizeof(line),
                "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u links=%c%c%c%c usb=%u cdrop=%lu "
                "usbdef=%lu thr=%lu scan=%u ledchurn=%lu dmachurn=%lu "
                "float=%u idleedges=%lu "
                "fifth=%ld M=%d,%d,%d,%d anchor=%d,%d preject=%lu "
-               "cmode=%s cseq=%u kreject=%lu\r\n",
+               "cmode=%s cseq=%u kreject=%lu "
+               "mdrop=%lu retrig=%lu nopitch=%lu\r\n",
                FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
                stream_on, led_viz_on,
                link_state_char(LINK_PORT_TOP), link_state_char(LINK_PORT_BOTTOM),
@@ -1602,7 +1630,9 @@ int main(void)
                pitch_params.m00, pitch_params.m01, pitch_params.m10, pitch_params.m11,
                pitch_params.aw, pitch_params.ah, (unsigned long)pq_rejected,
                (color_mode == COLOR_MODE_PROCEDURAL) ? "proc" : "expl",
-               mesh_colorgen_seq(), (unsigned long)kq_rejected);
+               mesh_colorgen_seq(), (unsigned long)kq_rejected,
+               (unsigned long)n_mdrop, (unsigned long)n_retrigger,
+               (unsigned long)n_nopitch);
       cdc_send_text(line);
     }
 
@@ -1611,18 +1641,19 @@ int main(void)
       for (link_port_t lp = 0; lp < LINK_PORT_COUNT; lp++) {
         uint32_t rx = 0, tx = 0, err = 0;
         link_stats(lp, &rx, &tx, &err);
-        uint32_t e_uart = 0, e_rxfull = 0, e_txfull = 0, e_sum = 0;
-        link_err_breakdown(lp, &e_uart, &e_rxfull, &e_txfull, &e_sum);
-        char line[160];
+        uint32_t e_ore = 0, e_frame = 0, e_rxfull = 0, e_txfull = 0, e_sum = 0;
+        link_err_breakdown(lp, &e_ore, &e_frame, &e_rxfull, &e_txfull, &e_sum);
+        char line[176];
         snprintf(line, sizeof(line),
                  "LINK %-6s %-9s peer=%08lX pp=%u usb=%u rx=%lu tx=%lu err=%lu"
-                 " (uart=%lu rxfull=%lu txfull=%lu sum=%lu)\r\n",
+                 " (ore=%lu frame=%lu rxfull=%lu txfull=%lu sum=%lu)\r\n",
                  link_port_name(lp), link_state_name(lp),
                  (unsigned long)link_peer_uid(lp)[0], link_peer_port(lp),
                  link_peer_has_usb(lp),
                  (unsigned long)rx, (unsigned long)tx, (unsigned long)err,
-                 (unsigned long)e_uart, (unsigned long)e_rxfull,
-                 (unsigned long)e_txfull, (unsigned long)e_sum);
+                 (unsigned long)e_ore, (unsigned long)e_frame,
+                 (unsigned long)e_rxfull, (unsigned long)e_txfull,
+                 (unsigned long)e_sum);
         cdc_send_text(line);
       }
     }

@@ -312,8 +312,26 @@ static uint8_t Composite_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *r
 static uint8_t Composite_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 {
   if ((epnum & 0x7FU) == (MIDI_IN_EP & 0x7FU)) {
+    /* Release the transmitter, and nothing else.
+     *
+     * Flushing from here raced the main loop and silently ate notes.
+     * USBD_MIDI_Flush() advances midi_tail and fills midi_tx_buf in its copy
+     * loop and only sets midi_tx_busy afterwards, so this handler -- USB_LP at
+     * preempt priority 0, above everything -- could interrupt a flush mid-copy,
+     * find busy == 0 with a non-empty queue, drain the remaining entries over
+     * the buffer the main loop had already staged, and transmit. The main loop
+     * then resumed, finished its own loop, and transmitted its stale len over
+     * the overwritten buffer. Packets were consumed from the ring and never
+     * delivered, and two transfers were queued on one endpoint -- uncounted,
+     * and the reason a fast trill dropped roughly one note a second.
+     *
+     * USBD_MIDI_Flush() is now reached only from main-loop context: the loop in
+     * main(), and USBD_MIDI_Send() below, which is only ever called from it
+     * (midi_send -> midi_note_on/off <- keys_process, mesh dispatch, reconcile).
+     * That context is single-threaded, so the window is closed. The cost is up
+     * to one scan of latency, ~439 us, before the drain is re-armed -- well
+     * under the 1 ms USB frame the packets are waiting for anyway. */
     comp_state.midi_tx_busy = 0U;
-    USBD_MIDI_Flush();          /* keep draining while packets remain */
     return USBD_OK;
   }
   if ((epnum & 0x7FU) == (CDC_IN_EP & 0x7FU)) {
