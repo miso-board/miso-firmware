@@ -1,20 +1,21 @@
 <script lang="ts">
-  // Controls for the active preset's procedural pitch mapping: a layout over a
-  // tuning, pinned by one note on one key.
+  // Controls for the active preset's tuning, and the one note on one key that
+  // pins it in place.
   //
-  // Layout and tuning are independent by construction — a layout is a basis
-  // change in meantonal's (w, h) pitch space, so Bosanquet and Wicki-Hayden mean
-  // the same thing in every tuning, and only the fifth changes underneath.
+  // The layout is chosen separately (LayoutPicker). The two are independent by
+  // construction — a layout is a basis change in meantonal's (w, h) pitch space,
+  // so it means the same thing in every tuning, and only the fifth changes
+  // underneath.
 
   import {
-    LAYOUTS, VALID_EDOS, FIFTH_MIN, FIFTH_MAX, CENTRE_KEY,
+    VALID_EDOS, FIFTH_MIN, FIFTH_MAX, CENTRE_KEY,
     fifthCents, tuningError, tuningWarning, noteName, generatePitchAt, hzAt,
-    type LayoutId, type Tuning,
+    type Tuning,
   } from "../lib/tuning";
-  import { activePreset, activeColors, updatePitchGenerator, updateColorGenerator } from "../lib/presets.svelte";
+  import { activePreset, updatePitchGenerator } from "../lib/presets.svelte";
+  import FifthRuler from "./FifthRuler.svelte";
 
   const gen = $derived(activePreset().pitch.generator);
-  const layout = $derived(LAYOUTS[gen.layout]);
   const fifth = $derived(fifthCents(gen.tuning));
   const error = $derived(tuningError(gen.tuning));
   const warning = $derived(tuningWarning(gen.tuning));
@@ -31,9 +32,9 @@
   // Fifths worth reaching for that no equal division provides.
   const NAMED_FIFTHS: { name: string; cents: number; why: string }[] = [
     { name: "1/4-comma", cents: 300 * Math.log2(5), why: "pure 5:4 major third" },
-    { name: "1/3-comma", cents: 600 * Math.log2(6) - 600, why: "pure 6:5 minor third" },
+    // 1200·(8 − φ)/11 = 696.214…¢
+    { name: "Golden Meantone", cents: (1200 * (8 - (1 + Math.sqrt(5)) / 2)) / 11, why: "whole tone to diatonic semitone in the golden ratio" },
     { name: "Pythagorean", cents: 1200 * Math.log2(1.5), why: "pure 3:2 fifth" },
-    { name: "Equal", cents: 700, why: "ordinary 12-tone equal temperament" },
   ];
 
   let centsDraft = $state("");
@@ -63,38 +64,21 @@
     key[axis] += delta;
     updatePitchGenerator({ anchorKey: key });
   }
-
-  /** Colour rows and sounding pitch can disagree; this reconciles them. */
-  const colourLayout = $derived(activeColors().generator?.layout);
-  const layoutsDiffer = $derived(colourLayout !== undefined && colourLayout !== gen.layout);
 </script>
 
 <section
-  class="mb-3.5 rounded-lg border p-4"
+  class="rounded-lg border p-4"
   style="background: var(--panel); border-color: var(--line); box-shadow: var(--shadow)"
 >
   <h2 class="m-0 mb-1 text-[11px] font-semibold uppercase tracking-[0.14em]" style="color: var(--text-dim)">
-    Procedural pitch
+    Tuning
   </h2>
   <p class="m-0 mb-3 text-xs" style="color: var(--text-dim)">
-    Every key's pitch from a layout over a tuning, computed with <b>meantonal</b>.
-    A tuning is one number — the width of its fifth — so an EDO and a historical
-    temperament are the same control.
-    <span class="mono">{layout.axes}</span>
+    A tuning is one number — the width of its fifth — so an EDO and a historical temperament are
+    the same control. The anchor pins one note to one key; every other key follows from the layout.
   </p>
 
   <div class="flex flex-wrap items-start gap-x-6 gap-y-3">
-    <label class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
-      Layout
-      <select
-        class="btn text-sm normal-case tracking-normal"
-        value={gen.layout}
-        onchange={(e) => updatePitchGenerator({ layout: e.currentTarget.value as LayoutId })}
-      >
-        {#each Object.values(LAYOUTS) as l}<option value={l.id}>{l.name}</option>{/each}
-      </select>
-    </label>
-
     <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
       Tuning by
       <div class="flex items-center gap-1">
@@ -189,6 +173,12 @@
     </div>
   </div>
 
+  {#if gen.tuning.kind === "fifth"}
+    <div class="mt-3">
+      <FifthRuler value={fifth} onchange={(cents) => setTuning({ kind: "fifth", cents })} />
+    </div>
+  {/if}
+
   {#if error}
     <p class="m-0 mt-3 rounded-md border-l-[3px] px-3 py-2 text-xs"
        style="background: var(--panel-2); border-color: var(--crit); color: var(--crit)">
@@ -198,17 +188,6 @@
     <p class="m-0 mt-3 rounded-md border-l-[3px] px-3 py-2 text-xs"
        style="background: var(--panel-2); border-color: var(--warn); color: var(--warn)">
       {warning}
-    </p>
-  {/if}
-
-  {#if layoutsDiffer}
-    <p class="m-0 mt-3 flex flex-wrap items-center gap-2 text-xs" style="color: var(--text-dim)">
-      This preset colours its rows by <b style="color: var(--text)">{LAYOUTS[colourLayout!].name}</b>
-      but sounds <b style="color: var(--text)">{layout.name}</b>, so the colour rows won't line up with
-      the accidentals you hear.
-      <button class="btn text-xs normal-case tracking-normal" onclick={() => updateColorGenerator({ layout: gen.layout })}>
-        Match colours to {layout.name}
-      </button>
     </p>
   {/if}
 

@@ -1,21 +1,14 @@
 <script lang="ts">
-  // The preset selector, shared by the Key colors and Pitch mapping tabs.
+  // The preset selector.
   //
-  // A preset is one LED mapping plus one pitch mapping, so it is deliberately
-  // the same control on both tabs rather than two independent lists: switching
-  // here changes what the instrument looks like AND what it plays.
+  // A preset is one LED mapping plus one pitch mapping: switching here changes
+  // what the instrument looks like AND what it plays, and Send pushes both.
 
   import { ui, toast } from "../lib/ui.svelte";
   import {
     presetState, activePreset, selectPreset, renamePreset, newPreset, duplicatePreset,
-    deletePreset, copyPresetJson, importPresetJson, pushColors, pushPitch, canPushPitch,
+    deletePreset, copyPresetJson, importPresetJson, pushAll, canPushPitch,
   } from "../lib/presets.svelte";
-
-  interface Props {
-    /** Which half this tab sends, for the Send button's wording. */
-    sends: "colors" | "pitch";
-  }
-  let { sends }: Props = $props();
 
   function importPrompt() {
     const text = window.prompt("Paste a preset JSON (or an older mapping JSON):");
@@ -24,16 +17,11 @@
   }
 
   async function send() {
-    if (sends === "pitch") {
-      await pushPitch();
-      toast("Tuning sent to board.");
-    } else {
-      await pushColors();
-      toast("Colors sent to board.");
-    }
+    // pushAll skips the tuning by itself on firmware that can't be retuned.
+    const retunable = canPushPitch();
+    await pushAll();
+    toast(retunable ? "Colors and tuning sent to board." : "Colors sent to board.");
   }
-
-  const sendDisabled = $derived(sends === "pitch" ? !canPushPitch() : !ui.connected);
 </script>
 
 <div class="mb-3 flex flex-wrap items-center gap-2">
@@ -59,9 +47,7 @@
   <div class="flex-1"></div>
   <button class="btn" onclick={copyPresetJson}>Copy JSON</button>
   <button class="btn" onclick={importPrompt}>Import…</button>
-  <button class="btn primary" disabled={sendDisabled} onclick={send}>
-    Send {sends === "pitch" ? "tuning" : "colors"} to board
-  </button>
+  <button class="btn primary" disabled={!ui.connected} onclick={send}>Send to board</button>
 </div>
 
 <style>

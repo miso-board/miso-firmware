@@ -9,21 +9,66 @@
 // survives boards being added, removed or rearranged. That also matches how the
 // procedural generator already worked: it colours a key by the accidental of
 // the pitch at its coordinate, which is a function of absolute position.
+//
+// WHICH pitch is not the colour layer's to choose. The rows follow the preset's
+// pitch generator — its layout and its anchor — so a key is always coloured by
+// the accidental of the note it actually plays. There is deliberately no way to
+// colour by one layout while sounding another.
 
-import { MapVec } from "meantonal";
 import { LED_POS, cellKey } from "./layout";
-import { LAYOUTS, pitchAt, type LayoutId } from "./tuning";
+import { LAYOUTS, accidentalLabel, anchorVec, generatePitchAt, type PitchGenerator } from "./tuning";
 import { scaleHex, mixWhite, parseHex } from "./ledColor";
 
-/** Parameters of a procedurally generated (row-coloured) scheme. */
+/**
+ * One slice of the chain of fifths, and the colour of every note inside it.
+ *
+ * Colouring is a partition of the chain of fifths: … B♭ F C G D A E B F♯ …
+ * is cut into consecutive runs, and a key takes the colour of the run its note
+ * falls in. The partitions repeat end to end, so a scheme of total width P
+ * colours two notes alike whenever they are P fifths apart.
+ */
+export interface Partition {
+  /** How many adjacent fifths it spans. */
+  width: number;
+  /** Colour at full brightness. */
+  color: string;
+}
+
+export const PARTITION_WIDTH_MAX = 31;
+export const PARTITIONS_MAX = 12;
+
+/** The naturals in chain-of-fifths order; the index is the note's fifths position. */
+export const FIFTHS_LETTERS = ["F", "C", "G", "D", "A", "E", "B"] as const;
+
+/**
+ * Parameters of a procedurally generated (row-coloured) scheme.
+ *
+ * Only what the rows LOOK like. Where they fall comes from the pitch generator.
+ *
+ * Two ways of saying how the chain of fifths is cut up, chosen by `scheme`.
+ * Both sets of fields are kept whichever is active, so switching back and forth
+ * loses nothing:
+ *
+ *  - "accidental": equal slices of seven fifths starting on F — the naturals,
+ *    the sharps, the flats and so on — one `palette` entry each.
+ *  - "partitions": slices of any widths, pinned by naming the natural that
+ *    starts one of them. Seven then five is the usual two-row scheme.
+ *
+ * The first is a special case of the second (see `partitionsFromAccidentals`).
+ * It stays a mode of its own because it is the one the firmware can generate.
+ */
 export interface GeneratorParams {
-  layout: LayoutId;
+  scheme: "accidental" | "partitions";
+  /** "partitions" scheme: the slices, in rising fifths order. */
+  partitions: Partition[];
+  /** "partitions" scheme: the natural that starts a partition, as an index into FIFTHS_LETTERS. */
+  anchorLetter: number;
+  /** "partitions" scheme: which partition that natural starts. */
+  anchorPartition: number;
   /** Row colours at full brightness; `brightness` dims them on write. */
   palette: string[];
   /** The accidental that receives palette[0]. */
   startAccidental: number;
-  /** Added to every board coordinate before the pitch is computed. */
-  offset: [number, number];
   /** Percent of full brightness written to the LEDs. */
   brightness: number;
   /** Tint the letters C, D and E paler, as an orientation landmark. */
@@ -38,37 +83,142 @@ const CDE_LIGHTEN = 0.35;
 /**
  * A preset's LED mapping.
  *
- * `generator` is optional here — unlike a pitch map's, which is mandatory. A
- * hand-painted colour layer has no parameters, and a coordinate nobody painted
- * can safely be black. See `PitchMap` in tuning.ts for why pitch cannot work
- * that way.
+ * The same shape as a `PitchMap`: a generator that is always there, with
+ * hand-painted keys layered on top as overrides. A layer with no overrides is
+ * procedural; painting any key makes it custom; clearing the overrides returns
+ * it to the generated colours, which is why painting never discards the
+ * generator.
  */
 export interface ColorLayer {
-  /** Explicit colours by "x,y". A generated layer fills the gaps from `generator`. */
+  /** Hand-painted colours by "x,y", over the generated ones. */
   colors: Record<string, string>;
-  /** Present when the mapping is procedural rather than hand-painted. */
-  generator?: GeneratorParams;
+  generator: GeneratorParams;
 }
 
 // Chosen so that at 10% brightness these reproduce the board's boot pattern
 // byte for byte (250 -> 25, 100 -> 10, 20 -> 2 …).
 export const DEFAULT_GENERATOR: GeneratorParams = {
-  layout: "bosanquet",
+  scheme: "accidental",
+  partitions: [],
+  anchorLetter: 0,
+  anchorPartition: 0,
   palette: ["#fa1414", "#fa6414", "#c8c814", "#32fa32", "#3232fa"],
   startAccidental: -2,
-  offset: [0, 0],
   brightness: 10,
   lightenCDE: false,
 };
 
-/** Colour for one coordinate under a procedural scheme. */
-export function generateColorAt(p: GeneratorParams, x: number, y: number): string {
-  const layout = LAYOUTS[p.layout];
+/** A fresh copy of the default generator, safe to mutate. */
+export function defaultGenerator(): GeneratorParams {
+  return { ...DEFAULT_GENERATOR, palette: [...DEFAULT_GENERATOR.palette], partitions: [] };
+}
+
+const mod = (v: number, m: number): number => ((v % m) + m) % m;
+
+/** A note's position on the chain of fifths, with F natural at 0, C at 1, F♯ at 7. */
+export function fifthsOf(pitch: { chroma: number }): number {
+  return pitch.chroma + 1;
+}
+
+/** Name of a chain-of-fifths position, without an octave: 0 → F, 7 → F♯, −1 → B♭. */
+export function fifthsName(i: number): string {
+  const acc = Math.floor(i / 7);
+  return FIFTHS_LETTERS[mod(i, 7)] + (acc === 0 ? "" : accidentalLabel(acc));
+}
+
+/**
+ * The accidental scheme, said as partitions: one slice of seven per palette
+ * row, with F starting the naturals' slice. Colours every key identically.
+ */
+export function partitionsFromAccidentals(
+  p: Pick<GeneratorParams, "palette" | "startAccidental">,
+): Pick<GeneratorParams, "partitions" | "anchorLetter" | "anchorPartition"> {
   const n = Math.max(1, p.palette.length);
-  const pitch = pitchAt(layout, x, y, p.offset);
-  // Rows outside the palette wrap back through it.
-  const idx = (((pitch.accidental - p.startAccidental) % n) + n) % n;
-  let hex = p.palette[idx] ?? "#000000";
+  return {
+    partitions: p.palette.map((color) => ({ width: 7, color })),
+    anchorLetter: 0,
+    anchorPartition: mod(-p.startAccidental, n),
+  };
+}
+
+/** True when the generator is using a usable partition scheme. */
+function usesPartitions(p: GeneratorParams): boolean {
+  return p.scheme === "partitions" && Array.isArray(p.partitions) && p.partitions.length > 0;
+}
+
+/**
+ * The chain-of-fifths position where each partition starts, for the cycle that
+ * contains the anchor. Add or subtract the total width for the other cycles.
+ */
+export function partitionStarts(p: GeneratorParams): number[] {
+  const starts: number[] = [];
+  let at = 0;
+  for (const part of p.partitions) {
+    starts.push(at);
+    at += part.width;
+  }
+  const k = mod(p.anchorPartition ?? 0, Math.max(1, starts.length));
+  const shift = (p.anchorLetter ?? 0) - (starts[k] ?? 0);
+  return starts.map((s) => s + shift);
+}
+
+/** Which partition a chain-of-fifths position falls in. */
+export function partitionIndexAt(p: GeneratorParams, fifths: number): number {
+  const starts = partitionStarts(p);
+  const total = p.partitions.reduce((sum, part) => sum + part.width, 0);
+  const pos = mod(fifths - starts[0], total);
+  let acc = 0;
+  for (let i = 0; i < p.partitions.length; i++) {
+    acc += p.partitions[i].width;
+    if (pos < acc) return i;
+  }
+  return 0;
+}
+
+/**
+ * The palette and first accidental that colour every key exactly as this
+ * generator does, or null if no accidental scheme can.
+ *
+ * This is what decides whether the boards can generate the colours themselves:
+ * the `K` frame carries an accidental scheme and nothing else. A partition
+ * scheme qualifies only when it happens to be one — every slice seven wide and
+ * a slice starting on F.
+ */
+export function asAccidentalScheme(
+  p: GeneratorParams,
+): Pick<GeneratorParams, "palette" | "startAccidental"> | null {
+  if (!usesPartitions(p)) return { palette: p.palette, startAccidental: p.startAccidental };
+  if (p.partitions.some((part) => part.width !== 7)) return null;
+  if (mod(partitionStarts(p)[0], 7) !== 0) return null;
+  return {
+    palette: p.partitions.map((part) => part.color),
+    // Partition 0 starts 7·k fifths from F, which is accidental k.
+    startAccidental: partitionStarts(p)[0] / 7,
+  };
+}
+
+/**
+ * Colour for one coordinate under a procedural scheme: the colour of the slice
+ * of the chain of fifths that the note `pitchGen` puts on that key falls in.
+ *
+ * The generated pitch, not a pitch override — the board colours itself from
+ * parameters, and an override is not one.
+ */
+export function generateColorAt(
+  p: GeneratorParams,
+  pitchGen: PitchGenerator,
+  x: number,
+  y: number,
+): string {
+  const pitch = generatePitchAt(pitchGen, x, y);
+  let hex: string;
+  if (usesPartitions(p)) {
+    hex = p.partitions[partitionIndexAt(p, fifthsOf(pitch))].color;
+  } else {
+    const n = Math.max(1, p.palette.length);
+    // Rows outside the palette wrap back through it.
+    hex = p.palette[mod(pitch.accidental - p.startAccidental, n)] ?? "#000000";
+  }
   if (p.lightenCDE && pitch.pc7 < 3) hex = mixWhite(hex, CDE_LIGHTEN);
   return scaleHex(hex, p.brightness);
 }
@@ -78,11 +228,10 @@ export function generateColorAt(p: GeneratorParams, x: number, y: number): strin
  * lazily rather than materialised, so attaching another board needs no
  * regeneration — its keys simply resolve.
  */
-export function colorAt(m: ColorLayer, x: number, y: number): string {
+export function colorAt(m: ColorLayer, pitchGen: PitchGenerator, x: number, y: number): string {
   const explicit = m.colors[cellKey(x, y)];
   if (explicit !== undefined) return explicit;
-  if (m.generator) return generateColorAt(m.generator, x, y);
-  return "#000000";
+  return generateColorAt(m.generator, pitchGen, x, y);
 }
 
 /** An LED-indexed array from the old storage format is a board at the origin. */
@@ -98,13 +247,14 @@ export function coloursFromLedArray(arr: string[]): Record<string, string> {
 /** 93 RGB bytes for one board, in LED-chain order, from absolute coordinates. */
 export function rgbForBoard(
   m: ColorLayer,
+  pitchGen: PitchGenerator,
   ox: number,
   oy: number,
   into: Uint8Array,
   at: number,
 ): void {
   LED_POS.forEach(([lx, ly], led) => {
-    const [r, g, b] = parseHex(colorAt(m, lx + ox, ly + oy));
+    const [r, g, b] = parseHex(colorAt(m, pitchGen, lx + ox, ly + oy));
     into[at + led * 3] = r;
     into[at + led * 3 + 1] = g;
     into[at + led * 3 + 2] = b;
@@ -115,6 +265,9 @@ export function rgbForBoard(
 
 /** Palette entries the firmware's frame can carry. */
 export const COLORGEN_PAL_MAX = 8;
+/** Partitions the firmware's frame can carry: six colours and six widths fill the palette bytes. */
+export const COLORGEN_PART_MAX = 6;
+const COLORGEN_PART_FLAG = 0x80;
 
 export const COLORGEN_FRAME_LEN = 41; // 'K' + 40 payload bytes
 
@@ -131,21 +284,48 @@ export const COLORGEN_FRAME_LEN = 41; // 'K' + 40 payload bytes
  * down the tree, so a board hot-plugged with no host connected still comes up in
  * the right colours.
  *
- * Two things are folded on the way out. `offset` disappears into the anchor,
- * since `M·(v + o) + a` is `M·v + (M·o + a)` — so the wire carries the same six
- * integers of geometry `P` does. `brightness` does NOT fold into the palette,
- * because `lightenCDE` is applied per key BEFORE scaling and rounds on the way
+ * The six integers of geometry are the pitch generator's own — the same matrix
+ * and anchor `P` carries — which is what keeps the board's rows on the notes it
+ * plays. The frame is still self-contained, so a board needs no tuning to colour
+ * itself. `brightness` does NOT fold into the palette, because `lightenCDE` is applied per key BEFORE scaling and rounds on the way
  * (see `generateColorAt`), so pre-scaling would shift some channels by a count.
  *
- * Returns null when the scheme cannot be expressed as parameters: a layer with
- * no generator (hand-painted), or a palette longer than the frame can carry. The
- * caller falls back to per-board `L` frames.
+ * The same 40 bytes carry one of two forms, told apart by the top bit of the
+ * length byte:
+ *
+ *   accidental rows   int8 start accidental · u8 palette length · … · 8 × RGB
+ *   partitions        int8 origin · u8 0x80 | count · … · 6 × RGB · 6 × u8 width
+ *
+ * A scheme that IS accidental rows always goes out in the first form, however it
+ * was authored, because every firmware since 0.8.0 understands it. The second
+ * needs 0.9.0, so it is only built when `partitionsOk` says the board has it. An
+ * older board rejects a partition frame outright (it reads the marked length as
+ * a palette over 8) and keeps the colours it had.
+ *
+ * Returns null when the scheme cannot be expressed as parameters: a palette over
+ * eight rows, more than six partitions, or partitions on firmware that predates
+ * them. The caller falls back to per-board `L` frames.
  */
-export function colorgenFrame(p: GeneratorParams): Uint8Array | null {
-  if (p.palette.length < 1 || p.palette.length > COLORGEN_PAL_MAX) return null;
+export function colorgenFrame(
+  g: GeneratorParams,
+  pitchGen: PitchGenerator,
+  partitionsOk = false,
+): Uint8Array | null {
+  let scheme = asAccidentalScheme(g);
+  if (scheme && (scheme.startAccidental < -128 || scheme.startAccidental > 127)) scheme = null;
+  if (scheme && scheme.palette.length > COLORGEN_PAL_MAX) scheme = null;
+  // Not accidental rows the frame can carry; a partition scheme may still fit
+  // (which includes accidental rows authored as six or fewer partitions with a
+  // first accidental out of an int8's reach — not that anyone will).
+  if (!scheme) {
+    if (!partitionsOk || !usesPartitions(g) || g.partitions.length > COLORGEN_PART_MAX) return null;
+    if (g.partitions.some((part) => part.width < 1 || part.width > PARTITION_WIDTH_MAX)) return null;
+  }
+  const p = scheme ? { ...g, ...scheme } : g;
+  if (scheme && p.palette.length < 1) return null;
 
-  const layout = LAYOUTS[p.layout];
-  const o = layout.matrix.map(new MapVec(p.offset[0], p.offset[1]));
+  const layout = LAYOUTS[pitchGen.layout];
+  const anchor = anchorVec(pitchGen);
 
   const frame = new Uint8Array(COLORGEN_FRAME_LEN);
   frame[0] = 0x4b; // 'K'
@@ -155,12 +335,31 @@ export function colorgenFrame(p: GeneratorParams): Uint8Array | null {
   dv.setInt16(3, layout.matrix.m01, true);
   dv.setInt16(5, layout.matrix.m10, true);
   dv.setInt16(7, layout.matrix.m11, true);
-  dv.setInt16(9, o.x + layout.anchor.w, true);
-  dv.setInt16(11, o.y + layout.anchor.h, true);
-  dv.setInt8(13, p.startAccidental);
-  frame[14] = p.palette.length;
+  dv.setInt16(9, anchor.w, true);
+  dv.setInt16(11, anchor.h, true);
   frame[15] = p.lightenCDE ? 0x01 : 0x00;
   frame[16] = Math.round(p.brightness);
+
+  if (!scheme) {
+    // Where partition 0 starts, as the residue nearest zero: the pattern repeats
+    // every `total` fifths, and the total is at most 6 × 31, so it fits an int8.
+    const total = g.partitions.reduce((sum, part) => sum + part.width, 0);
+    let origin = mod(partitionStarts(g)[0], total);
+    if (origin > total / 2) origin -= total;
+    dv.setInt8(13, origin);
+    frame[14] = COLORGEN_PART_FLAG | g.partitions.length;
+    g.partitions.forEach((part, i) => {
+      const [r, gr, b] = parseHex(part.color);
+      frame[17 + i * 3] = r;
+      frame[17 + i * 3 + 1] = gr;
+      frame[17 + i * 3 + 2] = b;
+      frame[17 + COLORGEN_PART_MAX * 3 + i] = part.width;
+    });
+    return frame;
+  }
+
+  dv.setInt8(13, p.startAccidental);
+  frame[14] = p.palette.length;
 
   // At FULL brightness: the board scales, so that it can apply the C/D/E tint
   // first and round exactly where the host does.

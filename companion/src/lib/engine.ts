@@ -204,21 +204,3 @@ export function resetTimeline(): void {
   badFrames = 0;
   pending = [];
 }
-
-export function calibrationJson(live: boolean): string {
-  return JSON.stringify(
-    {
-      schema: "miso-cal-1",
-      captured: new Date().toISOString(),
-      source: live ? "live" : "SIMULATED",
-      keys: keys.map((k, i) => ({
-        i,
-        rest: isNaN(k.rest) ? null : k.rest,
-        min: k.min <= k.max ? k.min : null,
-        max: k.max >= k.min ? k.max : null,
-      })),
-    },
-    null,
-    2,
-  );
-}

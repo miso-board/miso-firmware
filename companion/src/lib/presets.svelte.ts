@@ -3,19 +3,18 @@
 //
 // A PRESET is how the instrument is set up: an LED mapping and a pitch mapping,
 // with room for further preset-scoped settings. The two halves work the same way
-// — keyed by absolute grid coordinate, procedurally generated or set per key,
-// evaluated lazily so a board attached later simply resolves — but they differ
-// in one structural respect worth knowing before editing this file:
+// — keyed by absolute grid coordinate, a generator that is always present with
+// per-key overrides layered on top, evaluated lazily so a board attached later
+// simply resolves.
 //
-//   A colour layer's generator is OPTIONAL. Hand-painting one freezes it
-//   (`materialise`), because an unpainted coordinate can safely be black.
+// The colour generator has no geometry of its own: its rows follow the pitch
+// generator, so keys are coloured by the accidental of the note they play.
+// Painting a key adds an override and makes the colours "custom";
+// `resetColors` drops the overrides and returns to the generated scheme. The
+// generator is never removed by painting, which is what makes that reset
+// possible.
 //
-//   A pitch map's generator is MANDATORY and permanent. A coordinate with no
-//   pitch is a silent key, and the `P` frame carries parameters rather than a
-//   table, so there would be nothing left to send. Overrides are layered on top
-//   and are never a cache — editing the generator must not clear them.
-//
-// See `PitchMap` in tuning.ts for the long version.
+// See `PitchMap` in tuning.ts for why a pitch generator must be permanent.
 
 import { NUM_KEYS } from "./layout";
 import {
@@ -27,10 +26,12 @@ import {
   type PitchMap,
 } from "./tuning";
 import {
-  DEFAULT_GENERATOR,
+  FIFTHS_LETTERS,
+  PARTITIONS_MAX,
+  PARTITION_WIDTH_MAX,
   colorgenFrame,
   coloursFromLedArray,
-  generateColorAt,
+  defaultGenerator,
   rgbForBoard,
   type ColorLayer,
   type GeneratorParams,
@@ -58,6 +59,9 @@ export const PITCH_PUSH_FW = [0, 7, 0] as const;
 /** Firmware that understands the `K` colour-generator frame. */
 export const COLORGEN_PUSH_FW = [0, 8, 0] as const;
 
+/** Firmware whose `K` frame can carry a partition scheme, not just accidental rows. */
+export const COLORGEN_PARTITIONS_FW = [0, 9, 0] as const;
+
 /**
  * The out-of-the-box preset.
  *
@@ -72,14 +76,7 @@ export const COLORGEN_PUSH_FW = [0, 8, 0] as const;
 function defaultPreset(): Preset {
   return {
     name: "Bosanquet",
-    colors: {
-      colors: {},
-      generator: {
-        ...DEFAULT_GENERATOR,
-        palette: [...DEFAULT_GENERATOR.palette],
-        offset: [...DEFAULT_GENERATOR.offset] as [number, number],
-      },
-    },
+    colors: { colors: {}, generator: defaultGenerator() },
     pitch: defaultPitchMap(),
   };
 }
@@ -140,10 +137,9 @@ function normalise(raw: any): Preset | null {
   const colours = asColours(raw.colors?.colors ?? raw.colors);
   if (!colours) return null;
 
-  const colorGenerator = (raw.colors?.generator ?? raw.generator) as GeneratorParams | undefined;
   const colors: ColorLayer = {
     colors: colours,
-    ...(colorGenerator ? { generator: colorGenerator } : {}),
+    generator: normaliseColorGenerator(raw.colors?.generator ?? raw.generator),
   };
 
   const pitch = normalisePitch(raw.pitch);
@@ -153,6 +149,44 @@ function normalise(raw: any): Preset | null {
     colors,
     pitch,
     ...(raw.settings && typeof raw.settings === "object" ? { settings: raw.settings } : {}),
+  };
+}
+
+/**
+ * A stored colour generator, in the current shape.
+ *
+ * Older documents gave the colour generator its own `layout` and `offset`; both
+ * are dropped, since the rows now follow the pitch mapping. A document with no
+ * generator at all was hand-painted: it gets the default one underneath, with
+ * its painted keys kept as overrides, so "reset" has something to return to.
+ */
+function normaliseColorGenerator(raw: any): GeneratorParams {
+  const d = defaultGenerator();
+  if (!raw || typeof raw !== "object") return d;
+  const palette = Array.isArray(raw.palette)
+    ? raw.palette.filter((c: unknown) => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c))
+    : [];
+  const isHex = (c: unknown): c is string => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c);
+  const partitions = (Array.isArray(raw.partitions) ? raw.partitions : [])
+    .filter((p: any) => p && isHex(p.color) && Number.isFinite(p.width))
+    .slice(0, PARTITIONS_MAX)
+    .map((p: any) => ({
+      width: Math.min(PARTITION_WIDTH_MAX, Math.max(1, Math.round(p.width))),
+      color: p.color as string,
+    }));
+  const letter = Math.round(Number(raw.anchorLetter));
+  const anchorPartition = Math.round(Number(raw.anchorPartition));
+  return {
+    // A partition scheme with no partitions has nothing to draw with.
+    scheme: raw.scheme === "partitions" && partitions.length ? "partitions" : "accidental",
+    partitions,
+    anchorLetter: letter >= 0 && letter < FIFTHS_LETTERS.length ? letter : 0,
+    anchorPartition:
+      anchorPartition >= 0 && anchorPartition < partitions.length ? anchorPartition : 0,
+    palette: palette.length ? palette : d.palette,
+    startAccidental: Number.isFinite(raw.startAccidental) ? Number(raw.startAccidental) : d.startAccidental,
+    brightness: Number.isFinite(raw.brightness) ? Number(raw.brightness) : d.brightness,
+    lightenCDE: raw.lightenCDE === true,
   };
 }
 
@@ -230,48 +264,30 @@ function save(): void {
 
 // --- editing the colour layer ----------------------------------------------
 
-/** Freeze a generated colour scheme into explicit colours over the current grid. */
-function materialiseColors(m: ColorLayer, cells: { key: string; x: number; y: number }[]): void {
-  if (!m.generator) return;
-  const gen = m.generator;
-  for (const c of cells) {
-    if (m.colors[c.key] === undefined) {
-      m.colors[c.key] = generateColorAt(gen, c.x, c.y);
-    }
-  }
-  delete m.generator;
-}
-
+/** Paint one key by hand. The generator stays underneath for the rest. */
 export function paint(x: number, y: number, hex: string): void {
-  const m = activeColors();
-  // Painting a generated mapping by hand detaches it from its parameters.
-  materialiseColors(m, gridCells());
-  m.colors[cellKey(x, y)] = hex;
+  activeColors().colors[cellKey(x, y)] = hex;
   save();
   schedulePush({ colors: true });
 }
 
+/** Paint every key in the current grid. */
 export function fillAll(hex: string): void {
-  const m = activeColors();
-  delete m.generator;
   const colors: Record<string, string> = {};
   for (const c of gridCells()) colors[c.key] = hex;
-  m.colors = colors;
+  activeColors().colors = colors;
   save();
   schedulePush({ colors: true });
 }
 
-/** Give the active preset a procedural colour scheme. */
-export function createProceduralColorMap(params: GeneratorParams = DEFAULT_GENERATOR): void {
-  const p = activePreset();
-  p.colors = {
-    colors: {},
-    generator: {
-      ...params,
-      palette: [...params.palette],
-      offset: [...params.offset] as [number, number],
-    },
-  };
+/** How many keys have been painted by hand; zero means purely procedural. */
+export function paintedCount(): number {
+  return Object.keys(activeColors().colors).length;
+}
+
+/** Discard every hand-painted key, returning to the generated colours. */
+export function resetColors(): void {
+  activeColors().colors = {};
   save();
   schedulePush({ colors: true });
 }
@@ -279,9 +295,7 @@ export function createProceduralColorMap(params: GeneratorParams = DEFAULT_GENER
 /** Update the active preset's colour generator parameters. */
 export function updateColorGenerator(patch: Partial<GeneratorParams>): void {
   const m = activeColors();
-  if (!m.generator) return;
   m.generator = { ...m.generator, ...patch };
-  m.colors = {}; // drop stale overrides so the new parameters show everywhere
   save();
   schedulePush({ colors: true });
 }
@@ -291,21 +305,24 @@ export function updateColorGenerator(patch: Partial<GeneratorParams>): void {
 /**
  * Update the active preset's pitch generator.
  *
- * Note what this does NOT do, in contrast to `updateColorGenerator` above: it
- * does not clear `overrides`. A painted colour under a generated scheme is a
- * stale cache; a reassigned pitch is a decision the user made, and retuning is
- * not a reason to discard it.
+ * Overrides are left alone: a reassigned pitch is a decision the user made, and
+ * retuning is not a reason to discard it.
+ *
+ * The colour rows follow the layout and the anchor, so changing either re-pushes
+ * the colours too. The tuning does not move a single accidental, and dragging it
+ * must not drag the LEDs along (see `schedulePush`), so it pushes pitch alone.
  */
 export function updatePitchGenerator(patch: Partial<PitchGenerator>): void {
   const m = activePitch();
   m.generator = { ...m.generator, ...patch };
   save();
-  schedulePush({ pitch: true });
+  const movesRows = "layout" in patch || "anchorNote" in patch || "anchorKey" in patch;
+  schedulePush({ pitch: true, colors: movesRows });
 }
 
 // Mutators for per-key pitch overrides are deliberately absent. The data model
 // carries them -- `pitchOn` resolves them, storage and the JSON interchange
-// round-trip them, and the Pitch mapping tab lists any it finds -- but `P` pushes
+// round-trip them, and the Preset tab lists any it finds -- but `P` pushes
 // parameters, not a table, so a reassigned key cannot reach the board yet.
 // Writing setters now would mean guessing at an editing flow before the command
 // that has to carry it exists.
@@ -315,7 +332,7 @@ export function updatePitchGenerator(patch: Partial<PitchGenerator>): void {
 export function newPreset(): void {
   presetState.presets.push({
     name: `Preset ${presetState.presets.length + 1}`,
-    colors: { colors: {} },
+    colors: { colors: {}, generator: defaultGenerator() },
     pitch: defaultPitchMap(),
   });
   presetState.active = presetState.presets.length - 1;
@@ -381,16 +398,19 @@ export function selectPreset(index: number): void {
 export async function pushColors(): Promise<void> {
   if (!ui.connected) return;
   const m = activeColors();
+  const pitchGen = activePitch().generator;
 
   if (!mesh.seen) {
     const frame = new Uint8Array(1 + NUM_KEYS * 3);
     frame[0] = 0x43; // 'C'
-    rgbForBoard(m, 0, 0, frame, 1);
+    rgbForBoard(m, pitchGen, 0, 0, frame, 1);
     await sendBytes(frame);
     return;
   }
 
-  const gen = canPushColorgen() && m.generator ? colorgenFrame(m.generator) : null;
+  const gen = canPushColorgen()
+    ? colorgenFrame(m.generator, pitchGen, canPushPartitions())
+    : null;
   if (gen) {
     await sendBytes(gen);
     presetState.pushedColorgen = frameHex(gen);
@@ -406,7 +426,7 @@ export async function pushColors(): Promise<void> {
     const dv = new DataView(frame.buffer);
     dv.setInt16(1, board.ox, true);
     dv.setInt16(3, board.oy, true);
-    rgbForBoard(m, board.ox, board.oy, frame, 5);
+    rgbForBoard(m, pitchGen, board.ox, board.oy, frame, 5);
     await sendBytes(frame);
   }
 }
@@ -422,15 +442,33 @@ export function colorsAreSelfSufficient(): boolean {
   const m = activeColors();
   return (
     canPushColorgen() &&
-    !!m.generator &&
     Object.keys(m.colors).length === 0 &&
-    colorgenFrame(m.generator) !== null
+    colorgenFrame(m.generator, activePitch().generator, canPushPartitions()) !== null
   );
 }
 
 /** True when the attached firmware understands `K`. */
 export function canPushColorgen(): boolean {
   return ui.connected && fwAtLeast(...COLORGEN_PUSH_FW);
+}
+
+/** True when the attached firmware's `K` can carry a partition scheme. */
+export function canPushPartitions(): boolean {
+  return ui.connected && fwAtLeast(...COLORGEN_PARTITIONS_FW);
+}
+
+/**
+ * Whether the boards can generate the active colour scheme themselves, and if
+ * not, why — which decides whether it survives the app being closed.
+ *
+ * With no board attached the answer is for current firmware, since there is no
+ * version to ask.
+ */
+export function colorGenerationLimit(): "none" | "firmware" | "too-many" {
+  const g = activeColors().generator;
+  const pitchGen = activePitch().generator;
+  if (colorgenFrame(g, pitchGen, ui.connected ? canPushPartitions() : true)) return "none";
+  return colorgenFrame(g, pitchGen, true) ? "firmware" : "too-many";
 }
 
 /** True when the attached firmware understands `P`. */

@@ -16,7 +16,7 @@
 </script>
 
 <script lang="ts">
-  import { axialToPixel, BOARD_ROTATION } from "../lib/layout";
+  import { axialToPixel, hexPoints } from "../lib/layout";
   import { ledColor } from "../lib/ledColor";
 
   interface Props {
@@ -41,10 +41,6 @@
   }: Props = $props();
 
   const S = 26; // hex radius in SVG units
-  const ROT_DEG = (BOARD_ROTATION * 180) / Math.PI;
-  // Unique per instance so multiple views don't share gradient/filter ids.
-  const gid = "bv" + Math.random().toString(36).slice(2, 8);
-
   // Geometry is derived from the cells, so the view fits whatever grid it is
   // given — one board or nine — with no fixed key count anywhere.
   const centers = $derived(
@@ -55,7 +51,7 @@
   );
   const lit = $derived(cells.map((c) => ledColor(c.color)));
 
-  const PAD = S * 1.6; // room for the bloom to spill past the outer keys
+  const PAD = S * 1.15; // a little air around the outer keys
   const box = $derived.by(() => {
     if (centers.length === 0) return { minX: 0, minY: 0, w: 1, h: 1 };
     const xs = centers.map((c) => c[0]);
@@ -84,19 +80,9 @@
     return [...acc].map(([uid, a]) => ({ uid, x: a.x / a.n, y: a.y / a.n }));
   });
 
-  /** Hexagon vertices, rotated with the grid so the tiling stays rigid. */
-  function hexPoints(cx: number, cy: number, r: number): string {
-    const pts: string[] = [];
-    for (let i = 0; i < 6; i++) {
-      const a = ((60 * i - 90 - ROT_DEG) * Math.PI) / 180;
-      pts.push(`${(cx + r * Math.cos(a)).toFixed(1)},${(cy + r * Math.sin(a)).toFixed(1)}`);
-    }
-    return pts.join(" ");
-  }
-
   function fillFor(i: number): string {
     if (lit[i].off) return "var(--panel-2)";
-    return trueColor ? cells[i].color : `url(#${gid}-g${i})`;
+    return trueColor ? cells[i].color : lit[i].flat;
   }
 
   function onEnter(i: number, e: PointerEvent) {
@@ -113,31 +99,6 @@
   aria-label="Miso grid"
   onpointerleave={() => onhover?.(null)}
 >
-  <defs>
-    <filter id="{gid}-bloom" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="5" />
-    </filter>
-    {#each lit as c, i}
-      {#if !c.off}
-        <radialGradient id="{gid}-g{i}" cx="50%" cy="38%" r="62%">
-          <stop offset="0%" stop-color={c.core} />
-          <stop offset="100%" stop-color={c.hue} />
-        </radialGradient>
-      {/if}
-    {/each}
-  </defs>
-
-  <!-- Outer bloom: one filter over the whole group, so neighbouring glows merge -->
-  {#if !trueColor}
-    <g filter="url(#{gid}-bloom)">
-      {#each centers as [cx, cy], i}
-        {#if !lit[i].off}
-          <polygon points={hexPoints(cx, cy, S * 1.22)} fill={lit[i].hue} opacity={lit[i].bloom} />
-        {/if}
-      {/each}
-    </g>
-  {/if}
-
   {#each captions as cap}
     <text
       x={cap.x}

@@ -17,15 +17,15 @@ It lives in the firmware repository on purpose; see
 ```sh
 npm install
 npm run dev     # → http://localhost:5173, connects to the board
-npm run build   # dist/miso-companion.html (single file, publishable as artifact demo)
+npm run build   # dist/miso-companion.html (single file)
 npm run check:all
 ```
 
 **Chrome or Edge, and it must be the top-level page.** Web Serial is not
-delegated into iframes, so the published artifact copy runs in simulated mode
-(`src/lib/sim.ts`) and only a local `npm run dev` talks to real hardware. The app
-detects the embedded case and reports it rather than failing silently
-(`ui.serialBlocked`, `App.svelte:80`).
+delegated into iframes, so an embedded copy cannot talk to hardware. The app
+detects that case and reports it rather than failing silently
+(`ui.serialBlocked`). Without a board the Mapping tab still works — presets are
+edited and saved in the browser — and the Calibrate tab simply waits for one.
 
 Requirements beyond a browser:
 
@@ -47,9 +47,15 @@ not raw scans, and remote sensor data at full rate would be 93 kB/s against a
 46 kB/s link. Live levels, stats and press capture therefore show the
 USB-connected board's own keys only.
 
-**Key colors** is a click-to-paint view of the instrument in axial hex. **Pitch
-mapping** shows what every key sounds — note name, MIDI number, bend, frequency —
-and pushes the tuning to the board. **MIDI** monitors the board's MPE output and
+**Mapping**, the first tab, sets up a preset on one view of the instrument in axial hex:
+click or drag to paint key colours, with every key labelled by what it sounds —
+note name, MIDI number, bend or frequency. Colours start out generated from the
+pitch mapping and become custom once painted over, with a button to reset them.
+The layout is picked from a row of live icons — 2×2 board tilings drawn in the
+preset's own colour rows — and the tuning and colour generators sit side by side
+underneath, and one button sends both to the board. Keys are drawn
+in a single flat colour derived from the LED value (hue kept legible, washed
+toward white with brightness). **MIDI** monitors the board's MPE output and
 checks each received note against what meantonal says that key should sound, at
 its *absolute* coordinate, so a note from a neighbouring board is verified like
 any other.
@@ -87,12 +93,13 @@ manual diagnostic, driven from a serial terminal or the flashing scripts.
 
 The board reports `fw=miso X.Y.Z` on its `INFO` line, from `FW_VERSION` in
 [`../Core/Src/main.c`](../Core/Src/main.c). `fwAtLeast()` in
-`src/lib/ui.svelte.ts` compares against two constants in
+`src/lib/ui.svelte.ts` compares against three constants in
 `src/lib/presets.svelte.ts`:
 
 ```ts
 export const PITCH_PUSH_FW    = [0, 7, 0] as const;   // 'P'
 export const COLORGEN_PUSH_FW = [0, 8, 0] as const;   // 'K'
+export const COLORGEN_PARTITIONS_FW = [0, 9, 0] as const;   // 'K' carrying partitions
 ```
 
 **These gates are load-bearing, not polite.** A board that predates `P` does not
@@ -115,13 +122,36 @@ plays together. Both halves are keyed by **absolute grid coordinate**, not LED
 index, so one scheme covers however many boards are attached and survives them
 being added, removed or rearranged.
 
-The two halves differ in one structural respect. A colour layer's generator is
-**optional** — hand-painting freezes it, because an unpainted coordinate can
-safely be black. A pitch map's generator is **mandatory and permanent**: a
+Both halves have the same shape: a **generator that is always present**, with
+per-key overrides layered on top. A pitch generator has to be permanent — a
 coordinate with no pitch is a silent key, and `P` carries parameters rather than
-a table, so freezing one would leave nothing to send. Pitch overrides are
-additive exceptions layered on top, and retuning never discards them. Per-key
-pitch entry is modelled and persisted but has no editor yet.
+a table. Pitch overrides are additive exceptions, and retuning never discards
+them; per-key pitch entry is modelled and persisted but has no editor yet.
+
+The colour generator holds only what the rows *look like* — palette, first
+accidental, brightness, the C/D/E tint. *Where* they fall is the pitch
+generator's layout and anchor, so a key is always coloured by the accidental of
+the note it plays; there is no way to colour by one layout while sounding
+another.
+
+How the rows are cut is a **partition of the chain of fifths** (… B♭ F C G D A E
+B F♯ …): consecutive runs, each with a colour, repeating end to end. There are
+two ways to say it. *Accidental* is equal runs of seven starting on F — naturals,
+sharps, flats — one palette row each. *Partitions* is a list of runs of any
+widths, pinned by naming the natural that starts one of them; seven then five is
+the common two-row scheme, repeating every twelve fifths. The first is a special
+case of the second (`partitionsFromAccidentals`), kept as its own mode because
+it is the familiar one and the one every firmware since 0.8.0 can generate.
+`colorgenFrame` sends a scheme that *is* accidental rows in that form however it
+was authored (`asAccidentalScheme` decides), and otherwise as a partition frame,
+which needs firmware 0.9.0 and at most six partitions. Anything else is rendered
+here and sent as `L` frames, so it needs the app connected.
+
+A preset starts procedural. Painting a key adds a colour override and
+makes it **custom**; **Reset to generated colours** drops the overrides. Older
+documents whose colour generator carried its own `layout` and `offset` load with
+those dropped, and hand-painted ones with no generator get the default
+underneath their painted keys.
 
 Stored in `localStorage` under `miso-presets-v1`, reading `miso-color-maps-v2`
 and a v1 key as fallbacks and leaving both in place as backups
@@ -139,7 +169,8 @@ layer cannot be expressed in parameters, so it is rendered here and sent as a
 generated base.
 
 `colorgenFrame` in `src/lib/colorMaps.ts` is the one place that folds a generator
-into wire bytes. It returns `null` for a palette longer than the eight entries the
+into wire bytes, taking its matrix and anchor from the pitch generator. Changing
+the pitch layout or anchor therefore re-pushes colours as well as tuning. It returns `null` for a palette longer than the eight entries the
 frame carries, and `pushColors()` then falls back to `L` frames. Because only the
 second case needs the host at all, the 1 Hz topology poll re-pushes on a grid
 change *only* when `colorsAreSelfSufficient()` is false.
@@ -165,9 +196,9 @@ wire format:
 | Command | What it proves |
 |---------|----------------|
 | `npm run check` | `svelte-check`: types across the app |
-| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 8,084 assertions |
-| `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `../Core/Src/main.c`, compiles it with clang, and diffs it against the app over nine tunings × both layouts × a four-board grid — 2,232 cases, plus the byte-identical-default claim on 124 keys |
-| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 320 generators × a four-board grid — 39,680 cases, plus the byte-identical-boot-pattern claim and eight validation cases |
+| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,111 assertions |
+| `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `../Core/Src/main.c`, compiles it with clang, and diffs it against the app over nine tunings × three layouts × a four-board grid — 3,348 cases, plus the byte-identical-default claim on 124 keys |
+| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 1,236 generators × a four-board grid — accidental rows and partition schemes, 153,264 cases — plus the byte-identical-boot-pattern claim and fourteen validation cases |
 
 The 12-TET case is the one to keep: at a 700¢ fifth a wrong coefficient would not
 collapse to equal temperament, a wrong anchor would disagree with meantonal's own
@@ -198,7 +229,6 @@ keys in the wrong places rather than an error.
 | `src/lib/layout.ts` | the physical board: LED order, sensor positions, screen projection |
 | `src/lib/ledColor.ts` | hex/RGB helpers, brightness scaling, white mixing |
 | `src/lib/ui.svelte.ts` | connection state, toasts, `fwAtLeast` |
-| `src/lib/sim.ts` | synthetic frames for the demo build |
 
 `webserial.d.ts` and `webmidi.d.ts` are hand-written typings; neither API ships
 with TypeScript's DOM lib.

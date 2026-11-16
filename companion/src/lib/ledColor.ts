@@ -2,9 +2,11 @@
 //
 // SK6812s are bright enough that usable values are tiny — a vivid green is
 // #051905 — which a monitor renders as near-black. These helpers split a
-// color into hue (shown at full legibility) and intensity (shown as a bloom),
-// so the board reads the way the physical device looks rather than the way
-// the raw numbers do. Stored and transmitted values are never touched.
+// color into hue (shown at full legibility) and intensity (shown as how far
+// the hue is washed toward white), so the board reads the way the physical
+// device looks rather than the way the raw numbers do. Keys are drawn as one
+// flat colour — no gradient, no glow. Stored and transmitted values are never
+// touched.
 
 export interface LedColor {
   hex: string;
@@ -15,10 +17,9 @@ export interface LedColor {
   perceived: number;
   /** Hue at full legibility: channels scaled so the brightest reaches 255. */
   hue: string;
-  /** Hue mixed toward white — the "hot core" of a lit LED. */
-  core: string;
-  /** Opacity for the outer bloom layer. */
-  bloom: number;
+  /** The one flat colour a lit key is drawn in: the hue, washed toward white
+   *  by brightness. */
+  flat: string;
   off: boolean;
 }
 
@@ -36,6 +37,11 @@ export function toHex(rgb: [number, number, number]): string {
   );
 }
 
+// How much of the brightness wash reaches the flat colour. The keys used to be
+// a radial gradient from a white-hot centre out to the pure hue; this is where
+// that gradient sat on average, so flattening it kept the overall colour.
+const FLAT_WASH = 0.5;
+
 export function ledColor(hex: string): LedColor {
   const rgb = parseHex(hex);
   const max = Math.max(...rgb);
@@ -46,9 +52,9 @@ export function ledColor(hex: string): LedColor {
     (rgb[1] * 255) / max,
     (rgb[2] * 255) / max,
   ] : [0, 0, 0];
-  // Brighter LEDs look whiter at the middle; dimmer ones keep more of their hue.
-  const k = 0.25 + 0.55 * perceived;
-  const coreRgb: [number, number, number] = [
+  // Brighter LEDs look whiter; dimmer ones keep more of their hue.
+  const k = FLAT_WASH * (0.25 + 0.55 * perceived);
+  const flatRgb: [number, number, number] = [
     hueRgb[0] + (255 - hueRgb[0]) * k,
     hueRgb[1] + (255 - hueRgb[1]) * k,
     hueRgb[2] + (255 - hueRgb[2]) * k,
@@ -59,8 +65,7 @@ export function ledColor(hex: string): LedColor {
     intensity,
     perceived,
     hue: toHex(hueRgb),
-    core: toHex(coreRgb),
-    bloom: 0.12 + 0.5 * perceived,
+    flat: toHex(flatRgb),
     off: max === 0,
   };
 }
@@ -78,14 +83,8 @@ export function scaleHex(hex: string, percent: number): string {
   return toHex([r * k, g * k, b * k]);
 }
 
-/** CSS for a small square/round swatch that reads like a lit LED. */
+/** CSS for a small swatch, in the same flat colour a key of that value gets. */
 export function swatchStyle(hex: string): string {
   const c = ledColor(hex);
-  if (c.off) return "background: var(--panel-2)";
-  return (
-    `background: radial-gradient(circle at 50% 38%, ${c.core}, ${c.hue});` +
-    ` box-shadow: 0 0 ${(4 + 8 * c.perceived).toFixed(1)}px ${c.hue}${Math.round(c.bloom * 255)
-      .toString(16)
-      .padStart(2, "0")}`
-  );
+  return `background: ${c.off ? "var(--panel-2)" : c.flat}`;
 }

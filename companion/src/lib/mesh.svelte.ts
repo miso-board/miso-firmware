@@ -161,7 +161,7 @@ export function parseMeshLine(line: string): boolean {
   return true; // an unrecognised MESH line is still ours; don't log it as junk
 }
 
-/** Reset to the solo fallback (on disconnect, or when simulating). */
+/** Reset to the solo fallback (on disconnect). */
 export function resetMesh(): void {
   mesh.boards = [SOLO];
   mesh.ports = [];

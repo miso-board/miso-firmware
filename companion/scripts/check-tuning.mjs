@@ -106,7 +106,7 @@ section("1. golden: 31-EDO output is unchanged from the pre-change code");
     const cents = totalCents - note * 100;
     return { note, bend: 8192 + Math.round((cents / 4800) * 8192) };
   };
-  for (const id of ["bosanquet", "wicki-hayden"]) {
+  for (const id of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
     const m = pitchMapFor({ layout: id });
     for (const [x, y] of gridCoords(1)) {
       const p = generatePitchAt(m.generator, x, y);
@@ -130,13 +130,15 @@ section("2. anchor: SPN note on a key reproduces the compiled-in anchors");
   ok(b.w === 23 && b.h === 7, "Bosanquet D4 on (3,3) is (23,7)", `got (${b.w},${b.h})`);
   const wh = anchorVec(pitchMapFor({ layout: "wicki-hayden" }).generator);
   ok(wh.w === 29 && wh.h === 13, "Wicki-Hayden D4 on (3,3) is (29,13)", `got (${wh.w},${wh.h})`);
-  for (const id of ["bosanquet", "wicki-hayden"]) {
+  const ht = anchorVec(pitchMapFor({ layout: "harmonic-table" }).generator);
+  ok(ht.w === 23 && ht.h === 13, "Harmonic Table D4 on (3,3) is (23,13)", `got (${ht.w},${ht.h})`);
+  for (const id of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
     const a = anchorVec(pitchMapFor({ layout: id }).generator);
     ok(a.w === LAYOUTS[id].anchor.w && a.h === LAYOUTS[id].anchor.h,
        `${id} derived anchor matches LAYOUTS literal`);
   }
   // The anchor note must land on the anchor key, whatever the layout or note.
-  for (const id of ["bosanquet", "wicki-hayden"]) {
+  for (const id of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
     for (const note of ["C4", "D4", "F#3", "Bb5"]) {
       for (const key of [[3, 3], [0, 0], [6, 4]]) {
         const g = pitchMapFor({ layout: id, anchorNote: note, anchorKey: key }).generator;
@@ -161,6 +163,19 @@ section("3. wire frame: matrix fields are read and signed correctly");
   ok(String(read("bosanquet")) === "1,0,0,1", "Bosanquet matrix is identity", String(read("bosanquet")));
   ok(String(read("wicki-hayden")) === "1,-2,0,-1", "Wicki-Hayden matrix is (1,-2,0,-1)",
      String(read("wicki-hayden")));
+  ok(String(read("harmonic-table")) === "2,-1,0,-1", "Harmonic Table matrix is (2,-1,0,-1)",
+     String(read("harmonic-table")));
+  // The three hex directions are a major third, a fifth and a minor third.
+  {
+    const g = pitchMapFor({ layout: "harmonic-table" }).generator;
+    const step = (dx, dy) => {
+      const a = generatePitchAt(g, 3, 3), b = generatePitchAt(g, 3 + dx, 3 + dy);
+      return `${b.w - a.w},${b.h - a.h}`;
+    };
+    ok(step(1, 0) === "2,0", "Harmonic Table +x is a major third", step(1, 0));
+    ok(step(1, -1) === "3,1", "Harmonic Table up-right is a fifth", step(1, -1));
+    ok(step(0, -1) === "1,1", "Harmonic Table up-left is a minor third", step(0, -1));
+  }
   const f = pitchFrame(defaultPitchMap());
   ok(f.length === 17, "frame is 17 bytes", String(f.length));
   ok(f[0] === 0x50, "frame starts with 'P'");
@@ -209,7 +224,7 @@ section("5. app (meantonal) vs firmware (int32) across tunings and layouts");
   for (const tuning of tunings) {
     ok(tuningError(tuning) === null, `tuning ${JSON.stringify(tuning)} is accepted`,
        String(tuningError(tuning)));
-    for (const id of ["bosanquet", "wicki-hayden"]) {
+    for (const id of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
       const m = pitchMapFor({ layout: id, tuning });
       const frame = pitchFrame(m);
       for (const [x, y] of gridCoords(4)) {
@@ -250,7 +265,7 @@ section("5. app (meantonal) vs firmware (int32) across tunings and layouts");
 section("6. 12-TET self-check: whole notes, centred bends");
 {
   const tuning = { kind: "fifth", cents: 700 };
-  for (const id of ["bosanquet", "wicki-hayden"]) {
+  for (const id of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
     const m = pitchMapFor({ layout: id, tuning });
     const frame = pitchFrame(m);
     for (const [x, y] of gridCoords(4)) {
@@ -336,6 +351,83 @@ section("9. overrides: layered on, never materialised");
   ok(Number.isFinite(far.w) && Number.isFinite(far.h),
      "an unseen coordinate still resolves", `(${far.w},${far.h})`);
   ok(m.generator !== undefined, "the generator is never removed");
+}
+
+// --- 10. colour partitions --------------------------------------------------
+
+section("10. colour partitions: accidental rows are a special case; 7 + 5 repeats every 12");
+{
+  const {
+    defaultGenerator, generateColorAt, partitionsFromAccidentals, partitionIndexAt,
+    asAccidentalScheme, colorgenFrame, fifthsOf, fifthsName,
+  } = await import("../src/lib/colorMaps.ts");
+
+  ok(fifthsOf(SPN.toPitch("F4")) === 0 && fifthsOf(SPN.toPitch("F#4")) === 7 &&
+     fifthsOf(SPN.toPitch("Bb4")) === -1, "fifths position: F = 0, F♯ = 7, B♭ = −1");
+  ok(fifthsName(0) === "F" && fifthsName(6) === "B" && fifthsName(7) === "F♯" &&
+     fifthsName(-1) === "B♭", "fifths positions are named correctly");
+
+  // Saying the accidental scheme as partitions must not move a single colour,
+  // and must still be something the firmware's frame can carry, byte for byte.
+  for (const startAccidental of [-2, 0, 1, -7]) {
+    for (const palette of [["#fa1414"], ["#fa1414", "#32fa32"], defaultGenerator().palette]) {
+      const acc = { ...defaultGenerator(), palette, startAccidental, lightenCDE: true };
+      const part = { ...acc, scheme: "partitions", ...partitionsFromAccidentals(acc) };
+      for (const id of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
+        const g = pitchMapFor({ layout: id }).generator;
+        let same = true;
+        for (const [x, y] of gridCoords(4)) {
+          if (generateColorAt(acc, g, x, y) !== generateColorAt(part, g, x, y)) same = false;
+        }
+        ok(same, `partitions of 7 colour like accidentals (${id}, start ${startAccidental}, ${palette.length} rows)`);
+        // The start accidental may differ by a whole number of palettes, which
+        // changes nothing on any key, so compare what the board would draw.
+        const back = asAccidentalScheme(part);
+        const viaFrame = { ...acc, ...back };
+        let frameSame = back !== null;
+        for (const [x, y] of gridCoords(4)) {
+          if (back && generateColorAt(viaFrame, g, x, y) !== generateColorAt(acc, g, x, y)) frameSame = false;
+        }
+        ok(frameSame && colorgenFrame(part, g) !== null,
+           `…and still fit the firmware's frame (${id}, start ${startAccidental})`);
+      }
+    }
+  }
+
+  // Seven then five, F starting the sevens.
+  const sevenFive = {
+    ...defaultGenerator(), scheme: "partitions",
+    partitions: [{ width: 7, color: "#ffffff" }, { width: 5, color: "#000001" }],
+    anchorLetter: 0, anchorPartition: 0,
+  };
+  const at = (note) => partitionIndexAt(sevenFive, fifthsOf(SPN.toPitch(note)));
+  ok(["F4", "C4", "G4", "D4", "A4", "E4", "B4"].every((n) => at(n) === 0), "7 + 5: the naturals are partition 1");
+  ok(["F#4", "C#4", "G#4", "D#4", "A#4"].every((n) => at(n) === 1), "7 + 5: the five sharps are partition 2");
+  ok(at("E#4") === 0 && at("B#4") === 0, "7 + 5: E♯ and B♯ wrap round to the naturals' colour");
+  ok(["Bb4", "Eb4", "Ab4", "Db4", "Gb4"].every((n) => at(n) === 1), "7 + 5: the five flats share the sharps' colour");
+  ok(at("Cb4") === 0, "7 + 5: C♭ wraps round to the naturals' colour");
+  ok(asAccidentalScheme(sevenFive) === null &&
+     colorgenFrame(sevenFive, defaultPitchMap().generator) === null,
+     "7 + 5 is not an accidental scheme, so older firmware gets no parameter frame");
+  {
+    const f = colorgenFrame(sevenFive, defaultPitchMap().generator, true);
+    ok(f !== null && f.length === 41 && f[14] === 0x82 && f[13] === 0 &&
+       f[17 + 18] === 7 && f[17 + 19] === 5,
+       "…but firmware with partitions gets one: 0x80|2, origin 0, widths 7 and 5");
+    const seven = { ...sevenFive, partitions: Array.from({ length: 7 }, () => ({ width: 3, color: "#010101" })) };
+    ok(colorgenFrame(seven, defaultPitchMap().generator, true) === null,
+       "seven partitions do not fit the frame");
+  }
+
+  // Moving the anchor slides the whole pattern.
+  const fromC = { ...sevenFive, anchorLetter: 1 };
+  const atC = (note) => partitionIndexAt(fromC, fifthsOf(SPN.toPitch(note)));
+  ok(atC("C4") === 0 && atC("F#4") === 0 && atC("F4") === 1 && atC("C#4") === 1,
+     "anchoring on C starts the sevens at C: C…F♯, then C♯…");
+  const onSecond = { ...sevenFive, anchorPartition: 1 };
+  const at2 = (note) => partitionIndexAt(onSecond, fifthsOf(SPN.toPitch(note)));
+  ok(at2("F4") === 1 && at2("A4") === 1 && at2("E4") === 0 && at2("Bb4") === 0,
+     "anchoring F on the second partition starts the fives at F");
 }
 
 // --- summary ---------------------------------------------------------------

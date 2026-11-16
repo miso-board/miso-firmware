@@ -99,6 +99,20 @@ export function axialToPixel(x: number, y: number, size = 1): [number, number] {
   return [size * (px * c + py * s), size * (-px * s + py * c)];
 }
 
+/**
+ * SVG `points` for the hexagon of a key centred at (cx, cy), rotated with the
+ * grid so neighbouring keys stay edge to edge.
+ */
+export function hexPoints(cx: number, cy: number, r: number): string {
+  const rotDeg = (BOARD_ROTATION * 180) / Math.PI;
+  const pts: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    const a = ((60 * i - 90 - rotDeg) * Math.PI) / 180;
+    pts.push(`${(cx + r * Math.cos(a)).toFixed(1)},${(cy + r * Math.sin(a)).toFixed(1)}`);
+  }
+  return pts.join(" ");
+}
+
 /** Rotated screen position of each LED, in units of the hex radius. */
 export const LED_PIXEL: readonly (readonly [number, number])[] = LED_POS.map(([x, y]) =>
   axialToPixel(x, y),

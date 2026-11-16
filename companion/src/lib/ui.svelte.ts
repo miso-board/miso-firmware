@@ -29,22 +29,17 @@ export interface KeyEvent {
   /** Absolute grid coordinate. Firmware before 0.6.0 omits it. */
   x: number;
   y: number;
-  at: string; // wall-clock HH:MM:SS.mmm
 }
 
 export const ui = $state({
   connected: false,
   serialSupported: true,
   serialBlocked: false, // SecurityError: embedded context without serial permission
-  scanHz: null as number | null,
   /** Firmware version from the INFO line's `fw=miso X.Y.Z`, null until seen. */
   fwVersion: null as string | null,
-  fps: 0,
-  badFrames: 0,
   toast: "",
   rows: [] as Row[],
   traces: [] as TraceMeta[],
-  events: [] as KeyEvent[],
   /** Currently-held keys anywhere in the grid, keyed "x,y". */
   held: {} as Record<string, boolean>,
 });
@@ -68,8 +63,6 @@ export function fwAtLeast(major: number, minor: number, patch = 0): boolean {
 }
 
 export function pushEvent(ev: KeyEvent): void {
-  ui.events.unshift(ev);
-  if (ui.events.length > 12) ui.events.pop();
   const k = `${ev.x},${ev.y}`;
   if (ev.kind === "DOWN") ui.held[k] = true;
   else delete ui.held[k];

@@ -11,9 +11,10 @@ second implementation of "what colour is this key" on the other side of a wire.
      `colorgen_for_xy` and `colorgen_params_apply` VERBATIM from Core/Src/main.c,
      so what runs here is the firmware's code rather than a paraphrase of it.
   2. Compiles them with clang and feeds them real `K` frames built by the
-     companion's own `colorgenFrame`, over both layouts, palettes of one to eight
-     colours, four brightnesses, the C/D/E tint on and off, two placement offsets
-     and a four-board grid.
+     companion's own `colorgenFrame`, over all three layouts, palettes of one to eight
+     colours, four brightnesses, the C/D/E tint on and off, two anchor placements
+     and a four-board grid. The geometry comes from a pitch generator, as it does
+     in the app: colour rows follow the pitch mapping.
   3. Diffs the result against `generateColorAt` -- the companion's actual
      authoring path, which asks meantonal for the accidental. Unlike the pitch
      check, no JS mirror of the integer arithmetic is needed: the reference here
@@ -62,12 +63,24 @@ PALETTE_POOL = [
     "#3232fa", "#7f7f7f", "#010203", "#fffefd",
 ]
 
+PARTITION_WIDTHS = [
+    [7, 5],
+    [12],
+    [1],
+    [3, 4, 5],
+    [7, 7, 7],
+    [5, 7, 5, 7, 5, 7],
+    [31, 31, 31, 31, 31, 31],
+    [1, 31, 2],
+]
+
 CONFIG_AXES = {
-    "layout": ["bosanquet", "wicki-hayden"],
+    "layout": ["bosanquet", "wicki-hayden", "harmonic-table"],
     "palette_n": [1, 2, 3, 5, 8],
     "brightness": [1, 10, 60, 100],
     "lightenCDE": [False, True],
-    "offset": [[0, 0], [3, -1]],
+    # The pitch generator's anchor: where the rows fall.
+    "anchor": [["D4", [3, 3]], ["F#3", [1, 5]]],
     "startAccidental": [-2, 0],
 }
 
@@ -79,15 +92,54 @@ def configs() -> list[dict]:
         for n in CONFIG_AXES["palette_n"]:
             for brightness in CONFIG_AXES["brightness"]:
                 for lighten in CONFIG_AXES["lightenCDE"]:
-                    for offset in CONFIG_AXES["offset"]:
+                    for note, key in CONFIG_AXES["anchor"]:
                         for start in CONFIG_AXES["startAccidental"]:
                             out.append({
-                                "layout": layout,
-                                "palette": PALETTE_POOL[:n],
-                                "startAccidental": start,
-                                "offset": offset,
-                                "brightness": brightness,
-                                "lightenCDE": lighten,
+                                "colors": {
+                                    "palette": PALETTE_POOL[:n],
+                                    "startAccidental": start,
+                                    "brightness": brightness,
+                                    "lightenCDE": lighten,
+                                },
+                                "pitch": {
+                                    "layout": layout,
+                                    "tuning": {"kind": "edo", "edo": 31},
+                                    "anchorNote": note,
+                                    "anchorKey": key,
+                                    "bendSemitones": 48,
+                                },
+                            })
+    # Partition schemes: the general cut of the chain of fifths, which the
+    # accidental rows above are one instance of. Widths chosen to cover the usual
+    # two-row scheme, a single run, uneven runs, runs of seven that do NOT start
+    # on F (so are not accidental rows), and the frame's limits.
+    for layout in CONFIG_AXES["layout"]:
+        for widths in PARTITION_WIDTHS:
+            for letter in (0, 3, 6):
+                for anchor_partition in sorted({0, len(widths) - 1}):
+                    for brightness, lighten in ((10, False), (100, True), (1, True)):
+                        for note, key in CONFIG_AXES["anchor"]:
+                            out.append({
+                                "colors": {
+                                    "scheme": "partitions",
+                                    "partitions": [
+                                        {"width": w, "color": PALETTE_POOL[i]}
+                                        for i, w in enumerate(widths)
+                                    ],
+                                    "anchorLetter": letter,
+                                    "anchorPartition": anchor_partition,
+                                    "palette": PALETTE_POOL[:5],
+                                    "startAccidental": -2,
+                                    "brightness": brightness,
+                                    "lightenCDE": lighten,
+                                },
+                                "pitch": {
+                                    "layout": layout,
+                                    "tuning": {"kind": "edo", "edo": 31},
+                                    "anchorNote": note,
+                                    "anchorKey": key,
+                                    "bendSemitones": 48,
+                                },
                             })
     return out
 
@@ -189,6 +241,18 @@ int main(void)
   RESET(); PUT16(0, 999);           printf("REJECT matrix %d\\n",        !colorgen_params_apply(m));
   RESET(); PUT16(8, 9999);          printf("REJECT anchor %d\\n",        !colorgen_params_apply(m));
   RESET();                          printf("REJECT none %d\\n",          colorgen_params_apply(m));
+  /* partition frames: the count rides in the length byte under its top bit,
+   * with the widths over the last two palette slots */
+  #define PARTS(n, w0, w1) do {{ RESET(); m[13] = (uint8_t)(0x80 | (n)); \
+                                 m[34] = (w0); m[35] = (w1); }} while (0)
+  PARTS(0, 7, 5);                   printf("REJECT part_empty %d\\n",    !colorgen_params_apply(m));
+  PARTS(COLORGEN_PART_MAX + 1, 7, 5);
+                                    printf("REJECT part_many %d\\n",     !colorgen_params_apply(m));
+  PARTS(2, 7, 0);                   printf("REJECT width_zero %d\\n",    !colorgen_params_apply(m));
+  PARTS(2, 7, COLORGEN_WIDTH_MAX + 1);
+                                    printf("REJECT width_over %d\\n",    !colorgen_params_apply(m));
+  PARTS(2, 7, 5);                   printf("REJECT none_parts %d\\n",    colorgen_params_apply(m));
+  RESET();                          printf("REJECT none_after %d\\n",    colorgen_params_apply(m));
 
   /* 3. every frame on stdin, one 40-byte payload per line as hex, applied and
    *    evaluated over a four-board grid for diffing against the companion. */
@@ -237,7 +301,8 @@ const { configs, boards } = JSON.parse(readFileSync(process.argv[2], "utf8"));
 const hex2 = (n) => n.toString(16).padStart(2, "0");
 const out = [];
 configs.forEach((cfg, i) => {
-  const frame = colorgenFrame(cfg);
+  // true: build partition frames, as for firmware that understands them.
+  const frame = colorgenFrame(cfg.colors, cfg.pitch, true);
   if (!frame) {
     out.push(`FRAME ${i} -`);
     out.push(`ROW ${i} rejected`);
@@ -248,7 +313,7 @@ configs.forEach((cfg, i) => {
   for (let b = 0; b < boards; b++) {
     for (const [lx, ly] of LED_POS) {
       const x = lx + 5 * b, y = ly + 2 * b;
-      const hex = generateColorAt(cfg, x, y);
+      const hex = generateColorAt(cfg.colors, cfg.pitch, x, y);
       const v = parseInt(hex.slice(1), 16);
       out.push(`ROW ${i} ${x} ${y} ${(v >> 16) & 0xff} ${(v >> 8) & 0xff} ${v & 0xff}`);
     }
@@ -340,7 +405,7 @@ def main() -> int:
             checked += 1
             if rejected != "1":
                 failures += 1
-                if what == "none":
+                if what.startswith("none"):
                     print("  FAIL  a valid frame was rejected")
                 else:
                     print(f"  FAIL  a {what} frame was accepted")

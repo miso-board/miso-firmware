@@ -11,7 +11,7 @@ script closes that gap on the host:
      Core/Src/main.c, so what runs here is the firmware's code and not a
      paraphrase that can drift away from it.
   2. Compiles them with clang and runs them over every key of a four-board grid,
-     across nine tunings and both layouts.
+     across nine tunings and all three layouts.
   3. Diffs that against the same table computed by the JS mirror in
      check-tuning.mjs, which that script in turn checks against meantonal.
   4. Separately asserts the headline compatibility claim: at the compiled-in
@@ -40,8 +40,9 @@ MAIN_C = COMPANION.parent / "Core" / "Src" / "main.c"
 # Fifths in millicents: 12, 19, 31, 41, 53-EDO, 12-TET again, 1/4-comma
 # meantone, and both ends of the legal range.
 FIFTHS = [700000, 694737, 696774, 702439, 701887, 700000, 696578, 685714, 720000]
-# Bosanquet is the identity; Wicki-Hayden is w = x - 2y, h = -y.
-LAYOUTS = [((1, 0, 0, 1), (23, 7)), ((1, -2, 0, -1), (29, 13))]
+# Bosanquet is the identity; Wicki-Hayden is w = x - 2y, h = -y; the Harmonic
+# Table is w = 2x - y, h = -y.
+LAYOUTS = [((1, 0, 0, 1), (23, 7)), ((1, -2, 0, -1), (29, 13)), ((2, -1, 0, -1), (23, 13))]
 BOARDS = 4
 
 

@@ -10,8 +10,8 @@
 //
 //  - A LAYOUT is a basis change on the grid — which direction is a whole tone,
 //    which is a fifth. It lives entirely in (w, h) pitch space and so is
-//    independent of tuning: Bosanquet and Wicki-Hayden mean the same thing in
-//    any EDO.
+//    independent of tuning: Bosanquet, Wicki-Hayden and the Harmonic Table mean
+//    the same thing in any EDO.
 //  - A TUNING is one number, the width of the fifth in cents. Every tuning in
 //    the meantone family is determined by it, and an EDO is just one way to
 //    choose it. That is why this module needs no per-EDO step lattice.
@@ -19,7 +19,7 @@
 import { Pitch, Map2D, MapVec, TuningMap, SPN, WICKI_FROM } from "meantonal";
 import { cellKey } from "./layout";
 
-export type LayoutId = "bosanquet" | "wicki-hayden";
+export type LayoutId = "bosanquet" | "wicki-hayden" | "harmonic-table";
 
 export interface Layout {
   id: LayoutId;
@@ -63,6 +63,26 @@ export const LAYOUTS: Record<LayoutId, Layout> = {
     matrix: WICKI_FROM.compose(new Map2D(1, 1, 0, -1)),
     anchor: { w: 29, h: 13 }, // also D4 on the centre key
     axes: "+x whole tone · fifth up-right · fourth up-left",
+  },
+  "harmonic-table": {
+    id: "harmonic-table",
+    name: "Harmonic Table",
+    // Wicki-Hayden with its whole-tone axis exchanged for a major third (2, 0),
+    // the fifth staying up-right at (3, 1). The third hex direction is then
+    // their difference, a minor third (1, 1), so every upward triangle of keys
+    // is a major triad and every downward one a minor triad.
+    //
+    // In grid terms +x -> (2, 0) and up-right (1, -1) -> (3, 1), which leaves
+    // +y -> (-1, -1): w = 2x - y, h = -y, the matrix (2, -1, 0, -1).
+    //
+    // Its determinant is -2, not ±1, so the keys reach only every other point
+    // of (w, h) space. That is the layout, not a bug: thirds and fifths cannot
+    // build a whole tone or an octave without tempering. In 12-TET the missing
+    // half is enharmonic with the half that is there, so every pitch class
+    // still appears; in other tunings it does not.
+    matrix: new Map2D(2, -1, 0, -1),
+    anchor: { w: 23, h: 13 }, // also D4 on the centre key
+    axes: "+x major third · fifth up-right · minor third up-left",
   },
 };
 
@@ -285,7 +305,7 @@ export function matchToleranceCents(bendSemitones = MPE_BEND_SEMITONES): number 
  * A procedural pitch mapping: a layout over a tuning, pinned by one note on one
  * key.
  *
- * Note there is no `offset` here, unlike the colour generator. `pitchAt` applies
+ * Note there is no `offset` here. `pitchAt` applies
  * an offset BEFORE the matrix, so `M·(v + o) + a` means an offset and an anchor
  * are not interchangeable — under Wicki-Hayden `M·(0,1)` is `(−2,−1)`, not
  * `(0,1)`. Placement is expressed once, as `anchorNote` on `anchorKey`, which
@@ -317,13 +337,12 @@ export interface PitchOverride {
 /**
  * A preset's pitch mapping.
  *
- * `generator` is MANDATORY and is never removed — the opposite of
- * `ColorLayer.generator`. Two reasons, both load-bearing:
+ * `generator` is MANDATORY and is never removed. Two reasons, both
+ * load-bearing:
  *
  *  - The mapping has to answer for coordinates nobody has seen yet, because a
- *    board can be attached at any time. Freezing it over the current grid (the
- *    way `materialise()` does for colours) would leave a later board with no
- *    pitch at all — silent keys rather than a wrong colour.
+ *    board can be attached at any time. Freezing it over the current grid
+ *    would leave a later board with no pitch at all — silent keys.
  *  - The `P` frame carries PARAMETERS, not a table. Delete the generator and
  *    there is nothing left to send.
  *
@@ -352,8 +371,9 @@ export function defaultPitchMap(): PitchMap {
  * `anchorNote` on `anchorKey`.
  *
  * anchor = SPN(note) − M·key. With the defaults this reproduces the firmware's
- * compiled-in constants exactly — Bosanquet D4 on (3,3) gives (23, 7), and
- * Wicki-Hayden gives (29, 13), which are the literals in `LAYOUTS` above.
+ * compiled-in constants exactly — Bosanquet D4 on (3,3) gives (23, 7),
+ * Wicki-Hayden gives (29, 13) and the Harmonic Table (23, 13), which are the
+ * literals in `LAYOUTS` above.
  */
 export function anchorVec(g: PitchGenerator): { w: number; h: number } {
   const layout = LAYOUTS[g.layout];
