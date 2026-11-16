@@ -67,7 +67,7 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.8.0"
+#define FW_VERSION          "miso 0.9.0"
 #define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
@@ -121,10 +121,27 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 // A tuning is not involved: an accidental is a spelling, so the colours mean the
 // same thing in every tuning. Unlike 'P', these parameters DO travel down the
 // mesh (every board lights its own LEDs, while only the master sounds notes).
+//
+// Since 0.9.0 the same 40 bytes can instead carry a PARTITION scheme, which is
+// the general case the accidental rows are one instance of. chroma + 1 is a
+// note's position on the chain of fifths (F = 0, C = 1 ... B = 6, F# = 7), and
+// colouring is a cut of that chain into consecutive runs, repeating end to end:
+//
+//   pos   = mod(chroma + 1 - origin, sum of widths)
+//   index = the run that pos falls in
+//
+// Accidental rows are runs of 7 starting on F. Seven then five is the common
+// two-row scheme. The top bit of the palette-length byte selects the form; see
+// colorgen_params_apply() for the layout.
 #define COLORGEN_PAL_MAX      8    // palette entries; rows beyond it wrap
+#define COLORGEN_PART_MAX     6    // partitions a frame can carry (colours + widths in 24 bytes)
+#define COLORGEN_PART_FLAG    0x80 // in the palette-length byte: this is a partition scheme
+#define COLORGEN_WIDTH_MAX    31   // fifths in one partition
 #define COLORGEN_MSG_LEN      40   // payload bytes after 'K'
 _Static_assert(COLORGEN_MSG_LEN == MESH_CGEN_BYTES,
                "mesh.h's MESH_CGEN_BYTES must match COLORGEN_MSG_LEN");
+_Static_assert(16 + COLORGEN_PART_MAX * 3 + COLORGEN_PART_MAX == COLORGEN_MSG_LEN,
+               "a partition frame's colours and widths must exactly fill the palette bytes");
 #define COLORGEN_LIGHTEN_CDE  0x01 // flags bit 0: tint C, D, E paler as a landmark
 #define COLORGEN_CDE_PCT      35   // how far toward white that tint goes
 #define COLORGEN_WAIT_MS      1200 // boot: longest a child waits for colours before rippling
@@ -952,6 +969,12 @@ typedef struct {
   uint8_t flags;                /* COLORGEN_LIGHTEN_CDE */
   uint8_t brightness;           /* percent, 1..100 */
   uint8_t pal[COLORGEN_PAL_MAX][3];   /* RGB at FULL brightness */
+  /* Partition scheme. part_n == 0 means accidental rows, where start_acc and
+   * pal_n apply. With part_n set they are ignored, and pal[0..part_n-1] are the
+   * partitions' colours. */
+  uint8_t part_n;                     /* 0, or 1..COLORGEN_PART_MAX */
+  int8_t  part_origin;                /* chain-of-fifths position where partition 0 starts */
+  uint8_t part_w[COLORGEN_PART_MAX];  /* each 1..COLORGEN_WIDTH_MAX fifths */
 } colorgen_params_t;
 
 static volatile colorgen_params_t colorgen = {
@@ -959,6 +982,7 @@ static volatile colorgen_params_t colorgen = {
   -2,   /* pal[0] is the double-flat row */
   5, 0, 10,
   { {250, 20, 20}, {250, 100, 20}, {200, 200, 20}, {50, 250, 50}, {50, 50, 250} },
+  0, 0, {0},   /* accidental rows, not partitions */
 };
 
 // Whether led_background[] is generated from those parameters or was written
@@ -1003,11 +1027,28 @@ static void colorgen_for_xy(int32_t x, int32_t y, uint8_t *rgb)
   int32_t w = p.m00 * x + p.m01 * y + p.aw;
   int32_t h = p.m10 * x + p.m11 * y + p.ah;
 
-  int32_t acc = floor_div(2 * w - 5 * h + 1, 7);   /* the Bosanquet row */
+  int32_t fifths = 2 * w - 5 * h + 1;              /* chain of fifths, F = 0 */
   int32_t pc7 = mod_pos(w + h, 7);                 /* letter index, C D E = 0 1 2 */
 
-  uint8_t n = (p.pal_n == 0 || p.pal_n > COLORGEN_PAL_MAX) ? 1 : p.pal_n;
-  uint8_t idx = (uint8_t)mod_pos(acc - p.start_acc, n);   /* rows beyond the palette wrap */
+  uint8_t idx = 0;
+  if (p.part_n != 0 && p.part_n <= COLORGEN_PART_MAX) {
+    // Partitions: find the run this note falls in. The widths were validated
+    // non-zero on the way in, so the total is at least part_n.
+    int32_t total = 0;
+    for (uint8_t i = 0; i < p.part_n; i++) total += p.part_w[i];
+    if (total > 0) {
+      int32_t pos = mod_pos(fifths - p.part_origin, total);
+      int32_t end = 0;
+      for (uint8_t i = 0; i < p.part_n; i++) {
+        end += p.part_w[i];
+        if (pos < end) { idx = i; break; }
+      }
+    }
+  } else {
+    int32_t acc = floor_div(fifths, 7);            /* the Bosanquet row */
+    uint8_t n = (p.pal_n == 0 || p.pal_n > COLORGEN_PAL_MAX) ? 1 : p.pal_n;
+    idx = (uint8_t)mod_pos(acc - p.start_acc, n);  /* rows beyond the palette wrap */
+  }
 
   uint8_t lighten = (p.flags & COLORGEN_LIGHTEN_CDE) && pc7 < 3;
   for (int c = 0; c < 3; c++) {
@@ -1037,6 +1078,18 @@ static void colorgen_render(void)
 // Install a pushed generator, rejecting a frame that cannot be one. These bytes
 // come from a host, and a wild basis change would put every key on one row --
 // a uniformly coloured board with no way to tell why.
+//
+// Two layouts share the 40 bytes, told apart by the top bit of byte 13:
+//
+//   accidental rows   12 int8 start accidental | 13 palette length 1..8
+//                     16.. 8 x RGB
+//   partitions        12 int8 origin           | 13 0x80 | count, count 1..6
+//                     16.. 6 x RGB | 34.. 6 x u8 width
+//
+// Bytes 0-11 (geometry), 14 (flags) and 15 (brightness) are common. The marker
+// is in the length byte on purpose: firmware before 0.9.0 reads it as a palette
+// length over 8 and REJECTS the frame, so an old board in a mixed grid keeps the
+// colours it had rather than painting the widths as if they were colours.
 // Returns 0 if the frame was rejected.
 static uint8_t colorgen_params_apply(const uint8_t *m)
 {
@@ -1052,21 +1105,45 @@ static uint8_t colorgen_params_apply(const uint8_t *m)
     if (v[i] < -TUNE_ANCHOR_MAX || v[i] > TUNE_ANCHOR_MAX) return 0;
   }
 
+  uint8_t part_n = 0;
   uint8_t pal_n = m[13];
-  if (pal_n == 0 || pal_n > COLORGEN_PAL_MAX) return 0;
+  if (pal_n & COLORGEN_PART_FLAG) {
+    part_n = pal_n & (uint8_t)~COLORGEN_PART_FLAG;
+    if (part_n == 0 || part_n > COLORGEN_PART_MAX) return 0;
+    for (uint8_t i = 0; i < part_n; i++) {
+      uint8_t width = m[16 + COLORGEN_PART_MAX * 3 + i];
+      if (width == 0 || width > COLORGEN_WIDTH_MAX) return 0;
+    }
+  } else if (pal_n == 0 || pal_n > COLORGEN_PAL_MAX) {
+    return 0;
+  }
   uint8_t brightness = m[15];
   if (brightness == 0 || brightness > 100) return 0;
 
   colorgen.m00 = v[0]; colorgen.m01 = v[1];
   colorgen.m10 = v[2]; colorgen.m11 = v[3];
   colorgen.aw  = v[4]; colorgen.ah  = v[5];
-  colorgen.start_acc  = (int8_t)m[12];
-  colorgen.pal_n      = pal_n;
   colorgen.flags      = m[14];
   colorgen.brightness = brightness;
+  // In a partition frame the last two palette slots hold the widths, so only
+  // the first COLORGEN_PART_MAX are colours.
+  uint8_t colours = part_n ? COLORGEN_PART_MAX : COLORGEN_PAL_MAX;
   for (uint8_t i = 0; i < COLORGEN_PAL_MAX; i++) {
-    for (int c = 0; c < 3; c++) colorgen.pal[i][c] = m[16 + i * 3 + c];
+    for (int c = 0; c < 3; c++) colorgen.pal[i][c] = (i < colours) ? m[16 + i * 3 + c] : 0;
   }
+  if (part_n) {
+    colorgen.part_origin = (int8_t)m[12];
+    for (uint8_t i = 0; i < COLORGEN_PART_MAX; i++) {
+      colorgen.part_w[i] = (i < part_n) ? m[16 + COLORGEN_PART_MAX * 3 + i] : 0;
+    }
+  } else {
+    colorgen.start_acc = (int8_t)m[12];
+    colorgen.pal_n     = pal_n;
+  }
+  // Last, so a reader between two of these writes never sees partitions
+  // switched on over the previous scheme's widths. (colorgen_for_xy snapshots,
+  // but the snapshot itself is not atomic.)
+  colorgen.part_n = part_n;
   return 1;
 }
 
@@ -1080,12 +1157,21 @@ static void colorgen_params_pack(uint8_t *m)
     m[i * 2]     = (uint8_t)v[i];
     m[i * 2 + 1] = (uint8_t)((uint16_t)v[i] >> 8);
   }
-  m[12] = (uint8_t)p.start_acc;
-  m[13] = p.pal_n;
   m[14] = p.flags;
   m[15] = p.brightness;
   for (uint8_t i = 0; i < COLORGEN_PAL_MAX; i++) {
     for (int c = 0; c < 3; c++) m[16 + i * 3 + c] = p.pal[i][c];
+  }
+  if (p.part_n) {
+    m[12] = (uint8_t)p.part_origin;
+    m[13] = (uint8_t)(COLORGEN_PART_FLAG | p.part_n);
+    // Over the last two palette slots, which a partition frame does not use.
+    for (uint8_t i = 0; i < COLORGEN_PART_MAX; i++) {
+      m[16 + COLORGEN_PART_MAX * 3 + i] = p.part_w[i];
+    }
+  } else {
+    m[12] = (uint8_t)p.start_acc;
+    m[13] = p.pal_n;
   }
 }
 

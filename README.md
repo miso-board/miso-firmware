@@ -222,7 +222,7 @@ interface on the same USB-C port:
 | `B!`    | Reboot into the USB DFU bootloader (two bytes, so a stray character can't misfire) |
 | `C` + 93 bytes | Set all LED background colors: 31 × RGB, LED-chain order (a stalled frame aborts after 200 ms) |
 | `P` + 16 bytes | Set the pitch map: `int32` fifth in millicents, `int16` m00 m01 m10 m11 (grid → `(w, h)` basis change), `int16` anchor w, h. Little-endian, validated before it is installed |
-| `K` + 40 bytes | Set the **colour generator**: `int16` m00 m01 m10 m11, `int16` anchor w, h, `int8` start accidental, `u8` palette length, `u8` flags, `u8` brightness percent, then 8 × RGB. Little-endian, validated, and propagated down the mesh |
+| `K` + 40 bytes | Set the **colour generator**: `int16` m00 m01 m10 m11, `int16` anchor w, h, `int8` start accidental, `u8` palette length, `u8` flags, `u8` brightness percent, then 8 × RGB. Since 0.9.0 the length byte may instead be `0x80 \| count` for a **partition scheme**: the `int8` is then the origin and the palette bytes hold 6 × RGB followed by 6 × `u8` width. Little-endian, validated, and propagated down the mesh |
 
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
 (little-endian; checksum = byte sum of the payload).
@@ -357,6 +357,11 @@ grid *already is* that basis (`+x` a whole tone, `+y` a diatonic semitone), so
 the board, `w = x - 2y, h = -y`, i.e. the matrix `(1, -2, 0, -1)` — note that a
 vertical flip in a skewed axial basis is `(x, y) -> (x + y, -y)`, not `(x, -y)`;
 plain negation breaks hex adjacency and turns one diagonal into a major 6th.
+The **Harmonic Table** is Wicki-Hayden with the whole-tone axis exchanged for a
+major third `(2, 0)`, the fifth staying up-right: `w = 2x - y, h = -y`, the
+matrix `(2, -1, 0, -1)`, which leaves a minor third up-left. Its determinant is
+−2, so it reaches only every other point of `(w, h)` — outside 12-TET it has no
+exact whole tones or octaves, which is the layout rather than a defect.
 Because a layout lives in pitch space, it means the same thing in every tuning.
 
 A **tuning** is *one* number: the width of its fifth. Every tuning in the
@@ -725,6 +730,30 @@ three lines, taken from meantonal:
 A tuning is not involved, because an accidental is a *spelling*: the same colours
 mean the same thing in every tuning, which is why `K` and `P` are independent.
 
+Accidental rows are one instance of something more general, which 0.9.0 added.
+`chroma + 1` is a note's position on the chain of fifths (F = 0, C = 1 … B = 6,
+F♯ = 7), and a colour scheme is a **partition** of that chain into consecutive
+runs that repeat end to end:
+
+    pos   = mod(chroma + 1 - origin, sum of widths)
+    index = the run that pos falls in
+
+Runs of seven starting on F are the accidental rows; seven then five is the usual
+two-row scheme, repeating every twelve fifths. The same 40 bytes carry either
+form, told apart by the top bit of the length byte:
+
+| | byte 12 | byte 13 | bytes 16–39 |
+|---|---|---|---|
+| accidental rows | `int8` first accidental | palette length, 1–8 | 8 × RGB |
+| partitions | `int8` origin | `0x80 \| count`, count 1–6 | 6 × RGB, then 6 × `u8` width (1–31) |
+
+The frame did not grow, so the mesh relay, which treats it as 40 opaque bytes, is
+unchanged. Putting the marker in the length byte is deliberate: firmware before
+0.9.0 reads it as a palette longer than eight and **rejects** the frame, so an
+older board in a mixed grid keeps the colours it had rather than painting widths
+as colours. Six partitions is what fits; the companion sends anything larger as
+per-board `L` frames.
+
 Unlike `P`, which deliberately gets no propagation — only the master sounds notes
 — `K` travels **down the whole tree**, because every board lights its own LEDs.
 It is beaconed to children every second, carrying a sequence number bumped
@@ -917,7 +946,7 @@ compiling it on the host, and diffing it against the app:
 | Script | Extracts from `main.c` | Proves |
 |---|---|---|
 | [`companion/scripts/check-firmware-pitch.py`](companion/scripts/check-firmware-pitch.py) | `div_round`, `pitch_for_xy`, `pitch_params_apply` | 2,232 cases over nine tunings × both layouts × a four-board grid agree with the app, and the 31-EDO default is byte-identical to the step-lattice formula it replaced (124 keys) |
-| [`companion/scripts/check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) | `colorgen_params_t`, `floor_div`, `mod_pos`, `round_pct`, `colorgen_for_xy`, `colorgen_params_apply` | 39,680 cases over 320 generators × a four-board grid agree with the app, the default generator is byte-identical to `fill_bosanquet()` (31 keys), and eight malformed frames are refused |
+| [`companion/scripts/check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) | `colorgen_params_t`, `floor_div`, `mod_pos`, `round_pct`, `colorgen_for_xy`, `colorgen_params_apply` | 153,264 cases over 1,236 generators × a four-board grid — accidental rows and partition schemes — agree with the app, the default generator is byte-identical to `fill_bosanquet()` (31 keys), and fourteen frames are accepted or refused as intended |
 
 Both run from the companion, and both need `clang` and Node 24:
 

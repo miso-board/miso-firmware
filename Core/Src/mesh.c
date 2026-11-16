@@ -737,12 +737,15 @@ void mesh_dump(void)
    * topology snapshot. */
   if (cgen_have) {
     snprintf(line, sizeof(line),
-             "MESH cgen seq=%u M=%d,%d,%d,%d anchor=%d,%d start=%d n=%u flags=%u bright=%u\r\n",
+             "MESH cgen seq=%u M=%d,%d,%d,%d anchor=%d,%d %s=%d n=%u flags=%u bright=%u\r\n",
              cgen_seq,
              get16(cgen_params), get16(cgen_params + 2),
              get16(cgen_params + 4), get16(cgen_params + 6),
              get16(cgen_params + 8), get16(cgen_params + 10),
-             (int)(int8_t)cgen_params[12], cgen_params[13],
+             /* The top bit of the length byte marks a partition scheme, where
+              * byte 12 is the origin rather than the first accidental. */
+             (cgen_params[13] & 0x80u) ? "origin" : "start",
+             (int)(int8_t)cgen_params[12], cgen_params[13] & 0x7Fu,
              cgen_params[14], cgen_params[15]);
   } else {
     snprintf(line, sizeof(line), "MESH cgen none\r\n");
