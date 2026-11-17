@@ -40,7 +40,8 @@
 #define CGEN_SEQ_NONE   0xFEu   /* reported: "I have no generator" */
 #define CGEN_SEQ_SILENT 0xFFu   /* not reported: pre-0.8.0 board */
 #define COLOR_LEN   (4 + MESH_RGB_BYTES)   /* dx16 | dy16 | rgb[93] */
-#define CGEN_LEN        (1 + MESH_CGEN_BYTES)   /* seq8 | params[41] */
+#define CGEN_LEN        (1 + MESH_CGEN_BYTES)   /* seq8 | params[43] */
+#define CGEN_LEN_G      (1 + MESH_CGEN_G)       /* seq8 | params[41], from a 0.10.0 parent */
 #define CGEN_LEN_LEGACY (1 + MESH_CGEN_LEGACY)  /* seq8 | params[40], from a parent before 0.10.0 */
 
 /* --- Geometry -------------------------------------------------------------- */
@@ -448,13 +449,15 @@ static void cgen_send_children(void)
 static void on_colorgen(link_port_t p, const uint8_t *d, uint8_t len)
 {
   if (len < CGEN_LEN_LEGACY) return;
-  /* A parent before 0.10.0 beacons the 40-byte block. Upgrade it rather than
-   * ignore it, or a new board under an old one would never be coloured. Going
-   * the other way needs nothing: an old child reads the first 40 bytes of ours,
-   * and gets everything right but the landmark tint. */
+  /* An older parent beacons a shorter block: 40 bytes before 0.10.0, 41 in
+   * 0.10.0. Upgrade it rather than ignore it, or a new board under an old one
+   * would never be coloured. Going the other way needs nothing: an older child
+   * reads the leading bytes of ours, and gets everything right but what it
+   * predates — the landmark tint, and the EDO wrap. */
   uint8_t params[MESH_CGEN_BYTES];
-  if (len < CGEN_LEN) Miso_UpgradeColorGen(d + 1, params);
-  else                memcpy(params, d + 1, MESH_CGEN_BYTES);
+  if (len < CGEN_LEN_G)    Miso_UpgradeColorGen(d + 1, MESH_CGEN_LEGACY, params);
+  else if (len < CGEN_LEN) Miso_UpgradeColorGen(d + 1, MESH_CGEN_G, params);
+  else                     memcpy(params, d + 1, MESH_CGEN_BYTES);
   /* Colours flow down only. Taking this from anywhere else would let a cycle in
    * the grid hand us a set that is on its way somewhere, or loop one back. */
   if (p != parent_port) return;
@@ -709,7 +712,7 @@ void mesh_tick(uint32_t tick)
 
 void mesh_dump(void)
 {
-  char line[128];
+  char line[160];  /* the cgen line's worst case is ~150 */
 
   snprintf(line, sizeof(line),
            "MESH self=%08lX off=%d,%d depth=%d master=%u root=%08lX\r\n",
@@ -745,7 +748,7 @@ void mesh_dump(void)
    * topology snapshot. */
   if (cgen_have) {
     snprintf(line, sizeof(line),
-             "MESH cgen seq=%u M=%d,%d,%d,%d anchor=%d,%d %s=%d n=%u lighten=%02X@%u bright=%u\r\n",
+             "MESH cgen seq=%u M=%d,%d,%d,%d anchor=%d,%d %s=%d n=%u lighten=%02X@%u bright=%u wrap=%u@%d\r\n",
              cgen_seq,
              get16(cgen_params), get16(cgen_params + 2),
              get16(cgen_params + 4), get16(cgen_params + 6),
@@ -754,7 +757,8 @@ void mesh_dump(void)
               * byte 12 is the origin rather than the first accidental. */
              (cgen_params[13] & 0x80u) ? "origin" : "start",
              (int)(int8_t)cgen_params[12], cgen_params[13] & 0x7Fu,
-             cgen_params[14], cgen_params[MESH_CGEN_LEGACY], cgen_params[15]);
+             cgen_params[14], cgen_params[MESH_CGEN_LEGACY], cgen_params[15],
+             cgen_params[MESH_CGEN_G], (int)(int8_t)cgen_params[MESH_CGEN_G + 1]);
   } else {
     snprintf(line, sizeof(line), "MESH cgen none\r\n");
   }

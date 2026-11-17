@@ -457,9 +457,12 @@ section("10. colour partitions: accidental rows are a special case; 7 + 5 repeat
     ok(lightenMask({ ...g, lightenCDE: false }, "wicki-hayden") === 0 &&
        lightenMask({ ...g, lightenLetter: false }, "bosanquet") === 0,
        "each landmark has its own switch");
-    const f = colorgenFrame(g, bos, COLORGEN_CAPS_LATEST);
+    const f = colorgenFrame(g, bos, { partitions: true, lighten: true });
     ok(f !== null && f.length === 42 && f[0] === 0x47 && f[15] === 0b0010000 && f[41] === 60,
-       "current firmware gets 'G' with the letter mask and the amount");
+       "0.10.0 firmware gets 'G' with the letter mask and the amount");
+    const j = colorgenFrame(g, bos, COLORGEN_CAPS_LATEST);
+    ok(j !== null && j.length === 44 && j[0] === 0x4a && j[15] === 0b0010000 && j[41] === 60 &&
+       j[42] === 0 && j[43] === 0, "current firmware gets 'J': the same, with no wrap");
     ok(colorgenFrame(g, bos) === null && colorgenFrame(g, wh) === null,
        "older firmware cannot be sent a letter landmark, or C D E at 60%");
     const k = colorgenFrame({ ...g, lightenCDEAmount: 35 }, wh);
@@ -762,6 +765,251 @@ section("13. rotation: a mapping turns in sixths about its anchor, and the board
     const back = { ...base, rotation: 6 };
     ok(String(Object.values(layoutMatrix(back))) === String(Object.values(layoutMatrix(base))),
        `${id}: six turns is no turn`);
+  }
+}
+
+// --- 14. accidental rows wrapped to the EDO ---------------------------------
+
+section("14. wrapping accidental rows to an EDO: each note coloured once, naturals in the middle");
+{
+  const { edoWrap, generateColorAt, defaultGenerator, colorgenFrame, COLORGEN_CAPS_LATEST } =
+    await import("../src/lib/colorMaps.ts");
+  const { SELECTABLE_EDOS, edoOf } = await import("../src/lib/tuning.ts");
+
+  ok(edoWrap(12).widths.join(" ") === "2 7 3", "12-EDO wraps as 2 7 3", edoWrap(12).widths.join(" "));
+  ok(edoWrap(31).widths.join(" ") === "5 7 7 7 5", "31-EDO wraps as 5 7 7 7 5", edoWrap(31).widths.join(" "));
+  ok(edoWrap(19).widths.join(" ") === "6 7 6", "19-EDO wraps as 6 7 6");
+  ok(edoWrap(7).widths.join(" ") === "7" && edoWrap(5).widths.join(" ") === "5",
+     "7- and 5-EDO are a single run");
+
+  for (const edo of SELECTABLE_EDOS) {
+    const { widths, accidentals, naturals } = edoWrap(edo);
+    const shape = widths.join(" ");
+    ok(widths.reduce((a, b) => a + b, 0) === edo, `${edo}-EDO: the runs add up to the EDO`, shape);
+    ok(accidentals.every((a, i) => i === 0 || a === accidentals[i - 1] + 1) &&
+       accidentals[naturals] === 0 && (edo < 7 || widths[naturals] === 7),
+       `${edo}-EDO: one run per accidental in order, the naturals a whole one`, shape);
+    ok(widths.slice(1, -1).every((w) => w === 7), `${edo}-EDO: every run but the two ends is a whole seven`, shape);
+    if (edo < 7 || edo === 90) continue; // 90 is the one shape whose sharp end has to be whole
+    const below = widths.slice(0, naturals).filter((w) => w === 7).length;
+    const above = widths.slice(naturals + 1).filter((w) => w === 7).length;
+    const flatEnd = naturals > 0 && widths[0] !== 7 ? widths[0] : 0;
+    const sharpEnd = naturals < widths.length - 1 && widths[widths.length - 1] !== 7 ? widths[widths.length - 1] : 0;
+    ok(below === above, `${edo}-EDO: as many whole rows each side of the naturals`, shape);
+    ok(flatEnd < 7 && sharpEnd < 7 && sharpEnd >= flatEnd && sharpEnd - flatEnd <= 1,
+       `${edo}-EDO: both ends under seven, the sharp end larger by at most one`, shape);
+  }
+
+  // Through the real colouring path: under Bosanquet a key's fifths position is
+  // 2w − 5h + 1, so find a key for each position wanted.
+  const palette = ["#000001", "#000002", "#000003", "#000004", "#000005"]; // ♭♭ ♭ ♮ ♯ ♯♯
+  const colourAt = (edo, wrapEdo, positions) => {
+    const pitch = pitchMapFor({ tuning: { kind: "edo", edo } }).generator;
+    const gen = { ...defaultGenerator(), palette, startAccidental: -2, brightness: 100, wrapEdo };
+    const out = new Map();
+    for (let x = -60; x <= 60 && out.size < positions.length; x++) for (let y = -60; y <= 60; y++) {
+      const p = generatePitchAt(pitch, x, y);
+      const f = 2 * p.w - 5 * p.h + 1;
+      if (positions.includes(f) && !out.has(f)) out.set(f, generateColorAt(gen, pitch, x, y));
+    }
+    return out;
+  };
+  {
+    const names = { "E♭": -2, "B♭": -1, F: 0, B: 6, "F♯": 7, "C♯": 8, "G♯": 9, "D♭": -4, "A♭": -3, "D♯": 10, "E♯": 12, "C♭": -6 };
+    const c = colourAt(12, true, Object.values(names));
+    const of = (n) => c.get(names[n]);
+    ok(of("E♭") === "#000002" && of("B♭") === "#000002", "12-EDO wrapped: E♭ and B♭ are flats");
+    ok(of("F") === "#000003" && of("B") === "#000003", "…F to B are naturals");
+    ok(of("F♯") === "#000004" && of("C♯") === "#000004" && of("G♯") === "#000004", "…F♯ C♯ G♯ are sharps");
+    ok(of("D♭") === of("C♯") && of("A♭") === of("G♯") && of("D♯") === of("E♭") &&
+       of("E♯") === of("F") && of("C♭") === of("B"),
+       "…and a note spelled further out takes the colour of the note it is the same as");
+    const plain = colourAt(12, false, [names["D♭"], names["C♯"]]);
+    ok(plain.get(names["D♭"]) !== plain.get(names["C♯"]), "unwrapped, D♭ and C♯ still differ");
+  }
+  for (const edo of [12, 19, 22, 31, 41, 53]) {
+    const positions = Array.from({ length: 2 * edo }, (_, i) => i - edo);
+    const c = colourAt(edo, true, positions);
+    ok(positions.slice(0, edo).every((p) => c.get(p) === c.get(p + edo)),
+       `${edo}-EDO wrapped: the colours repeat every ${edo} fifths`);
+  }
+
+  // Only in an EDO, and only for accidental rows.
+  {
+    const meantone = pitchMapFor({ tuning: { kind: "fifth", cents: 696.578 } }).generator;
+    const gen = { ...defaultGenerator(), wrapEdo: true };
+    let same = true;
+    for (const [x, y] of gridCoords(2)) {
+      if (generateColorAt(gen, meantone, x, y) !== generateColorAt({ ...gen, wrapEdo: false }, meantone, x, y)) same = false;
+    }
+    ok(same, "a tuning that is not an EDO is not wrapped");
+    ok(edoOf({ kind: "fifth", cents: 21600 / 31 }) === 31 && edoOf({ kind: "edo", edo: 24 }) === 12,
+       "a fifth set exactly to 31-EDO's counts as 31-EDO, and 24-EDO wraps as the 12 it plays");
+    const piano = { ...gen, scheme: "piano" };
+    const p31 = pitchMapFor({ tuning: { kind: "edo", edo: 31 } }).generator;
+    ok(gridCoords(1).every(([x, y]) => generateColorAt(piano, p31, x, y) ===
+                                    generateColorAt({ ...piano, wrapEdo: false }, p31, x, y)),
+       "the toggle does nothing to the piano scheme");
+  }
+
+  // What the boards can be sent.
+  {
+    const gen = { ...defaultGenerator(), wrapEdo: true };
+    const frame = (edo, caps) => colorgenFrame(gen, pitchMapFor({ tuning: { kind: "edo", edo } }).generator, caps);
+    const older = { partitions: true, lighten: true };
+    ok(frame(12, older)?.[14] === (0x80 | 3) && frame(31, older)?.[14] === (0x80 | 5),
+       "before 0.11.0, 12- and 31-EDO wrapped go as three and five partitions");
+    ok(frame(7, older)?.[14] === 1, "…7-EDO wrapped as one accidental row");
+    ok(frame(41, older) === null && frame(53, older) === null,
+       "…and 41- and 53-EDO, more than six runs, key by key");
+    for (const edo of [12, 31, 41, 53, 72, 5]) {
+      const f = frame(edo, COLORGEN_CAPS_LATEST);
+      const dv = f && new DataView(f.buffer);
+      const period = edoOf({ kind: "edo", edo }); // 72-EDO plays, and wraps, as 12
+      ok(f !== null && f[0] === 0x4a && f[14] === 5 && f[42] === period &&
+         dv.getInt8(43) === edoWrap(period).origin,
+         `from 0.11.0, ${edo}-EDO wrapped goes as accidental rows with the EDO and window start`,
+         f ? `${f[14]} ${f[42]} ${dv.getInt8(43)}` : "no frame");
+    }
+    ok(edoWrap(12).origin === -2 && edoWrap(31).origin === -12 && edoWrap(5).origin === 1,
+       "the window starts at E♭ in 12-EDO, at 12 fifths flat of F in 31, and at C in 5");
+  }
+}
+
+// --- 15. symmetric rows and partitions -----------------------------------------
+
+section("15. symmetric rows and partitions: mirrored about the centre, then repeating");
+{
+  const {
+    expandSymmetric, symmetricFromRows, symmetricFromPartitions, generateColorAt, defaultGenerator,
+    colorgenFrame, COLORGEN_CAPS_LATEST, edoWrap,
+  } = await import("../src/lib/colorMaps.ts");
+  const { autoColorsFor } = await import("../src/lib/autoColors.ts");
+  const fifthOf = (edo) => fifthCents({ kind: "edo", edo });
+
+  const rows = { ...defaultGenerator(), symmetricRows: true, palette: ["#000001", "#000002", "#000003"], brightness: 100 };
+  const full = expandSymmetric(rows);
+  ok(full.palette.join(" ") === "#000003 #000002 #000001 #000002 #000003" && full.startAccidental === -2 &&
+     !full.symmetricRows, "rows ♮ ♯ ♯♯ write out as ♯♯ ♯ ♮ ♯ ♯♯ from ♭♭");
+
+  // Through the real colouring path, finding a key for each fifths position.
+  const colours = (gen, pitch, positions) => {
+    const out = new Map();
+    for (let x = -70; x <= 70 && out.size < positions.length; x++) for (let y = -70; y <= 70; y++) {
+      const p = generatePitchAt(pitch, x, y);
+      const f = 2 * p.w - 5 * p.h + 1;
+      if (positions.includes(f) && !out.has(f)) out.set(f, generateColorAt(gen, pitch, x, y));
+    }
+    return out;
+  };
+  {
+    // Mirror point of the chain of fifths about the naturals: F…B is 0…6, so
+    // position p mirrors to 6 − p (B ↔ F, F♯ ↔ B♭, C♯ ↔ E♭ …).
+    const pitch = defaultPitchMap().generator;
+    const positions = Array.from({ length: 71 }, (_, i) => i - 32);
+    const c = colours(rows, pitch, positions);
+    ok(positions.every((p) => !c.has(6 - p) || c.get(p) === c.get(6 - p)),
+       "every note and its mirror image about the naturals share a colour, however far out");
+    ok(c.get(0) === "#000001" && c.get(7) === "#000002" && c.get(-1) === "#000002" &&
+       c.get(14) === "#000003" && c.get(-8) === "#000003", "♮ ♯ ♯♯ as set, ♭ and ♭♭ mirroring them");
+    ok(c.get(21) === "#000003" && c.get(28) === "#000002", "past the end, the whole mirrored pattern repeats");
+  }
+  {
+    // Turning it on keeps the naturals and sharps; turning it off changes nothing on the keys.
+    const plain = { ...defaultGenerator(), startAccidental: -2 };
+    const on = { ...plain, symmetricRows: true, ...symmetricFromRows(plain) };
+    ok(on.palette.join(" ") === plain.palette.slice(2).join(" "), "symmetric rows start from ♮ and the sharps as they were");
+    const off = { ...on, ...expandSymmetric(on), symmetricRows: false };
+    ok(gridCoords(4).every(([x, y]) => generateColorAt(on, defaultPitchMap().generator, x, y) ===
+                                      generateColorAt(off, defaultPitchMap().generator, x, y)),
+       "turning symmetry off writes the mirror out, so no key changes colour");
+  }
+  {
+    // Partitions: the centre and those above, mirrored below.
+    const parts = { ...defaultGenerator(), scheme: "partitions", symmetricPartitions: true, brightness: 100,
+      partitions: [{ width: 7, color: "#00000a" }, { width: 3, color: "#00000b" }, { width: 2, color: "#00000c" }],
+      anchorLetter: 0, anchorPartition: 0 };
+    const f = expandSymmetric(parts);
+    ok(f.partitions.map((p) => p.width).join(" ") === "2 3 7 3 2" && f.anchorPartition === 2,
+       "partitions 7 | 3 2 write out as 2 3 7 3 2, the anchor on the centre");
+    const pitch = defaultPitchMap().generator;
+    const positions = Array.from({ length: 60 }, (_, i) => i - 27);
+    const c = colours(parts, pitch, positions);
+    ok(positions.every((p) => !c.has(6 - p) || c.get(p) === c.get(6 - p)),
+       "every note and its mirror image about the centre partition share a colour");
+    ok(c.get(0) === "#00000a" && c.get(7) === "#00000b" && c.get(-1) === "#00000b" && c.get(10) === "#00000c" &&
+       c.get(-4) === "#00000c" && c.get(12) === "#00000c", "centre F…B, then 3 and 2 above it and below it");
+    const from = symmetricFromPartitions({ partitions: [{ width: 5, color: "#1" }, { width: 7, color: "#2" }, { width: 5, color: "#3" }], anchorPartition: 1 });
+    ok(from.partitions.length === 2 && from.partitions[0].color === "#2" && from.anchorPartition === 0,
+       "making partitions symmetric centres them on the anchored one");
+  }
+  {
+    // With the EDO wrap: still symmetric, still repeating every EDO fifths.
+    const pitch = pitchMapFor({ tuning: { kind: "edo", edo: 31 } }).generator;
+    const gen = { ...rows, wrapEdo: true };
+    const positions = Array.from({ length: 62 }, (_, i) => i - 31);
+    const c = colours(gen, pitch, positions);
+    ok(positions.slice(0, 31).every((p) => c.get(p) === c.get(p + 31)), "wrapped to 31-EDO: repeats every 31 fifths");
+    ok(positions.every((p) => !c.has(6 - p) || c.get(p) === c.get(6 - p)), "…and is still symmetric");
+    const fr = colorgenFrame(gen, pitch, COLORGEN_CAPS_LATEST);
+    ok(fr !== null && fr[14] === 5 && fr[42] === 31 && new DataView(fr.buffer).getInt8(43) === edoWrap(31).origin,
+       "…and goes to the board as five rows wrapped to 31");
+  }
+  {
+    // Automatic colours treat the centre as home and step outward.
+    const a = autoColorsFor(rows, fifthOf(31));
+    const plain = autoColorsFor({ ...defaultGenerator(), palette: Array(5).fill("#000000"), startAccidental: -2 }, fifthOf(31));
+    ok(a.palette.join(" ") === plain.palette.slice(2).join(" "),
+       "automatic: symmetric ♮ ♯ ♯♯ take the colours five plain rows give them");
+  }
+}
+
+// --- 16. the default palette, extended ------------------------------------------
+
+section("16. the default palette extended: nine hues to ♭⁴ and ♯⁴, paler beyond, and grown for a wrap");
+{
+  const { defaultRowColor, rowsForWrap, colourDifference, hueOf } = await import("../src/lib/autoColors.ts");
+  const { defaultGenerator, edoWrap, colorgenFrame, COLORGEN_CAPS_LATEST } = await import("../src/lib/colorMaps.ts");
+
+  const def = defaultGenerator();
+  ok([-2, -1, 0, 1, 2].every((a, i) => defaultRowColor(a) === def.palette[i]), "♭♭ to ♯♯ are the default palette");
+  const nine = Array.from({ length: 9 }, (_, i) => defaultRowColor(i - 4));
+  ok(new Set(nine).size === 9, "♭⁴ to ♯⁴ are nine different colours");
+  let closest = Infinity;
+  for (let i = 0; i < 9; i++) for (let j = i + 1; j < 9; j++) closest = Math.min(closest, colourDifference(nine[i], nine[j]));
+  ok(closest >= colourDifference(def.palette[0], def.palette[1]) - 1e-9,
+     "no two of the nine are closer than the default's own ♭♭ and ♭", closest.toFixed(3));
+  ok(hueOf(defaultRowColor(3)) > 240 && hueOf(defaultRowColor(3)) < hueOf(defaultRowColor(4)) &&
+     hueOf(defaultRowColor(-3)) > hueOf(defaultRowColor(-4)), "♯♯♯ and ♯⁴ go on past blue, ♭♭♭ and ♭⁴ back from red");
+  // Further out: the nine again, paler each lap.
+  const lightness = (hex) => { const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)); return r + g + b; };
+  ok([5, 6, 7, 8, 9, 10, 11, 12, 13].every((a, i) => hueOf(defaultRowColor(a)) === hueOf(nine[i]) ||
+       Math.abs(hueOf(defaultRowColor(a)) - hueOf(nine[i])) < 2) &&
+     lightness(defaultRowColor(5)) > lightness(nine[0]) && lightness(defaultRowColor(-5)) > lightness(nine[8]),
+     "♯⁵ onward repeat the nine's hues, paler");
+  ok(defaultRowColor(3) === defaultRowColor(3), "the same accidental always gets the same colour");
+
+  // Grown for a wrap: every accidental the EDO uses gets a row, nothing is lost.
+  const grow = (edo, g = def) => rowsForWrap(g, edoWrap(edo).accidentals);
+  ok(grow(12) === null && grow(31) === null, "12- and 31-EDO need no more than the default five");
+  {
+    const g41 = grow(41);
+    ok(g41 !== null && g41.startAccidental === -3 && g41.palette.length === 7 &&
+       g41.palette.slice(1, 6).join(" ") === def.palette.join(" ") &&
+       g41.palette[0] === defaultRowColor(-3) && g41.palette[6] === defaultRowColor(3),
+       "41-EDO grows to ♭♭♭ … ♯♯♯, the five kept in the middle");
+    const g53 = grow(53);
+    ok(g53 !== null && g53.palette.length === 8 && g53.startAccidental === -3,
+       "53-EDO needs nine but gets the eight the boards can carry, the flat side giving way");
+    const pitch53 = pitchMapFor({ tuning: { kind: "edo", edo: 53 } }).generator;
+    ok(colorgenFrame({ ...def, wrapEdo: true, ...g53 }, pitch53, COLORGEN_CAPS_LATEST) !== null,
+       "…so it still goes to the board as rows");
+    const sym = grow(41, { ...def, symmetricRows: true, palette: def.palette.slice(2), startAccidental: 0 });
+    ok(sym !== null && sym.palette.length === 4 && sym.palette[3] === defaultRowColor(3),
+       "symmetric rows grow to ♮ … ♯♯♯ for 41-EDO");
+    const custom = { ...def, palette: ["#111111", "#222222", "#333333", "#444444", "#555555"] };
+    const kept = grow(41, custom);
+    ok(kept.palette.slice(1, 6).join(" ") === custom.palette.join(" "), "the user's own colours are never changed");
   }
 }
 

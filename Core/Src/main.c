@@ -67,7 +67,7 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.10.0"
+#define FW_VERSION          "miso 0.11.0"
 #define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
@@ -149,10 +149,24 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 // 0.10.0 made the landmark tint general. It used to be one flag, "lighten C, D
 // and E by 35%"; it is now a mask of which of the seven letters to lighten and
 // how far toward white, 0..100%. That needed one more byte than the 40 had, so
-// the parameter block is 41 bytes and travels as 'G'. 'K' is still accepted in
-// its old 40-byte form and upgraded on the way in (colorgen_upgrade_legacy).
-#define COLORGEN_MSG_LEN      41   // the parameter block: payload after 'G', and what the mesh relays
+// the block grew to 41 bytes and travelled as 'G'.
+//
+// 0.11.0 added WRAPPING accidental rows to an EDO. In an EDO of P notes the
+// chain of fifths repeats every P fifths, so a note spelled far enough out is
+// the same note as one nearer in; wrapped, every position is first brought into
+// one window of P fifths before its accidental is taken:
+//
+//   fifths' = origin + mod(fifths - origin, P)
+//
+// The companion chooses the window (the naturals in the middle, partial rows at
+// each end) and sends P and its first position; this does only the arithmetic.
+// Two more bytes, so the block is 43 and travels as 'J'. 'K' (40) and 'G' (41)
+// are still accepted and brought up to it on the way in (colorgen_upgrade).
+#define COLORGEN_MSG_LEN      43   // the parameter block: payload after 'J', and what the mesh relays
+#define COLORGEN_G_LEN        41   // payload after 'G', the 0.10.0 block
 #define COLORGEN_LEGACY_LEN   40   // payload after 'K', the pre-0.10.0 block
+#define COLORGEN_WRAP_PERIOD  41   // block offsets of the two wrap bytes
+#define COLORGEN_WRAP_ORIGIN  42
 _Static_assert(COLORGEN_MSG_LEN == MESH_CGEN_BYTES,
                "mesh.h's MESH_CGEN_BYTES must match COLORGEN_MSG_LEN");
 _Static_assert(16 + COLORGEN_PART_MAX * 3 + COLORGEN_PART_MAX == COLORGEN_LEGACY_LEN,
@@ -725,7 +739,7 @@ static volatile uint32_t pq_rejected = 0; // failed validation; surfaced by 'i'
 static volatile uint8_t  kq_buf[COLORGEN_MSG_LEN];
 static volatile uint8_t  kq_fill = 0;
 static volatile uint8_t  kq_active = 0;
-static volatile uint8_t  kq_want = COLORGEN_MSG_LEN;   // bytes this frame carries: 'K' 40, 'G' 41
+static volatile uint8_t  kq_want = COLORGEN_MSG_LEN;   // bytes this frame carries: 'K' 40, 'G' 41, 'J' 43
 static volatile uint8_t  kq_ready = 0;
 static volatile uint32_t kq_rejected = 0; // failed validation; surfaced by 'i'
 static volatile uint32_t last_rx_tick = 0;
@@ -1002,6 +1016,10 @@ typedef struct {
   int8_t  part_origin;                /* chain-of-fifths position where partition 0 starts */
   uint8_t part_w[COLORGEN_PART_MAX];  /* each 1..COLORGEN_WIDTH_MAX fifths */
   uint8_t lighten_pct;                /* how far toward white those letters go, 0..100 */
+  /* Accidental rows only: wrap the chain of fifths every wrap_period fifths,
+   * the window starting at wrap_origin. wrap_period == 0 means no wrap. */
+  uint8_t wrap_period;
+  int8_t  wrap_origin;
 } colorgen_params_t;
 
 static volatile colorgen_params_t colorgen = {
@@ -1011,6 +1029,7 @@ static volatile colorgen_params_t colorgen = {
   { {250, 20, 20}, {250, 100, 20}, {200, 200, 20}, {50, 250, 50}, {50, 50, 250} },
   0, 0, {0},   /* accidental rows, not partitions */
   COLORGEN_CDE_PCT,
+  0, 0,        /* not wrapped */
 };
 
 // Whether led_background[] is generated from those parameters or was written
@@ -1073,7 +1092,11 @@ static void colorgen_for_xy(int32_t x, int32_t y, uint8_t *rgb)
       }
     }
   } else {
-    int32_t acc = floor_div(fifths, 7);            /* the Bosanquet row */
+    // Wrapped to an EDO, a note spelled outside the window is the same note as
+    // one inside it, and takes that one's row.
+    int32_t f = fifths;
+    if (p.wrap_period) f = p.wrap_origin + mod_pos(f - p.wrap_origin, p.wrap_period);
+    int32_t acc = floor_div(f, 7);                 /* the Bosanquet row */
     uint8_t n = (p.pal_n == 0 || p.pal_n > COLORGEN_PAL_MAX) ? 1 : p.pal_n;
     idx = (uint8_t)mod_pos(acc - p.start_acc, n);  /* rows beyond the palette wrap */
   }
@@ -1115,7 +1138,8 @@ static void colorgen_render(void)
 //                     16.. 6 x RGB | 34.. 6 x u8 width
 //
 // Bytes 0-11 (geometry), 14 (letters to lighten), 15 (brightness) and 40 (how
-// far to lighten them) are common. The marker
+// far to lighten them) are common; 41 and 42 (the EDO wrap) belong to
+// accidental rows, and must be zero in a partition frame. The marker
 // is in the length byte on purpose: firmware before 0.9.0 reads it as a palette
 // length over 8 and REJECTS the frame, so an old board in a mixed grid keeps the
 // colours it had rather than painting the widths as if they were colours.
@@ -1150,6 +1174,8 @@ static uint8_t colorgen_params_apply(const uint8_t *m)
   if (brightness == 0 || brightness > 100) return 0;
   if (m[14] & (uint8_t)~COLORGEN_LETTERS_MASK) return 0;   /* only seven letters */
   if (m[COLORGEN_LEGACY_LEN] > 100) return 0;              /* lighten percent */
+  uint8_t wrap_period = m[COLORGEN_WRAP_PERIOD];
+  if (wrap_period != 0 && part_n != 0) return 0;           /* wrap is for accidental rows */
 
   colorgen.m00 = v[0]; colorgen.m01 = v[1];
   colorgen.m10 = v[2]; colorgen.m11 = v[3];
@@ -1157,6 +1183,8 @@ static uint8_t colorgen_params_apply(const uint8_t *m)
   colorgen.letters     = m[14];
   colorgen.lighten_pct = m[COLORGEN_LEGACY_LEN];
   colorgen.brightness  = brightness;
+  colorgen.wrap_period = wrap_period;
+  colorgen.wrap_origin = (int8_t)m[COLORGEN_WRAP_ORIGIN];
   // In a partition frame the last two palette slots hold the widths, so only
   // the first COLORGEN_PART_MAX are colours.
   uint8_t colours = part_n ? COLORGEN_PART_MAX : COLORGEN_PAL_MAX;
@@ -1179,14 +1207,18 @@ static uint8_t colorgen_params_apply(const uint8_t *m)
   return 1;
 }
 
-// Turn a pre-0.10.0 block (what 'K' carries, and what an older parent beacons)
-// into the current one. The geometry, scheme and palette are unchanged; the old
-// flags byte had one meaning, and the tint it selected was fixed at 35%.
-static void colorgen_upgrade_legacy(const uint8_t *legacy, uint8_t *m)
+// Turn an older block — what 'K' (40 bytes) or 'G' (41) carries, and what an
+// older parent beacons — into the current one. Neither wraps. The 40-byte
+// block's flags byte had one meaning, and the tint it selected was fixed at 35%.
+static void colorgen_upgrade(const uint8_t *old, uint8_t len, uint8_t *m)
 {
-  memcpy(m, legacy, COLORGEN_LEGACY_LEN);
-  m[14] = (legacy[14] & COLORGEN_LEGACY_CDE) ? COLORGEN_LETTERS_CDE : 0;
-  m[COLORGEN_LEGACY_LEN] = COLORGEN_CDE_PCT;
+  memcpy(m, old, len);
+  if (len == COLORGEN_LEGACY_LEN) {
+    m[14] = (old[14] & COLORGEN_LEGACY_CDE) ? COLORGEN_LETTERS_CDE : 0;
+    m[COLORGEN_LEGACY_LEN] = COLORGEN_CDE_PCT;
+  }
+  m[COLORGEN_WRAP_PERIOD] = 0;
+  m[COLORGEN_WRAP_ORIGIN] = 0;
 }
 
 // Serialise the live generator back into the wire block, so the master can
@@ -1202,6 +1234,8 @@ static void colorgen_params_pack(uint8_t *m)
   m[14] = p.letters;
   m[15] = p.brightness;
   m[COLORGEN_LEGACY_LEN] = p.lighten_pct;
+  m[COLORGEN_WRAP_PERIOD] = p.wrap_period;
+  m[COLORGEN_WRAP_ORIGIN] = (uint8_t)p.wrap_origin;
   for (uint8_t i = 0; i < COLORGEN_PAL_MAX; i++) {
     for (int c = 0; c < 3; c++) m[16 + i * 3 + c] = p.pal[i][c];
   }
@@ -1374,9 +1408,9 @@ void Miso_PackColorGen(uint8_t *p)
   colorgen_params_pack(p);
 }
 
-void Miso_UpgradeColorGen(const uint8_t *legacy, uint8_t *p)
+void Miso_UpgradeColorGen(const uint8_t *old, uint8_t len, uint8_t *p)
 {
-  colorgen_upgrade_legacy(legacy, p);
+  colorgen_upgrade(old, len, p);
 }
 
 void Miso_SensorCoord(uint8_t sensor, int8_t *x, int8_t *y)
@@ -1562,7 +1596,8 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       case 'P': pq_want = PITCH_LEGACY_LEN; pq_active = 1; pq_fill = 0; break;
       case 'Q': pq_want = PITCH_MSG_LEN;    pq_active = 1; pq_fill = 0; break;
       case 'K': kq_want = COLORGEN_LEGACY_LEN; kq_active = 1; kq_fill = 0; break;
-      case 'G': kq_want = COLORGEN_MSG_LEN;    kq_active = 1; kq_fill = 0; break;
+      case 'G': kq_want = COLORGEN_G_LEN;      kq_active = 1; kq_fill = 0; break;
+      case 'J': kq_want = COLORGEN_MSG_LEN;    kq_active = 1; kq_fill = 0; break;
       case 'T': topo_req = 1; break;
       case 'p': collecting_thr = 1; thr_val = 0; break;
       case 'n': scan_enabled ^= 1; break;
@@ -1830,12 +1865,13 @@ int main(void)
     }
     if (kq_ready) {
       kq_ready = 0;
-      // A 'K' arrived in the old 40-byte form; bring it up to the current block
-      // before anything else sees it, so the mesh only ever relays one format.
-      if (kq_want == COLORGEN_LEGACY_LEN) {
-        uint8_t legacy[COLORGEN_LEGACY_LEN];
-        memcpy(legacy, (const uint8_t *)kq_buf, sizeof(legacy));
-        colorgen_upgrade_legacy(legacy, (uint8_t *)kq_buf);
+      // A 'K' or 'G' arrived in an older, shorter form; bring it up to the
+      // current block before anything else sees it, so the mesh only ever
+      // relays one format.
+      if (kq_want < COLORGEN_MSG_LEN) {
+        uint8_t old[COLORGEN_MSG_LEN];
+        memcpy(old, (const uint8_t *)kq_buf, kq_want);
+        colorgen_upgrade(old, kq_want, (uint8_t *)kq_buf);
       }
       if (colorgen_params_apply((const uint8_t *)kq_buf)) {
         color_mode = COLOR_MODE_PROCEDURAL;
@@ -1854,7 +1890,7 @@ int main(void)
       pq_active = 0;   // likewise, so a truncated 'P' or 'Q' cannot wedge the parser
     }
     if (kq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
-      kq_active = 0;   // and a truncated 'K' or 'G'
+      kq_active = 0;   // and a truncated 'K', 'G' or 'J'
     }
 
     // LED rendering, decimated so the WS2812 DMA (~1.6 ms per refresh)

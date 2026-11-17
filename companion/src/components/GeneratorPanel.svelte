@@ -6,17 +6,19 @@
   // Two ways to cut the chain up: by accidental (equal slices of seven), or as
   // a hand-built list of partitions of any widths.
 
-  import { accidentalLabel } from "../lib/tuning";
+  import { accidentalLabel, edoOf } from "../lib/tuning";
   import { swatchStyle } from "../lib/ledColor";
+  import { defaultRowColor } from "../lib/autoColors";
   import {
     FIFTHS_LETTERS, PARTITIONS_MAX, PARTITION_WIDTH_MAX,
-    COLORGEN_PART_MAX, COLORGEN_PAL_MAX, LANDMARK_LETTERS, landmarkFor,
+    COLORGEN_PART_MAX, COLORGEN_PAL_MAX, LANDMARK_LETTERS, landmarkFor, edoWrap, wrapPeriod,
     defaultGenerator, fifthsName, partitionStarts, partitionsFromAccidentals,
+    expandSymmetric, symmetricFromRows, symmetricFromPartitions,
     type GeneratorParams, type Partition, type PianoColors,
   } from "../lib/colorMaps";
   import {
     activeColors, activePitch, updateColorGenerator, paintedCount, colorGenerationLimit,
-    COLORGEN_LIGHTEN_FW,
+    COLORGEN_WRAP_FW,
   } from "../lib/presets.svelte";
   import { ui } from "../lib/ui.svelte";
 
@@ -49,8 +51,16 @@
     updateGenerator({ palette, autoColors: false });
   }
 
+  // New rows continue the default colour sequence on whichever side they are
+  // added, rather than starting grey.
   function addRow() {
-    updateGenerator({ palette: [...gen.palette, "#888888"] });
+    const next = gen.symmetricRows ? gen.palette.length : gen.startAccidental + gen.palette.length;
+    updateGenerator({ palette: [...gen.palette, defaultRowColor(next)] });
+  }
+
+  function addFlatRow() {
+    const next = gen.startAccidental - 1;
+    updateGenerator({ palette: [defaultRowColor(next), ...gen.palette], startAccidental: next });
   }
 
   function removeRow(i: number) {
@@ -58,16 +68,47 @@
     updateGenerator({ palette: gen.palette.filter((_: string, j: number) => j !== i) });
   }
 
+  // Symmetric rows keep only the naturals and the sharps; turning it off writes
+  // the mirrored flats back out, so neither direction changes a key's colour.
+  function toggleSymmetricRows() {
+    if (gen.symmetricRows) {
+      const full = expandSymmetric({ ...gen, symmetricPartitions: false });
+      updateGenerator({ symmetricRows: false, palette: full.palette, startAccidental: full.startAccidental });
+    } else {
+      updateGenerator({ symmetricRows: true, ...symmetricFromRows(gen) });
+    }
+  }
+
+  function toggleSymmetricPartitions() {
+    if (gen.symmetricPartitions) {
+      const full = expandSymmetric({ ...gen, symmetricRows: false });
+      updateGenerator({
+        symmetricPartitions: false, partitions: full.partitions, anchorPartition: full.anchorPartition,
+      });
+    } else {
+      updateGenerator({ symmetricPartitions: true, ...symmetricFromPartitions(gen) });
+    }
+  }
+
   // --- by partition ---
 
-  const starts = $derived(byPartition ? partitionStarts(gen) : []);
-  const totalWidth = $derived(gen.partitions.reduce((sum, p) => sum + p.width, 0));
+  // Symmetric partitions are edited centre-first but laid out mirrored, so what
+  // they cover is read from the full list: partition i is its upper copy there.
+  const fullPartitions = $derived(expandSymmetric({ ...gen, symmetricRows: false }));
+  const mirrorShift = $derived(gen.symmetricPartitions ? gen.partitions.length - 1 : 0);
+  const starts = $derived(byPartition ? partitionStarts(fullPartitions) : []);
+  const totalWidth = $derived(fullPartitions.partitions.reduce((sum, p) => sum + p.width, 0));
   // Whether the boards can generate this themselves, or need it sent key by key.
   const limit = $derived(colorGenerationLimit());
 
+  // Wrapping accidental rows to the EDO: offered only when the tuning is one.
+  const edo = $derived(edoOf(activePitch().generator.tuning));
+  const wrapped = $derived(wrapPeriod(gen, activePitch().generator));
+  const wrapWidths = $derived(wrapped !== null ? edoWrap(wrapped).widths : []);
+
   /** The notes a partition covers, e.g. "F – B" or "F♯ – A♯". */
   function span(i: number): string {
-    const from = starts[i];
+    const from = starts[mirrorShift + i];
     const to = from + gen.partitions[i].width - 1;
     return from === to ? fifthsName(from) : `${fifthsName(from)} – ${fifthsName(to)}`;
   }
@@ -75,7 +116,7 @@
   function usePartitions() {
     // First time in: start from the accidental rows, said as partitions, so
     // switching scheme changes nothing on the keys until something is edited.
-    const seed = gen.partitions.length > 0 ? {} : partitionsFromAccidentals(gen);
+    const seed = gen.partitions.length > 0 ? {} : partitionsFromAccidentals(expandSymmetric(gen));
     updateGenerator({ scheme: "partitions", ...seed });
   }
 
@@ -107,7 +148,10 @@
 
   function addPartition() {
     if (gen.partitions.length >= PARTITIONS_MAX) return;
-    setPartitions([...gen.partitions, { width: 7, color: "#888888" }]);
+    // The next colour in the default sequence, counting outward from the centre.
+    const i = gen.partitions.length;
+    const color = defaultRowColor(gen.symmetricPartitions ? i : i - gen.anchorPartition);
+    setPartitions([...gen.partitions, { width: 7, color }]);
   }
 
   function removePartition(i: number) {
@@ -185,6 +229,17 @@
     </div>
 
     {#if scheme === "accidental"}
+      <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
+        Flats
+        <button
+          class="btn text-sm normal-case tracking-normal"
+          style={gen.symmetricRows ? "border-color: var(--accent); color: var(--accent)" : ""}
+          aria-pressed={gen.symmetricRows}
+          title="Set the naturals and the sharps; each flat takes the colour of the sharp it mirrors"
+          onclick={toggleSymmetricRows}
+        >Symmetrical</button>
+      </div>
+      {#if !gen.symmetricRows}
       <label class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
         First row is
         <select
@@ -197,7 +252,30 @@
           {/each}
         </select>
       </label>
+      {/if}
+      {#if edo !== null}
+        <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
+          Remote accidentals
+          <button
+            class="btn text-sm normal-case tracking-normal"
+            style={gen.wrapEdo ? "border-color: var(--accent); color: var(--accent)" : ""}
+            aria-pressed={gen.wrapEdo}
+            title="Colour each of the {edo} notes once. The outermost flats and sharps are trimmed so the pattern repeats every {edo} fifths, and a note spelled further out takes the colour of the note it is the same as."
+            onclick={() => updateGenerator({ wrapEdo: !gen.wrapEdo })}
+          >Wrap to {edo}-EDO</button>
+        </div>
+      {/if}
     {:else if scheme === "partitions"}
+      <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
+        Below the centre
+        <button
+          class="btn text-sm normal-case tracking-normal"
+          style={gen.symmetricPartitions ? "border-color: var(--accent); color: var(--accent)" : ""}
+          aria-pressed={gen.symmetricPartitions}
+          title="Set the centre partition and those above it; the same are laid out below it in reverse"
+          onclick={toggleSymmetricPartitions}
+        >Symmetrical</button>
+      </div>
       <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
         Starting note
         <div class="flex items-center gap-1.5 text-sm normal-case tracking-normal">
@@ -216,7 +294,9 @@
             aria-label="Which partition it starts"
             onchange={(e) => updateGenerator({ anchorPartition: +e.currentTarget.value })}
           >
-            {#each gen.partitions as _, i}<option value={i}>{i + 1}</option>{/each}
+            {#each gen.partitions as _, i}
+              <option value={i}>{gen.symmetricPartitions && i === 0 ? "centre" : i + 1}</option>
+            {/each}
           </select>
         </div>
       </div>
@@ -311,11 +391,23 @@
   {:else if scheme === "accidental"}
     <p class="m-0 mt-4 text-xs" style="color: var(--text-dim)">
       One colour per accidental. The pattern repeats for accidentals beyond the ones set here.
+      {#if gen.symmetricRows}
+        The flats mirror the sharps: ♭ takes ♯'s colour, ♭♭ takes ♯♯'s, and so on.
+      {/if}
+      {#if wrapped !== null}
+        Wrapped to {wrapped}-EDO, the fifths are coloured in runs of
+        <span class="mono" style="color: var(--text)">{wrapWidths.join(" · ")}</span>.
+      {/if}
     </p>
     <div class="mt-2 flex flex-wrap items-end gap-2">
+      {#if !gen.symmetricRows}
+        <button class="btn mb-6" onclick={addFlatRow} title="Add a row on the flat side">+ ♭ row</button>
+      {/if}
       {#each gen.palette as hex, i}
         <div class="flex flex-col items-center gap-1">
-          <span class="text-xs" style="color: var(--text-dim)">{accidentalLabel(gen.startAccidental + i)}</span>
+          <span class="text-xs" style="color: var(--text-dim)">
+            {accidentalLabel(gen.symmetricRows ? i : gen.startAccidental + i)}
+          </span>
           <div class="relative">
             <span class="block h-8 w-8 rounded-md border" style="{swatchStyle(hex)}; border-color: var(--line)"></span>
             <input
@@ -333,13 +425,16 @@
           >✕</button>
         </div>
       {/each}
-      <button class="btn mb-6" onclick={addRow}>+ row</button>
+      <button class="btn mb-6" onclick={addRow} title="Add a row on the sharp side">+ ♯ row</button>
     </div>
   {:else}
     <p class="m-0 mt-4 text-xs" style="color: var(--text-dim)">
       Each partition is a run of adjacent fifths (… B♭ F C G D A E B F♯ …) and colours every note in
       it. Together they span <b class="mono" style="color: var(--text)">{totalWidth}</b>
       fifth{totalWidth === 1 ? "" : "s"}, then repeat.
+      {#if gen.symmetricPartitions}
+        The first is the centre; the others are laid out above it as listed and below it in reverse.
+      {/if}
     </p>
     <div class="mt-2 flex flex-wrap items-stretch gap-2">
       {#each gen.partitions as part, i}
@@ -373,7 +468,8 @@
             >✕</button>
           </div>
           <span class="mono text-xs" style="color: var(--text-dim)">
-            <b style="color: var(--text)">{i + 1}</b> · {span(i)}
+            <b style="color: var(--text)">{gen.symmetricPartitions && i === 0 ? "centre" : i + 1}</b>
+            · {span(i)}{gen.symmetricPartitions && i > 0 ? " (and below)" : ""}
           </span>
         </div>
       {/each}
@@ -388,7 +484,7 @@
       {#if limit === "firmware"}
         This firmware (<span class="mono">{ui.fwVersion ?? "unknown"}</span>) can't generate this
         scheme on its own; update to
-        <b style="color: var(--text)">{COLORGEN_LIGHTEN_FW.join(".")}</b> or newer.
+        <b style="color: var(--text)">{COLORGEN_WRAP_FW.join(".")}</b> or newer.
       {:else if byPartition}
         The boards can generate up to {COLORGEN_PART_MAX} partitions on their own.
       {:else}

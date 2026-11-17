@@ -248,6 +248,19 @@ export const SELECTABLE_EDOS: readonly number[] = VALID_EDOS.filter(
 );
 
 /**
+ * The EDO a tuning plays as, or null if it is not one.
+ *
+ * A fifth typed or dragged to exactly an offered EDO's counts as that EDO —
+ * the tuning row lights the same button for it. An EDO whose fifth cannot reach
+ * all its steps plays as the smaller one it does reach (24 as 12).
+ */
+export function edoOf(t: Tuning): number | null {
+  if (tuningError(t) !== null) return null;
+  if (t.kind === "edo") return effectiveEdo(t.edo);
+  return SELECTABLE_EDOS.find((e) => Math.abs(fifthCents({ kind: "edo", edo: e }) - t.cents) < 0.0005) ?? null;
+}
+
+/**
  * Why this tuning cannot be used at all, or null if it can.
  *
  * Checked before constructing a `TuningMap`, so a half-typed number in an input

@@ -17,7 +17,7 @@
 
 import { LED_POS, cellKey } from "./layout";
 import {
-  accidentalLabel, anchorVec, generatePitchAt, layoutMatrix, type LayoutId, type PitchGenerator,
+  accidentalLabel, anchorVec, edoOf, generatePitchAt, layoutMatrix, type LayoutId, type PitchGenerator,
 } from "./tuning";
 import { scaleHex, lightenHex, parseHex } from "./ledColor";
 
@@ -73,6 +73,25 @@ export interface GeneratorParams {
    */
   autoColors: boolean;
   scheme: "accidental" | "piano" | "partitions";
+  /**
+   * "accidental" scheme, in an EDO: wrap the chain of fifths at the EDO's size,
+   * so each of its notes is coloured once rather than the rows running on into
+   * ever more remote accidentals that only repeat notes already coloured. See
+   * `edoWrap`. Ignored in a tuning that is not an EDO.
+   */
+  wrapEdo: boolean;
+  /**
+   * "accidental" scheme: the rows are mirrored about the naturals. `palette` is
+   * then centre-first — ♮, ♯, ♯♯, … — and the flats take the colours of the
+   * sharps they mirror; `startAccidental` is not used. See `expandSymmetric`.
+   */
+  symmetricRows: boolean;
+  /**
+   * "partitions" scheme: the partitions are mirrored about the first. The list
+   * is then centre-first, the partitions above it in rising fifths; the same
+   * ones are laid out below it in reverse.
+   */
+  symmetricPartitions: boolean;
   /** "piano" scheme. */
   piano: PianoColors;
   /** "partitions" scheme: the slices, in rising fifths order. */
@@ -176,6 +195,9 @@ export const DEFAULT_GENERATOR: GeneratorParams = {
   // Off by default: these are the colours a board shows with no app attached.
   autoColors: false,
   scheme: "accidental",
+  wrapEdo: false,
+  symmetricRows: false,
+  symmetricPartitions: false,
   partitions: [],
   anchorLetter: 0,
   anchorPartition: 0,
@@ -264,15 +286,160 @@ export function pianoPartitions(c: PianoColors): Partition[] {
   ];
 }
 
-/** A generator with the piano scheme spelled out as the partitions it is. */
-function resolveScheme(p: GeneratorParams): GeneratorParams {
-  if (p.scheme !== "piano") return p;
+/**
+ * Accidental rows wrapped to an EDO of `period` notes: how wide each run along
+ * the chain of fifths is, which accidental each stands for, and which run the
+ * naturals are.
+ *
+ * The naturals sit in the middle with whole accidentals of seven either side —
+ * as many as fit, always the same number each side — and the remainder is
+ * split between a partial row at each end, the sharp side taking the odd one:
+ *
+ *   12-EDO   2 7 3            E♭ B♭ · F…B · F♯ C♯ G♯
+ *   19-EDO   6 7 6
+ *   31-EDO   5 7 7 7 5
+ *
+ * Both ends are at most seven: the remainder is under fourteen, so the flat
+ * end is at most six and the sharp end at most seven (a whole row, only when
+ * the remainder is 13 — 90-EDO). An EDO smaller than seven is a single run
+ * centred on D.
+ *
+ * The flat end is never the larger, because the sharp end takes the odd one.
+ */
+export function edoWrap(period: number): {
+  widths: number[];
+  accidentals: number[];
+  naturals: number;
+  /** Where the window starts on the chain of fifths (F = 0): what the board is sent. */
+  origin: number;
+} {
+  if (period <= 7) {
+    return { widths: [period], accidentals: [0], naturals: 0, origin: 3 - Math.floor((period - 1) / 2) };
+  }
+  let k = 0; // whole accidentals each side of the naturals
+  while (period - 7 * (2 * k + 3) >= 0) k++;
+  const rest = period - 7 * (2 * k + 1);
+  const flat = Math.floor(rest / 2);
+  const sharp = rest - flat;
+  const widths: number[] = [];
+  const accidentals: number[] = [];
+  if (flat > 0) {
+    widths.push(flat);
+    accidentals.push(-(k + 1));
+  }
+  for (let a = -k; a <= k; a++) {
+    widths.push(7);
+    accidentals.push(a);
+  }
+  if (sharp > 0) {
+    widths.push(sharp);
+    accidentals.push(k + 1);
+  }
+  return { widths, accidentals, naturals: (flat > 0 ? 1 : 0) + k, origin: -(flat + 7 * k) };
+}
+
+/** The EDO a generator wraps its colours to under a tuning, or null if it does not. */
+export function wrapPeriod(g: GeneratorParams, pitchGen?: Pick<PitchGenerator, "tuning">): number | null {
+  if (g.scheme !== "accidental" || !g.wrapEdo || !pitchGen) return null;
+  return edoOf(pitchGen.tuning);
+}
+
+/** A centre-first list mirrored about its first entry: [c₂, c₁, c₀, c₁, c₂]. */
+function mirror<T>(centreFirst: readonly T[]): T[] {
+  const above = centreFirst.slice(1);
+  return [...[...above].reverse(), ...centreFirst];
+}
+
+/**
+ * A generator with any symmetric rows or partitions written out in full, as
+ * the ordinary lists they amount to. Everything that draws or sends a scheme
+ * goes through this first, so nothing else needs to know symmetry exists.
+ *
+ * The full list then repeats as any other does: rows cycle through the palette,
+ * partitions repeat end to end.
+ */
+export function expandSymmetric(p: GeneratorParams): GeneratorParams {
+  let out = p;
+  if (p.symmetricRows && p.palette.length > 0) {
+    out = {
+      ...out,
+      symmetricRows: false,
+      palette: mirror(p.palette),
+      startAccidental: -(p.palette.length - 1),
+    };
+  }
+  if (p.symmetricPartitions && p.partitions.length > 0) {
+    const anchor = Math.min(Math.max(0, p.anchorPartition ?? 0), p.partitions.length - 1);
+    out = {
+      ...out,
+      symmetricPartitions: false,
+      partitions: mirror(p.partitions),
+      // The anchor names a partition in the centre-first list; in the full one
+      // that is its copy on the upper side.
+      anchorPartition: p.partitions.length - 1 + anchor,
+    };
+  }
+  return out;
+}
+
+/**
+ * Accidental rows made symmetric: the naturals' row and every row above it,
+ * as they are now. The flat side is then taken from these.
+ */
+export function symmetricFromRows(
+  p: Pick<GeneratorParams, "palette" | "startAccidental">,
+): Pick<GeneratorParams, "palette" | "startAccidental"> {
+  const n = Math.max(1, p.palette.length);
+  const highest = Math.max(0, p.startAccidental + p.palette.length - 1);
+  return {
+    palette: Array.from({ length: highest + 1 }, (_, a) => p.palette[mod(a - p.startAccidental, n)]),
+    startAccidental: 0,
+  };
+}
+
+/**
+ * Partitions made symmetric: the anchored one becomes the centre, with the
+ * ones after it above. Its natural still starts it, so nothing moves.
+ */
+export function symmetricFromPartitions(
+  p: Pick<GeneratorParams, "partitions" | "anchorPartition">,
+): Pick<GeneratorParams, "partitions" | "anchorPartition"> {
+  const k = Math.min(Math.max(0, p.anchorPartition ?? 0), Math.max(0, p.partitions.length - 1));
+  return { partitions: p.partitions.slice(k), anchorPartition: 0 };
+}
+
+/**
+ * A generator with the piano scheme, or wrapped accidental rows, spelled out as
+ * the partitions they are — and anything symmetric written out in full.
+ */
+function resolveScheme(generator: GeneratorParams, pitchGen?: Pick<PitchGenerator, "tuning">): GeneratorParams {
+  const p = expandSymmetric(generator);
+  if (p.scheme === "piano") {
+    return {
+      ...p,
+      scheme: "partitions",
+      partitions: pianoPartitions(p.piano ?? DEFAULT_GENERATOR.piano),
+      anchorLetter: 0,
+      anchorPartition: 0,
+    };
+  }
+  const period = wrapPeriod(p, pitchGen);
+  if (period === null) return p;
+  // Each run takes its accidental's row of the palette, wrapping through it as
+  // unwrapped rows do.
+  const { widths, accidentals, naturals } = edoWrap(period);
+  const n = Math.max(1, p.palette.length);
   return {
     ...p,
     scheme: "partitions",
-    partitions: pianoPartitions(p.piano ?? DEFAULT_GENERATOR.piano),
-    anchorLetter: 0,
-    anchorPartition: 0,
+    partitions: widths.map((width, i) => ({
+      width,
+      color: p.palette[mod(accidentals[i] - p.startAccidental, n)] ?? "#000000",
+    })),
+    // The naturals' run starts on F, or for an EDO under seven, where the one
+    // run is centred on D, on the natural it starts with.
+    anchorLetter: period < 7 ? edoWrap(period).origin : 0,
+    anchorPartition: naturals,
   };
 }
 
@@ -321,8 +488,9 @@ export function partitionIndexAt(p: GeneratorParams, fifths: number): number {
  */
 export function asAccidentalScheme(
   generator: GeneratorParams,
+  pitchGen?: Pick<PitchGenerator, "tuning">,
 ): Pick<GeneratorParams, "palette" | "startAccidental"> | null {
-  const p = resolveScheme(generator);
+  const p = resolveScheme(generator, pitchGen);
   if (!usesPartitions(p)) return { palette: p.palette, startAccidental: p.startAccidental };
   if (p.partitions.some((part) => part.width !== 7)) return null;
   if (mod(partitionStarts(p)[0], 7) !== 0) return null;
@@ -346,7 +514,7 @@ export function generateColorAt(
   x: number,
   y: number,
 ): string {
-  const p = resolveScheme(generator);
+  const p = resolveScheme(generator, pitchGen);
   const pitch = generatePitchAt(pitchGen, x, y);
   let hex: string;
   if (usesPartitions(p)) {
@@ -408,7 +576,8 @@ export const COLORGEN_PAL_MAX = 8;
 export const COLORGEN_PART_MAX = 6;
 const COLORGEN_PART_FLAG = 0x80;
 
-export const COLORGEN_FRAME_LEN = 42; // 'G' + 41 payload bytes
+export const COLORGEN_FRAME_LEN = 44; // 'J' + 43 payload bytes
+export const COLORGEN_G_FRAME_LEN = 42; // 'G' + 41, for firmware 0.10.0
 export const COLORGEN_LEGACY_FRAME_LEN = 41; // 'K' + 40, for firmware before 0.10.0
 
 /** What the attached firmware's colour generator can do. */
@@ -417,10 +586,12 @@ export interface ColorgenCaps {
   partitions: boolean;
   /** 0.10.0: the `G` frame, with a letter mask and a lighten amount. */
   lighten: boolean;
+  /** 0.11.0: the `J` frame, which can wrap accidental rows to an EDO. Implies `lighten`. */
+  wrap?: boolean;
 }
 
 /** Everything current firmware can do. */
-export const COLORGEN_CAPS_LATEST: ColorgenCaps = { partitions: true, lighten: true };
+export const COLORGEN_CAPS_LATEST: ColorgenCaps = { partitions: true, lighten: true, wrap: true };
 
 /**
  * The generator parameters, as the firmware wants them — the colour counterpart
@@ -459,6 +630,11 @@ export const COLORGEN_CAPS_LATEST: ColorgenCaps = { partitions: true, lighten: t
  * means "C, D and E, by 35%" — so an older board can be sent parameters only
  * when the landmark is off or is exactly that.
  *
+ * Accidental rows wrapped to an EDO go as `J` — the `G` block with two more
+ * bytes, the EDO and where its window starts — when the firmware has it (from
+ * 0.11.0), so any EDO is generated on the board. Before that they go as the
+ * partitions they are, which fits up to 33-EDO.
+ *
  * Returns null when the scheme cannot be expressed as parameters: a palette over
  * eight rows, more than six partitions, or partitions or a landmark that the
  * attached firmware predates. The caller falls back to per-board `L` frames.
@@ -468,7 +644,10 @@ export function colorgenFrame(
   pitchGen: PitchGenerator,
   caps: ColorgenCaps = { partitions: false, lighten: false },
 ): Uint8Array | null {
-  const g = resolveScheme(generator);
+  // The board wraps rows itself if it can; otherwise spell them out as runs.
+  const period = caps.wrap ? wrapPeriod(generator, pitchGen) : null;
+  const wrap = period !== null ? { period, origin: edoWrap(period).origin } : null;
+  const g = wrap ? expandSymmetric(generator) : resolveScheme(generator, pitchGen);
   const partitionsOk = caps.partitions;
   const letters = lightenMask(g, pitchGen.layout);
   const amount = lightenPercent(g, pitchGen.layout);
@@ -492,8 +671,10 @@ export function colorgenFrame(
   const layout = { matrix: layoutMatrix(pitchGen) };
   const anchor = anchorVec(pitchGen);
 
-  const frame = new Uint8Array(caps.lighten ? COLORGEN_FRAME_LEN : COLORGEN_LEGACY_FRAME_LEN);
-  frame[0] = caps.lighten ? 0x47 : 0x4b; // 'G' : 'K'
+  const frame = new Uint8Array(
+    caps.wrap ? COLORGEN_FRAME_LEN : caps.lighten ? COLORGEN_G_FRAME_LEN : COLORGEN_LEGACY_FRAME_LEN,
+  );
+  frame[0] = caps.wrap ? 0x4a : caps.lighten ? 0x47 : 0x4b; // 'J' : 'G' : 'K'
   const dv = new DataView(frame.buffer);
   // Signed: Wicki-Hayden's matrix is (1, −2, 0, −1).
   dv.setInt16(1, layout.matrix.m00, true);
@@ -530,6 +711,10 @@ export function colorgenFrame(
 
   dv.setInt8(13, p.startAccidental);
   frame[14] = p.palette.length;
+  if (wrap) {
+    frame[42] = wrap.period;
+    dv.setInt8(43, wrap.origin);
+  }
 
   // At FULL brightness: the board scales, so that it can apply the C/D/E tint
   // first and round exactly where the host does.

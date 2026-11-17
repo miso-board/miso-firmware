@@ -39,7 +39,8 @@ extern "C" {
 #define MESH_MAX_BOARDS   16
 #define MESH_SENSORS      31   /* must match NUM_SENSORS; checked in main.c */
 #define MESH_RGB_BYTES    (MESH_SENSORS * 3)   /* RGB, LED-chain order */
-#define MESH_CGEN_BYTES   41   /* must match COLORGEN_MSG_LEN; checked in main.c */
+#define MESH_CGEN_BYTES   43   /* must match COLORGEN_MSG_LEN; checked in main.c */
+#define MESH_CGEN_G       41   /* the block 0.10.0 boards beacon */
 #define MESH_CGEN_LEGACY  40   /* the block boards before 0.10.0 beacon */
 
 void mesh_init(void);
@@ -61,7 +62,7 @@ uint8_t mesh_is_master(void);
  * us, otherwise routed down the tree. 93 bytes, RGB in LED-chain order. */
 void mesh_set_colors(int16_t x, int16_t y, const uint8_t *rgb);
 
-/* The procedural colour generator: 41 bytes of parameters that colour a key by
+/* The procedural colour generator: 43 bytes of parameters that colour a key by
  * the accidental of the pitch at its ABSOLUTE coordinate (see main.c). Unlike a
  * pitch map, which only the master needs because only the master sounds notes,
  * these travel down the whole tree -- every board lights its own LEDs, and a
@@ -88,7 +89,7 @@ void     Miso_EmitKeyUp(uint8_t sensor, int16_t x, int16_t y);
 void     Miso_ApplyColors(const uint8_t *rgb);
 uint8_t  Miso_ApplyColorGen(const uint8_t *params);   /* 0 if the params were rejected */
 void     Miso_PackColorGen(uint8_t *params);         /* the live set, as wire bytes */
-void     Miso_UpgradeColorGen(const uint8_t *legacy, uint8_t *params);  /* 40-byte block -> current */
+void     Miso_UpgradeColorGen(const uint8_t *old, uint8_t len, uint8_t *params);  /* 40/41-byte block -> current */
 void     Miso_SensorCoord(uint8_t sensor, int8_t *x, int8_t *y);
 uint32_t Miso_LocalHeldMask(void);
 void     Miso_SendText(const char *s);

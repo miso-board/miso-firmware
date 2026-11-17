@@ -310,8 +310,11 @@ export function autoColorsFor(
     rows === 2 ? autoColor(fifthCents, offset * 2, PAIR_ROWS) : autoColor(fifthCents, offset, rows);
 
   // Accidental rows: the naturals are home, and a row's offset is its accidental.
+  // Symmetric rows are ♮, ♯, ♯♯ … and stand for twice as many less one.
   const n = g.palette.length;
-  const palette = g.palette.map((_, i) => row(g.startAccidental + i, n));
+  const palette = g.symmetricRows
+    ? g.palette.map((_, i) => row(i, 2 * n - 1))
+    : g.palette.map((_, i) => row(g.startAccidental + i, n));
 
   // Piano: naturals at home, sharps and flats a pair's distance to the FLAT
   // side — the colours an accidental scheme of just ♭ and ♮ rows gets, which is
@@ -329,13 +332,17 @@ export function autoColorsFor(
 
   // Partitions: home is the one the anchor names.
   const count = g.partitions.length;
-  const partitions: Partition[] = g.partitions.map((part, i) => ({
+  // Symmetric partitions are centre-first, so the centre is home and the rest
+  // step outward from it.
+  const partitions: Partition[] = g.symmetricPartitions
+    ? g.partitions.map((part, i) => ({ ...part, color: row(i, 2 * count - 1) }))
+    : g.partitions.map((part, i) => ({
     ...part,
     // A pair of partitions is coloured as the piano pair is: the other one sits
     // to the flat side of home.
     color: row(count === 2 ? -Math.abs(signedOffset(i, g.anchorPartition ?? 0, count))
                            : signedOffset(i, g.anchorPartition ?? 0, count), count),
-  }));
+    }));
 
   return { palette, piano, partitions };
 }
@@ -348,4 +355,104 @@ export function hueOf(hex: string): number {
   if (d === 0) return 0;
   const h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
   return (h * 60 + 360) % 360;
+}
+
+// --- the default palette, extended -------------------------------------------
+//
+// The default rows already walk round the colour wheel: red (♭♭), orange (♭),
+// yellow (♮), green (♯), blue (♯♯). More accidentals continue that walk from
+// both ends into the stretch the five leave unused — on from blue through
+// violet, back from red through rose — spaced evenly by how different they
+// look, so the two sides meet in magenta without any two colours crowding.
+// That gives nine distinct hues, ♭⁴ to ♯⁴. Further out the nine come round
+// again, paler with each lap.
+
+const DEFAULT_ROWS: Readonly<Record<number, string>> = {
+  [-2]: "#fa1414",
+  [-1]: "#fa6414",
+  0: "#c8c814",
+  1: "#32fa32",
+  2: "#3232fa",
+};
+
+// The stretch of the wheel from the default blue round to its red, and the
+// four new hues spaced along it: ♯♯♯, ♯⁴, then ♭⁴, ♭♭♭ coming back to red.
+const BLUE_POSITION = positionOfHue(hueOf(DEFAULT_ROWS[2]));
+const RED_POSITION = WHEEL_LENGTH + positionOfHue(hueOf(DEFAULT_ROWS[-2]));
+const EXTRA_ROWS: Readonly<Record<number, string>> = Object.fromEntries(
+  ([[3, 1], [4, 2], [-4, 3], [-3, 4]] as const).map(([accidental, step]) => [
+    accidental,
+    colourAt(BLUE_POSITION + ((RED_POSITION - BLUE_POSITION) * step) / 5),
+  ]),
+);
+
+/** How far each further lap of the nine moves toward white. */
+const LAP_PALER = 0.35;
+
+/**
+ * The colour the default palette gives an accidental row, for any accidental:
+ * the five defaults, four more hues to ♭⁴ and ♯⁴, and beyond that the nine
+ * again, paler on each lap out.
+ */
+export function defaultRowColor(accidental: number): string {
+  const base = (((accidental + 4) % 9) + 9) % 9 - 4;
+  const lap = Math.floor((accidental + 4) / 9);
+  const hex = DEFAULT_ROWS[base] ?? EXTRA_ROWS[base];
+  if (lap === 0) return hex;
+  const k = Math.min(0.75, LAP_PALER * Math.abs(lap));
+  const [r, g, b] = parseHex(hex);
+  return toHex([r + (255 - r) * k, g + (255 - g) * k, b + (255 - b) * k]);
+}
+
+/** The most rows the boards' colour frame can carry. Mirrors COLORGEN_PAL_MAX. */
+const BOARD_ROWS_MAX = 8;
+
+/**
+ * Accidental rows grown to give every accidental an EDO wraps to a colour of
+ * its own, or null if they already do.
+ *
+ * Wrapped, an EDO uses a fixed set of accidentals — ♭ to ♯ in 12, ♭♭♭ to ♯♯♯
+ * in 41 — and rows short of that would cycle, giving a remote sharp a flat's
+ * colour. So the missing rows are added from the default sequence. Nothing is
+ * ever removed or recoloured, and the rows stop at what the boards can carry:
+ * past that (53-EDO and up), the outermost flat shares the outermost sharp's
+ * colour — the two runs that meet where the EDO wraps round.
+ */
+export function rowsForWrap(
+  g: Pick<GeneratorParams, "palette" | "startAccidental" | "symmetricRows">,
+  accidentals: readonly number[],
+): Pick<GeneratorParams, "palette" | "startAccidental"> | null {
+  const lo = Math.min(...accidentals);
+  const hi = Math.max(...accidentals);
+  const n = g.palette.length;
+
+  if (g.symmetricRows) {
+    // Centre-first: ♮, ♯, ♯♯ … mirrored, so the furthest accidental either
+    // way is what is needed — within what the mirrored list can fit.
+    const want = Math.min(Math.max(-lo, hi) + 1, Math.floor((BOARD_ROWS_MAX + 1) / 2));
+    if (want <= n) return null;
+    return {
+      palette: [...g.palette, ...Array.from({ length: want - n }, (_, i) => defaultRowColor(n + i))],
+      startAccidental: g.startAccidental,
+    };
+  }
+
+  const start = g.startAccidental;
+  const end = start + n - 1;
+  let from = Math.min(start, lo);
+  let to = Math.max(end, hi);
+  // Keep within the boards' limit, giving up the flat side's extra row first.
+  while (to - from + 1 > Math.max(BOARD_ROWS_MAX, n)) {
+    if (from < start) from++;
+    else if (to > end) to--;
+    else break;
+  }
+  if (from === start && to === end) return null;
+  return {
+    palette: Array.from({ length: to - from + 1 }, (_, i) => {
+      const a = from + i;
+      return a >= start && a <= end ? g.palette[a - start] : defaultRowColor(a);
+    }),
+    startAccidental: from,
+  };
 }

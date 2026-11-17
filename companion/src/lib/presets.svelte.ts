@@ -38,13 +38,15 @@ import {
   PARTITION_WIDTH_MAX,
   colorgenFrame,
   coloursFromLedArray,
+  edoWrap,
+  wrapPeriod,
   defaultGenerator,
   rgbForBoard,
   type ColorLayer,
   type ColorgenCaps,
   type GeneratorParams,
 } from "./colorMaps";
-import { autoColorsFor } from "./autoColors";
+import { autoColorsFor, rowsForWrap } from "./autoColors";
 import { sendBytes } from "./serial";
 import { ui, toast, fwAtLeast } from "./ui.svelte";
 import { mesh, gridCells, cellKey } from "./mesh.svelte";
@@ -76,6 +78,9 @@ export const COLORGEN_PARTITIONS_FW = [0, 9, 0] as const;
 
 /** Firmware with the `G` frame: any letters as the landmark, lightened by any amount. */
 export const COLORGEN_LIGHTEN_FW = [0, 10, 0] as const;
+
+/** Firmware with the `J` frame: accidental rows wrapped to an EDO, generated on the board. */
+export const COLORGEN_WRAP_FW = [0, 11, 0] as const;
 
 /**
  * The out-of-the-box preset.
@@ -212,6 +217,9 @@ function normaliseColorGenerator(raw: any): GeneratorParams {
   const anchorPartition = Math.round(Number(raw.anchorPartition));
   return {
     autoColors: raw.autoColors === true,
+    wrapEdo: raw.wrapEdo === true,
+    symmetricRows: raw.symmetricRows === true,
+    symmetricPartitions: raw.symmetricPartitions === true,
     // A partition scheme with no partitions has nothing to draw with.
     scheme:
       raw.scheme === "partitions" && partitions.length
@@ -390,6 +398,7 @@ export function resetColors(): void {
 export function updateColorGenerator(patch: Partial<GeneratorParams>): void {
   const m = activeColors();
   m.generator = { ...m.generator, ...patch };
+  growRowsForWrap();
   recolourFromTuning();
   schedulePush({ colors: true });
 }
@@ -413,8 +422,24 @@ export function updatePitchGenerator(patch: Partial<PitchGenerator>): void {
     "layout" in patch || "rotation" in patch || "anchorNote" in patch || "anchorKey" in patch;
   // A scheme that follows the tuning changes colour with it — the one case
   // where retuning does have to reach the LEDs.
+  const grown = "tuning" in patch && growRowsForWrap();
   const recoloured = "tuning" in patch && recolourFromTuning();
-  schedulePush({ pitch: true, colors: movesRows || recoloured });
+  schedulePush({ pitch: true, colors: movesRows || recoloured || grown });
+}
+
+/**
+ * Give every accidental the active EDO wraps to a row of its own, adding rows
+ * from the default sequence where the palette falls short (`rowsForWrap`).
+ * Returns whether rows were added.
+ */
+function growRowsForWrap(): boolean {
+  const g = activeColors().generator;
+  const period = wrapPeriod(g, activePitch().generator);
+  if (period === null) return false;
+  const grown = rowsForWrap(g, edoWrap(period).accidentals);
+  if (!grown) return false;
+  activeColors().generator = { ...g, ...grown };
+  return true;
 }
 
 /**
@@ -540,6 +565,8 @@ function colorsSignature(): string {
   return JSON.stringify({
     colors: activeColors(),
     geometry: [g.layout, g.rotation ?? 0, g.anchorNote, g.anchorKey],
+    // Wrapped rows change with the EDO; nothing else about the tuning moves a colour.
+    wrap: wrapPeriod(activeColors().generator, g),
     caps: [canPushColorgen(), colorgenCaps()],
     seen: mesh.seen,
     grid: colorsAreSelfSufficient() ? null : mesh.boards.map((b) => [b.ox, b.oy]),
@@ -612,6 +639,7 @@ export function colorgenCaps(): ColorgenCaps {
   return {
     partitions: ui.connected && fwAtLeast(...COLORGEN_PARTITIONS_FW),
     lighten: ui.connected && fwAtLeast(...COLORGEN_LIGHTEN_FW),
+    wrap: ui.connected && fwAtLeast(...COLORGEN_WRAP_FW),
   };
 }
 

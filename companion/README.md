@@ -92,7 +92,7 @@ Status lines the app parses:
 | `MESH self=… \| port=… \| board=… \| stat …` | `src/lib/mesh.svelte.ts` | the grid model |
 
 **Sending.** The app uses a deliberately small subset: `i`, `s`, `x`, `d<N>`,
-`T`, and the push commands `C`, `L`, `Q` and `G` (or `P` and `K` for firmware before 0.10.0). Everything else in the
+`T`, and the push commands `C`, `L`, `Q` and `J` (or the older `P`, `K` and `G` for firmware that predates them). Everything else in the
 firmware's table — `l`, `M`, `e`, `r`, `k`, `f`, `F`, `n`, `p<N>`, `B!` — is a
 manual diagnostic, driven from a serial terminal or the flashing scripts.
 
@@ -100,7 +100,7 @@ manual diagnostic, driven from a serial terminal or the flashing scripts.
 
 The board reports `fw=miso X.Y.Z` on its `INFO` line, from `FW_VERSION` in
 [`../Core/Src/main.c`](../Core/Src/main.c). `fwAtLeast()` in
-`src/lib/ui.svelte.ts` compares against five constants in
+`src/lib/ui.svelte.ts` compares against six constants in
 `src/lib/presets.svelte.ts`:
 
 ```ts
@@ -109,6 +109,7 @@ export const PITCH_REFERENCE_FW = [0, 10, 0] as const;  // 'Q': 'P' plus a conce
 export const COLORGEN_PUSH_FW = [0, 8, 0] as const;   // 'K'
 export const COLORGEN_PARTITIONS_FW = [0, 9, 0] as const;   // 'K' carrying partitions
 export const COLORGEN_LIGHTEN_FW = [0, 10, 0] as const;     // 'G': landmark letters and amount
+export const COLORGEN_WRAP_FW = [0, 11, 0] as const;        // 'J': accidental rows wrapped to an EDO
 ```
 
 **These gates are load-bearing, not polite.** A board that predates `P` does not
@@ -164,6 +165,35 @@ that starts one of them. The first two are special cases of the third
 (`partitionsFromAccidentals`, `pianoPartitions`), kept as modes of their own
 because they are what people mean; Piano with its centre keys is six partitions,
 exactly what the firmware's frame carries.
+
+In an EDO, accidental rows can be **wrapped** to it (`wrapEdo`, `edoWrap`): the
+chain of fifths is cut into runs that add up to the EDO, the naturals in the
+middle with as many whole rows of seven either side as fit, and the remainder
+split between a partial row at each end, the sharp end taking the odd one —
+2 7 3 in 12-EDO, 5 7 7 7 5 in 31. The pattern then repeats every EDO-many
+fifths, so a note spelled further out takes the colour of the note it is the
+same as. From firmware 0.11.0 the boards do the wrapping themselves: the app
+sends the EDO and where its window starts in a `J` frame, so any EDO is
+generated on the board. Before that it goes as the partitions it is — up to six
+runs, so up to 33-EDO — and key by key beyond that.
+
+Accidental rows and partitions can each be **symmetrical** (`symmetricRows`,
+`symmetricPartitions`): only the centre — the naturals, or the first partition —
+and what lies above it are set, and the same are laid out below it in reverse.
+The full mirrored list then repeats as any other does. `expandSymmetric` writes
+it out before anything draws or sends a scheme, so the boards see ordinary rows
+or partitions and nothing else needs to know.
+
+The **default palette extends** past its five rows (`defaultRowColor` in
+`autoColors.ts`). It is already a walk round the colour wheel, red ♭♭ to blue
+♯♯; more accidentals continue that walk from both ends — violet past blue, rose
+back from red — spaced evenly by how different they look until the two sides
+meet in magenta. That is nine hues, ♭⁴ to ♯⁴; further out the nine come round
+again, paler each lap. New rows and partitions take the next colour in that
+sequence instead of grey, and wrapping to an EDO that uses more accidentals than
+the palette has adds the missing rows (`rowsForWrap`) — never changing or
+removing one, and stopping at the eight the boards' frame carries, so in 53-EDO
+the outermost flat shares the outermost sharp's colour.
 `colorgenFrame` sends a scheme that *is* accidental rows in that form however it
 was authored (`asAccidentalScheme` decides), and otherwise as a partition frame,
 which needs firmware 0.9.0 and at most six partitions. Anything else is rendered
@@ -251,9 +281,9 @@ wire format:
 | Command | What it proves |
 |---------|----------------|
 | `npm run check` | `svelte-check`: types across the app |
-| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,495 assertions |
+| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,791 assertions |
 | `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `../Core/Src/main.c`, compiles it with clang, and diffs it against the app over nine tunings × three layouts × six concert-pitch offsets × a four-board grid — 20,088 cases, plus the byte-identical-default claim on 124 keys |
-| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 1,992 generators × a four-board grid — accidental rows, the piano scheme, partition schemes and landmark tints, 247,008 cases — plus the byte-identical-boot-pattern claim and nineteen validation cases |
+| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 2,088 generators × a four-board grid — accidental rows plain, symmetric and wrapped to EDOs from 5 to 90, the piano scheme, partition schemes and landmark tints, 258,912 cases — plus the byte-identical-boot-pattern claim and twenty-two validation cases |
 
 The 12-TET case is the one to keep: at a 700¢ fifth a wrong coefficient would not
 collapse to equal temperament, a wrong anchor would disagree with meantonal's own

@@ -191,6 +191,69 @@ def configs() -> list[dict]:
                             "bendSemitones": 48,
                         },
                     })
+    # Accidental rows wrapped to an EDO: sent as 'J', where the board does the
+    # wrapping itself, for small EDOs and large, and 90 with its whole sharp end.
+    for layout in CONFIG_AXES["layout"]:
+        for edo in (5, 7, 12, 17, 19, 22, 26, 31, 41, 53, 72, 90):
+            for start in (-2, 0):
+                out.append({
+                    "colors": {
+                        "scheme": "accidental",
+                        "wrapEdo": True,
+                        "piano": {
+                            "natural": PALETTE_POOL[0], "accidental": PALETTE_POOL[1], "centres": False,
+                            "centreNatural": PALETTE_POOL[2], "centreAccidental": PALETTE_POOL[3],
+                        },
+                        "partitions": [],
+                        "anchorLetter": 0,
+                        "anchorPartition": 0,
+                        "palette": PALETTE_POOL[:5],
+                        "startAccidental": start,
+                        "brightness": 60,
+                        **landmark(35, 0),
+                    },
+                    "pitch": {
+                        "layout": layout,
+                        "tuning": {"kind": "edo", "edo": edo},
+                        "anchorNote": "D4",
+                        "anchorKey": [3, 3],
+                        "bendSemitones": 48,
+                    },
+                })
+    # Symmetric rows and partitions: written out in full by the app, so the board
+    # sees ordinary rows or partitions — wrapped, too, for rows.
+    for layout in CONFIG_AXES["layout"]:
+        for edo, wrap in ((31, False), (31, True), (53, True), (12, True)):
+            for symmetric in ("rows", "partitions"):
+                out.append({
+                    "colors": {
+                        "scheme": "accidental" if symmetric == "rows" else "partitions",
+                        "wrapEdo": wrap,
+                        "symmetricRows": symmetric == "rows",
+                        "symmetricPartitions": symmetric == "partitions",
+                        "piano": {
+                            "natural": PALETTE_POOL[0], "accidental": PALETTE_POOL[1], "centres": False,
+                            "centreNatural": PALETTE_POOL[2], "centreAccidental": PALETTE_POOL[3],
+                        },
+                        "partitions": [
+                            {"width": 7, "color": PALETTE_POOL[4]},
+                            {"width": 3, "color": PALETTE_POOL[5]},
+                        ],
+                        "anchorLetter": 0,
+                        "anchorPartition": 0,
+                        "palette": PALETTE_POOL[:4],
+                        "startAccidental": 0,
+                        "brightness": 60,
+                        **landmark(35, 0),
+                    },
+                    "pitch": {
+                        "layout": layout,
+                        "tuning": {"kind": "edo", "edo": edo},
+                        "anchorNote": "D4",
+                        "anchorKey": [3, 3],
+                        "bendSemitones": 48,
+                    },
+                })
     return out
 
 
@@ -229,7 +292,7 @@ def build_harness(src: str, led_pos: list[list[int]]) -> str:
     round_pct = grab(src, "static uint8_t round_pct(uint32_t num, uint32_t den)")
     gen = grab(src, "static void colorgen_for_xy(int32_t x, int32_t y, uint8_t *rgb)")
     apply_fn = grab(src, "static uint8_t colorgen_params_apply(const uint8_t *m)")
-    upgrade = grab(src, "static void colorgen_upgrade_legacy(const uint8_t *legacy, uint8_t *m)")
+    upgrade = grab(src, "static void colorgen_upgrade(const uint8_t *old, uint8_t len, uint8_t *m)")
 
     pos = ",".join(f"{{{x},{y}}}" for x, y in led_pos)
     legacy = ",".join(
@@ -282,7 +345,7 @@ int main(void)
   #define PUT16(i, v) do {{ m[i] = (uint8_t)(v); m[(i)+1] = (uint8_t)((v) >> 8); }} while (0)
   #define RESET() do {{ PUT16(0,1); PUT16(2,0); PUT16(4,0); PUT16(6,1); \\
                         PUT16(8,23); PUT16(10,7); m[12]=(uint8_t)(-2); m[13]=5; \\
-                        m[14]=0; m[15]=10; m[40]=35; }} while (0)
+                        m[14]=0; m[15]=10; m[40]=35; m[41]=0; m[42]=0; }} while (0)
   RESET(); m[13] = 0;               printf("REJECT palette_empty %d\\n", !colorgen_params_apply(m));
   RESET(); m[13] = COLORGEN_PAL_MAX + 1;
                                     printf("REJECT palette_long %d\\n",  !colorgen_params_apply(m));
@@ -307,6 +370,10 @@ int main(void)
   RESET();                          printf("REJECT none_after %d\\n",    colorgen_params_apply(m));
   /* the landmark: seven letters, and a percent */
   RESET(); m[14] = 0x80;            printf("REJECT letters %d\\n",       !colorgen_params_apply(m));
+  /* the EDO wrap belongs to accidental rows */
+  PARTS(2, 7, 5); m[41] = 12;       printf("REJECT wrap_parts %d\\n",    !colorgen_params_apply(m));
+  RESET(); m[41] = 31; m[42] = (uint8_t)(-12);
+                                    printf("REJECT none_wrap %d\\n",     colorgen_params_apply(m));
   RESET(); m[40] = 101;             printf("REJECT lighten_over %d\\n",  !colorgen_params_apply(m));
   RESET(); m[14] = 0x7F; m[40] = 100;
                                     printf("REJECT none_letters %d\\n",  colorgen_params_apply(m));
@@ -314,12 +381,21 @@ int main(void)
   {{
     uint8_t legacy[COLORGEN_LEGACY_LEN];
     RESET(); memcpy(legacy, m, sizeof(legacy));
-    legacy[14] = 0x01; memset(m, 0xEE, sizeof(m)); colorgen_upgrade_legacy(legacy, m);
+    legacy[14] = 0x01; memset(m, 0xEE, sizeof(m)); colorgen_upgrade(legacy, COLORGEN_LEGACY_LEN, m);
     printf("REJECT none_legacy_cde %d\\n",
-           m[14] == 0x07 && m[40] == 35 && memcmp(m, legacy, 14) == 0 && colorgen_params_apply(m));
-    legacy[14] = 0x00; memset(m, 0xEE, sizeof(m)); colorgen_upgrade_legacy(legacy, m);
+           m[14] == 0x07 && m[40] == 35 && m[41] == 0 && m[42] == 0 &&
+           memcmp(m, legacy, 14) == 0 && colorgen_params_apply(m));
+    legacy[14] = 0x00; memset(m, 0xEE, sizeof(m)); colorgen_upgrade(legacy, COLORGEN_LEGACY_LEN, m);
     printf("REJECT none_legacy_off %d\\n",
            m[14] == 0x00 && m[40] == 35 && colorgen_params_apply(m));
+  }}
+  /* a 0.10.0 block: everything kept, and no wrap */
+  {{
+    uint8_t g[COLORGEN_G_LEN];
+    RESET(); m[14] = 0x15; m[40] = 77; memcpy(g, m, sizeof(g));
+    memset(m, 0xEE, sizeof(m)); colorgen_upgrade(g, COLORGEN_G_LEN, m);
+    printf("REJECT none_g %d\\n",
+           memcmp(m, g, COLORGEN_G_LEN) == 0 && m[41] == 0 && m[42] == 0 && colorgen_params_apply(m));
   }}
 
   /* 3. every frame on stdin, one 40-byte payload per line as hex, applied and
