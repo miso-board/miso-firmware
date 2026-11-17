@@ -217,8 +217,18 @@ generated base.
 into wire bytes, taking its matrix and anchor from the pitch generator. Changing
 the pitch layout or anchor therefore re-pushes colours as well as tuning. It returns `null` for a palette longer than the eight entries the
 frame carries, and `pushColors()` then falls back to `L` frames. Because only the
-second case needs the host at all, the 1 Hz topology poll re-pushes on a grid
-change *only* when `colorsAreSelfSufficient()` is false.
+second case needs the host at all, a change of grid re-pushes colours *only* when
+`colorsAreSelfSufficient()` is false.
+
+**The boards reflecting the app is an invariant, not a chore.** One effect in
+`App.svelte` calls `keepBoardsInSync()`, which compares what was last pushed with
+what the active preset now asks for — `pitchIsStale()` for the tuning,
+`colorsAreStale()` for the colours — and pushes whichever is behind, debounced.
+It re-runs whenever either side of those comparisons changes, which covers edits,
+preset switches, a board being attached, and the firmware version or topology
+arriving a moment after connecting (the push made at connect time happens before
+either is known, so it used to be able to send less than the board could take).
+*Send to board* remains as a way to force a push.
 
 One rounding detail constrains the split: the landmark tint is applied per key
 *before* brightness scaling and rounds on the way, so brightness cannot be folded

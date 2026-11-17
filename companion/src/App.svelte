@@ -14,9 +14,8 @@
   import {
     load as loadPresets,
     pushAll,
-    pushColors,
     resetPushed,
-    colorsAreSelfSufficient,
+    keepBoardsInSync,
   } from "./lib/presets.svelte";
 
   // Scan frames are streamed at half the scan rate: plenty for the Calibrate
@@ -26,6 +25,10 @@
   // Rest levels are captured once per connection, the first time the Calibrate
   // tab has live scans to take them from.
   let restCaptured = false;
+
+  // The boards always reflect the active preset. This re-runs whenever the
+  // preset, the grid or what the firmware can be sent changes.
+  $effect(() => keepBoardsInSync());
 
   // Only the Calibrate tab consumes scan frames, and streaming them is what
   // makes the LED chain flicker (the data line has no voltage margin — see the
@@ -114,24 +117,10 @@
     ui.serialSupported = serial.serialSupported();
     engine.onTracesChanged(refreshTraces);
     loadPresets();
-    // The grid we last pushed colours for. A procedural preset needs no watching
-    // — the boards hold the generator and colour themselves, which is the whole
-    // point of `K` — but a hand-painted one only exists as rendered tables here,
-    // so a board that appears has to be sent its own.
-    let lastGrid = "";
     const secTimer = setInterval(() => {
       if (ui.connected) {
         void serial.send("i");
         void serial.send("T"); // boards can be hot-plugged at any time
-
-        const grid = mesh.boards.map((b) => `${b.ox},${b.oy}`).join(" ");
-        if (grid !== lastGrid) {
-          // Only after the first snapshot: connect() already pushed for it.
-          if (lastGrid !== "" && !colorsAreSelfSufficient()) void pushColors();
-          lastGrid = grid;
-        }
-      } else {
-        lastGrid = "";
       }
     }, 1000);
     const rowTimer = setInterval(refreshRows, 200);

@@ -16,7 +16,7 @@
   import {
     presetState, activePreset, selectPreset, renamePreset, newPreset, duplicatePreset,
     deletePreset, savePreset, revertPreset, isDirty, anyDirty,
-    copyPresetJson, importPresetJson, pushAll, canPushPitch, pitchIsStale, PITCH_PUSH_FW,
+    copyPresetJson, importPresetJson, pushAll, canPushPitch, PITCH_PUSH_FW,
     type Preset,
   } from "../lib/presets.svelte";
   import TilingIcon from "./TilingIcon.svelte";
@@ -147,10 +147,6 @@
         <b style="color: var(--text)">{PITCH_PUSH_FW.join(".")}</b> or newer, so no tuning is sent
         until it does.
       {/if}
-    </p>
-  {:else if pitchIsStale()}
-    <p class="note" style="border-left-color: var(--warn); color: var(--warn)">
-      The board is running a different tuning from this preset — press <b>Send to board</b>.
     </p>
   {/if}
 </section>

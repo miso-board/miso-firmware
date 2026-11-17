@@ -120,6 +120,12 @@ export const presetState = $state({
   pushedPitch: null as string | null,
   /** The colour-generator frame the board is believed to be running, as hex. */
   pushedColorgen: null as string | null,
+  /**
+   * What the boards' colours were last brought up to date with — everything a
+   * colour push depends on, as one string (see `colorsSignature`). Null until
+   * the first push of a connection.
+   */
+  pushedColors: null as string | null,
 });
 
 export function activePreset(): Preset {
@@ -513,6 +519,39 @@ export function selectPreset(index: number): void {
  */
 export async function pushColors(): Promise<void> {
   if (!ui.connected) return;
+  // Taken before anything is sent: if the preset changes while frames are
+  // going out, the boards hold THIS state, and the difference is noticed.
+  const signature = colorsSignature();
+  try {
+    await sendColors();
+  } finally {
+    presetState.pushedColors = signature;
+  }
+}
+
+/**
+ * Everything a colour push depends on, as one string: the colours themselves,
+ * the geometry they follow, what the attached firmware can be sent, and — only
+ * when the boards cannot generate the scheme themselves — which boards there
+ * are, since each then needs a table of its own.
+ */
+function colorsSignature(): string {
+  const g = activePitch().generator;
+  return JSON.stringify({
+    colors: activeColors(),
+    geometry: [g.layout, g.rotation ?? 0, g.anchorNote, g.anchorKey],
+    caps: [canPushColorgen(), colorgenCaps()],
+    seen: mesh.seen,
+    grid: colorsAreSelfSufficient() ? null : mesh.boards.map((b) => [b.ox, b.oy]),
+  });
+}
+
+/** True when the boards' colours are behind the active preset. */
+export function colorsAreStale(): boolean {
+  return ui.connected && presetState.pushedColors !== colorsSignature();
+}
+
+async function sendColors(): Promise<void> {
   const m = activeColors();
   const pitchGen = activePitch().generator;
 
@@ -619,7 +658,13 @@ export async function pushPitch(): Promise<void> {
 const frameHex = (f: Uint8Array): string =>
   [...f].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-/** True when the board is running a different tuning from the active preset. */
+/**
+ * True when the board is running a different tuning from the active preset.
+ *
+ * Never for long: `keepBoardsInSync` pushes as soon as this is so. It is still
+ * exported for the MIDI monitor, which would otherwise report every note as
+ * wrong for the instant in between.
+ */
 export function pitchIsStale(): boolean {
   if (!canPushPitch()) return false;
   return presetState.pushedPitch !== frameHex(pitchFrame(activePitch(), canPushReference()));
@@ -636,6 +681,21 @@ export function canPushReference(): boolean {
  */
 export function referenceIsIgnored(): boolean {
   return canPushPitch() && !canPushReference() && referenceOffsetMilli(activePitch().generator) !== 0;
+}
+
+/**
+ * Bring the boards up to date with the active preset, if they are not.
+ *
+ * The boards showing and playing what the app shows is an invariant, not
+ * something to ask the user to restore. This is called from an effect
+ * (App.svelte) that re-runs whenever anything either side of the comparison
+ * changes — an edit, a preset switch, a board being attached, the firmware
+ * version arriving after connecting — so no caller has to remember to push.
+ * The pushes themselves stay debounced.
+ */
+export function keepBoardsInSync(): void {
+  if (!ui.connected) return;
+  schedulePush({ pitch: pitchIsStale(), colors: colorsAreStale() });
 }
 
 /** Everything, for connect time. */
@@ -667,6 +727,7 @@ export function schedulePush(what: { colors?: boolean; pitch?: boolean }): void 
 export function resetPushed(): void {
   presetState.pushedPitch = null;
   presetState.pushedColorgen = null;
+  presetState.pushedColors = null;
 }
 
 // --- interchange -----------------------------------------------------------
