@@ -6,13 +6,13 @@
   // Two ways to cut the chain up: by accidental (equal slices of seven), or as
   // a hand-built list of partitions of any widths.
 
-  import { LAYOUTS, accidentalLabel } from "../lib/tuning";
+  import { accidentalLabel } from "../lib/tuning";
   import { swatchStyle } from "../lib/ledColor";
   import {
     FIFTHS_LETTERS, PARTITIONS_MAX, PARTITION_WIDTH_MAX,
     COLORGEN_PART_MAX, COLORGEN_PAL_MAX, LANDMARK_LETTERS, landmarkFor,
     defaultGenerator, fifthsName, partitionStarts, partitionsFromAccidentals,
-    type GeneratorParams, type Partition,
+    type GeneratorParams, type Partition, type PianoColors,
   } from "../lib/colorMaps";
   import {
     activeColors, activePitch, updateColorGenerator, paintedCount, colorGenerationLimit,
@@ -23,19 +23,30 @@
   const updateGenerator = (patch: Partial<GeneratorParams>) => updateColorGenerator(patch);
 
   const gen = $derived(activeColors().generator);
-  const layoutName = $derived(LAYOUTS[activePitch().generator.layout].name);
   // The landmark is the layout's: C D E under Wicki-Hayden, one letter otherwise.
   const landmark = $derived(landmarkFor(activePitch().generator.layout));
   const landmarkOn = $derived(landmark === "cde" ? gen.lightenCDE : gen.lightenLetter);
+  // Each landmark has its own amount, so setting one layout's leaves the other's.
+  const lightenAmount = $derived(landmark === "cde" ? gen.lightenCDEAmount : gen.lightenLetterAmount);
+  function setLightenAmount(v: number) {
+    updateGenerator(landmark === "cde" ? { lightenCDEAmount: v } : { lightenLetterAmount: v });
+  }
+  const scheme = $derived<"accidental" | "piano" | "partitions">(
+    gen.scheme === "partitions" && gen.partitions.length > 0
+      ? "partitions"
+      : gen.scheme === "piano" ? "piano" : "accidental",
+  );
   const painted = $derived(paintedCount());
   const byPartition = $derived(gen.scheme === "partitions" && gen.partitions.length > 0);
 
   // --- by accidental ---
 
+  // Choosing a colour by hand is a decision to stop taking them from the
+  // tuning, so every swatch edit switches that off.
   function setPaletteColor(i: number, hex: string) {
     const palette = [...gen.palette];
     palette[i] = hex;
-    updateGenerator({ palette });
+    updateGenerator({ palette, autoColors: false });
   }
 
   function addRow() {
@@ -79,6 +90,15 @@
     setPartitions(gen.partitions.map((p, j) => (j === i ? { ...p, ...patch } : p)));
   }
 
+  // In one update with switching the generated colours off — done as two, the
+  // first would be recoloured from the tuning before the second landed.
+  function setPartitionColor(i: number, color: string) {
+    updateGenerator({
+      partitions: gen.partitions.map((p, j) => (j === i ? { ...p, color } : p)),
+      autoColors: false,
+    });
+  }
+
   function setWidth(i: number, raw: string) {
     const v = Math.round(Number(raw));
     if (!Number.isFinite(v)) return;
@@ -97,19 +117,13 @@
     setPartitions(gen.partitions.filter((_, j) => j !== i), anchor);
   }
 
-  /** Seven naturals then five sharps, repeating every twelve fifths. */
-  function sevenFive() {
-    // Reuse the colours already in play: the naturals' and the sharps'.
-    const colourOf = (accidental: number, fallback: string) =>
-      gen.palette[accidental - gen.startAccidental] ?? fallback;
+  // --- piano ---
+
+  function setPiano(patch: Partial<PianoColors>) {
+    const picksColour = Object.keys(patch).some((k) => k !== "centres");
     updateGenerator({
-      scheme: "partitions",
-      partitions: [
-        { width: 7, color: colourOf(0, "#c8c814") },
-        { width: 5, color: colourOf(1, "#3232fa") },
-      ],
-      anchorLetter: 0,
-      anchorPartition: 0,
+      piano: { ...gen.piano, ...patch },
+      ...(picksColour ? { autoColors: false } : {}),
     });
   }
 </script>
@@ -118,13 +132,9 @@
   class="rounded-lg border p-4"
   style="background: var(--panel); border-color: var(--line); box-shadow: var(--shadow)"
 >
-  <h2 class="m-0 mb-1 text-[11px] font-semibold uppercase tracking-[0.14em]" style="color: var(--text-dim)">
-    Colour rows
+  <h2 class="m-0 mb-3 text-[11px] font-semibold uppercase tracking-[0.14em]" style="color: var(--text-dim)">
+    Colour scheme
   </h2>
-  <p class="m-0 mb-3 text-xs" style="color: var(--text-dim)">
-    Every key is coloured by where the note it plays sits on the chain of fifths, so the rows follow
-    the <b style="color: var(--text)">{layoutName}</b> layout.
-  </p>
 
   {#if painted > 0}
     <p class="m-0 mb-3 rounded-md border-l-[3px] px-3 py-2 text-xs"
@@ -141,11 +151,18 @@
       <div class="flex items-center gap-1">
         <button
           class="btn text-sm normal-case tracking-normal"
-          style={!byPartition ? "border-color: var(--accent); color: var(--accent)" : ""}
-          aria-pressed={!byPartition}
-          title="Equal slices of seven fifths: the naturals, the sharps, the flats…"
+          style={scheme === "accidental" ? "border-color: var(--accent); color: var(--accent)" : ""}
+          aria-pressed={scheme === "accidental"}
+          title="One colour for the naturals, one for the sharps, one for the flats…"
           onclick={() => updateGenerator({ scheme: "accidental" })}
         >Accidental</button>
+        <button
+          class="btn text-sm normal-case tracking-normal"
+          style={scheme === "piano" ? "border-color: var(--accent); color: var(--accent)" : ""}
+          aria-pressed={scheme === "piano"}
+          title="Two colours, like a piano's white and black keys"
+          onclick={() => updateGenerator({ scheme: "piano" })}
+        >Piano</button>
         <button
           class="btn text-sm normal-case tracking-normal"
           style={byPartition ? "border-color: var(--accent); color: var(--accent)" : ""}
@@ -156,7 +173,18 @@
       </div>
     </div>
 
-    {#if !byPartition}
+    <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
+      Colours
+      <button
+        class="btn text-sm normal-case tracking-normal"
+        style={gen.autoColors ? "border-color: var(--accent); color: var(--accent)" : ""}
+        aria-pressed={gen.autoColors}
+        title="Choose the colours from the width of the fifth: red at the flat end, gold around 31-EDO, green where the fifth is pure, blue and magenta beyond"
+        onclick={() => updateGenerator({ autoColors: !gen.autoColors })}
+      >Automatic</button>
+    </div>
+
+    {#if scheme === "accidental"}
       <label class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
         First row is
         <select
@@ -169,7 +197,7 @@
           {/each}
         </select>
       </label>
-    {:else}
+    {:else if scheme === "partitions"}
       <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
         Starting note
         <div class="flex items-center gap-1.5 text-sm normal-case tracking-normal">
@@ -194,6 +222,7 @@
       </div>
     {/if}
 
+    {#if landmark !== "none"}
     <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
       Landmark
       <div class="flex items-center gap-1.5 text-sm normal-case tracking-normal">
@@ -224,15 +253,16 @@
     </div>
 
     <label class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
-      Lighten by <span class="mono normal-case" style="color: var(--text)">{gen.lightenAmount}%</span>
+      Lighten by <span class="mono normal-case" style="color: var(--text)">{lightenAmount}%</span>
       <input
-        type="range" min="0" max="100" value={gen.lightenAmount}
+        type="range" min="0" max="100" value={lightenAmount}
         disabled={!landmarkOn}
-        oninput={(e) => updateGenerator({ lightenAmount: +e.currentTarget.value })}
+        oninput={(e) => setLightenAmount(+e.currentTarget.value)}
         class="w-32"
         aria-label="How far landmark keys move toward white"
       />
     </label>
+    {/if}
 
     <label class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
       LED brightness <span class="mono normal-case" style="color: var(--text)">{gen.brightness}%</span>
@@ -244,10 +274,43 @@
     </label>
   </div>
 
-  {#if !byPartition}
+  {#if scheme === "piano"}
+    {#snippet swatch(label: string, hex: string, set: (hex: string) => void)}
+      <div class="flex flex-col items-center gap-1">
+        <span class="text-xs" style="color: var(--text-dim)">{label}</span>
+        <div class="relative">
+          <span class="block h-8 w-8 rounded-md border" style="{swatchStyle(hex)}; border-color: var(--line)"></span>
+          <input
+            type="color" value={hex}
+            oninput={(e) => set(e.currentTarget.value)}
+            class="absolute inset-0 h-8 w-8 cursor-pointer opacity-0"
+            aria-label="{label} colour"
+          />
+        </div>
+      </div>
+    {/snippet}
     <p class="m-0 mt-4 text-xs" style="color: var(--text-dim)">
-      Each row is one accidental — seven adjacent fifths, F to B. Rows past the end wrap back to the
-      start.
+      One colour for the naturals and one for the sharps and flats, like a piano's white and black
+      keys.
+    </p>
+    <div class="mt-2 flex flex-wrap items-end gap-x-3 gap-y-3">
+      {@render swatch("Naturals", gen.piano.natural, (hex) => setPiano({ natural: hex }))}
+      {@render swatch("Sharps / flats", gen.piano.accidental, (hex) => setPiano({ accidental: hex }))}
+      <button
+        class="btn ml-3 text-sm"
+        style={gen.piano.centres ? "border-color: var(--accent); color: var(--accent)" : ""}
+        aria-pressed={gen.piano.centres}
+        title="Gives the middle key of each group of three its own colour: D among the naturals, G♯ / A♭ among the sharps and flats"
+        onclick={() => setPiano({ centres: !gen.piano.centres })}
+      >Pick out the middle of each group of three</button>
+      {#if gen.piano.centres}
+        {@render swatch("D", gen.piano.centreNatural, (hex) => setPiano({ centreNatural: hex }))}
+        {@render swatch("G♯ / A♭", gen.piano.centreAccidental, (hex) => setPiano({ centreAccidental: hex }))}
+      {/if}
+    </div>
+  {:else if scheme === "accidental"}
+    <p class="m-0 mt-4 text-xs" style="color: var(--text-dim)">
+      One colour per accidental. The pattern repeats for accidentals beyond the ones set here.
     </p>
     <div class="mt-2 flex flex-wrap items-end gap-2">
       {#each gen.palette as hex, i}
@@ -286,7 +349,7 @@
               <span class="block h-8 w-8 rounded-md border" style="{swatchStyle(part.color)}; border-color: var(--line)"></span>
               <input
                 type="color" value={part.color}
-                oninput={(e) => setPartition(i, { color: e.currentTarget.value })}
+                oninput={(e) => setPartitionColor(i, e.currentTarget.value)}
                 class="absolute inset-0 h-8 w-8 cursor-pointer opacity-0"
                 aria-label="Partition {i + 1} colour"
               />
@@ -337,7 +400,6 @@
   {/if}
 
   <div class="mt-3 flex flex-wrap items-center gap-2">
-    <button class="btn" title="Seven naturals then five sharps, repeating" onclick={sevenFive}>7 + 5</button>
     <div class="flex-1"></div>
     <button class="btn" onclick={() => updateGenerator(defaultGenerator())}>Reset to default</button>
   </div>

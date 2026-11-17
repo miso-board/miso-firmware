@@ -95,7 +95,9 @@ def landmark(amount: int | None, letter: int) -> dict:
         "lightenCDE": on,
         "lightenLetter": on,
         "lightenLetterIndex": letter,
-        "lightenAmount": amount if on else 35,
+        # One amount per landmark; deliberately different, so a mix-up shows.
+        "lightenCDEAmount": amount if on else 35,
+        "lightenLetterAmount": (100 - amount) if on else 35,
     }
 
 
@@ -155,6 +157,38 @@ def configs() -> list[dict]:
                                     "bendSemitones": 48,
                                 },
                             })
+    # The piano scheme: naturals and accidentals, with and without the centre
+    # keys picked out. Authored as its own scheme, generated as partitions.
+    for layout in CONFIG_AXES["layout"]:
+        for centres in (False, True):
+            for brightness, lighten in ((10, None), (60, 35), (100, 100)):
+                for note, key in CONFIG_AXES["anchor"]:
+                    out.append({
+                        "colors": {
+                            "scheme": "piano",
+                            "piano": {
+                                "natural": PALETTE_POOL[0],
+                                "accidental": PALETTE_POOL[1],
+                                "centres": centres,
+                                "centreNatural": PALETTE_POOL[2],
+                                "centreAccidental": PALETTE_POOL[3],
+                            },
+                            "partitions": [],
+                            "anchorLetter": 0,
+                            "anchorPartition": 0,
+                            "palette": PALETTE_POOL[:5],
+                            "startAccidental": -2,
+                            "brightness": brightness,
+                            **landmark(lighten, 1),
+                        },
+                        "pitch": {
+                            "layout": layout,
+                            "tuning": {"kind": "edo", "edo": 31},
+                            "anchorNote": note,
+                            "anchorKey": key,
+                            "bendSemitones": 48,
+                        },
+                    })
     return out
 
 

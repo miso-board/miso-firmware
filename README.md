@@ -970,7 +970,7 @@ compiling it on the host, and diffing it against the app:
 | Script | Extracts from `main.c` | Proves |
 |---|---|---|
 | [`companion/scripts/check-firmware-pitch.py`](companion/scripts/check-firmware-pitch.py) | `div_round`, `pitch_for_xy`, `pitch_params_apply` | 20,088 cases over nine tunings × three layouts × six concert-pitch offsets × a four-board grid agree with the app, and the 31-EDO default is byte-identical to the step-lattice formula it replaced (124 keys) |
-| [`companion/scripts/check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) | `colorgen_params_t`, `floor_div`, `mod_pos`, `round_pct`, `colorgen_for_xy`, `colorgen_params_apply`, `colorgen_upgrade_legacy` | 242,544 cases over 1,956 generators × a four-board grid — accidental rows and partition schemes — agree with the app, the default generator is byte-identical to `fill_bosanquet()` (31 keys), and nineteen frames are accepted, refused or upgraded as intended |
+| [`companion/scripts/check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) | `colorgen_params_t`, `floor_div`, `mod_pos`, `round_pct`, `colorgen_for_xy`, `colorgen_params_apply`, `colorgen_upgrade_legacy` | 247,008 cases over 1,992 generators × a four-board grid — accidental rows and partition schemes — agree with the app, the default generator is byte-identical to `fill_bosanquet()` (31 keys), and nineteen frames are accepted, refused or upgraded as intended |
 
 Both run from the companion, and both need `clang` and Node 24:
 

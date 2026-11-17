@@ -8,50 +8,15 @@
   // anchor all stay as they are.
 
   import {
-    LAYOUTS, CENTRE_KEY, generatePitchAt, hzAt, noteName, referenceOf, tuningError,
+    LAYOUTS, CENTRE_KEY, generatePitchAt, hzAt, noteName, referenceOf, tuningError, stepIntervalName,
     type LayoutId,
   } from "../lib/tuning";
-  import { LED_POS, axialToPixel, hexPoints } from "../lib/layout";
-  import { RIGHT, DOWN } from "../lib/mesh.svelte";
   import { generateColorAt } from "../lib/colorMaps";
   import { ledColor } from "../lib/ledColor";
+  import { ICON_SHIFT } from "../lib/tilingIcon";
+  import { axialToPixel, hexPoints } from "../lib/layout";
   import { activeColors, activePitch, updatePitchGenerator } from "../lib/presets.svelte";
-
-  const S = 10; // hex radius in icon units
-  const PAD = S * 1.2;
-
-  // Four boards, tiled the way the hardware tiles: one, its right-hand
-  // neighbour, the one below, and the one diagonally across.
-  const BOARD_OFFSETS: readonly (readonly [number, number])[] = [
-    [0, 0],
-    RIGHT,
-    DOWN,
-    [RIGHT[0] + DOWN[0], RIGHT[1] + DOWN[1]],
-  ];
-  const KEYS = BOARD_OFFSETS.flatMap(([ox, oy]) =>
-    LED_POS.map(([lx, ly]) => {
-      const x = lx + ox;
-      const y = ly + oy;
-      const [px, py] = axialToPixel(x, y, S);
-      return { x, y, points: hexPoints(px, py, S * 0.94), px, py };
-    }),
-  );
-  const VIEW_BOX = (() => {
-    const xs = KEYS.map((k) => k.px);
-    const ys = KEYS.map((k) => k.py);
-    const minX = Math.min(...xs) - PAD;
-    const minY = Math.min(...ys) - PAD;
-    return `${minX} ${minY} ${Math.max(...xs) + PAD - minX} ${Math.max(...ys) + PAD - minY}`;
-  })();
-
-  // Which stretch of the pattern each icon shows, as a grid offset from the
-  // boards' own coordinates. Purely a matter of framing: these two read better
-  // moved (2, 1) along from where the anchor happens to put them, which means
-  // each icon key samples the colour from (2, 1) back.
-  const ICON_SHIFT: Partial<Record<LayoutId, readonly [number, number]>> = {
-    "wicki-hayden": [-2, -1],
-    "harmonic-table": [-2, -1],
-  };
+  import TilingIcon from "./TilingIcon.svelte";
 
   const pitchGen = $derived(activePitch().generator);
 
@@ -72,22 +37,39 @@
 
   const colorGen = $derived(activeColors().generator);
 
-  /** The fill of every icon key, under each layout, from the live generators. */
-  const fills = $derived(
-    Object.fromEntries(
-      Object.values(LAYOUTS).map((l) => {
-        const asLayout = { ...pitchGen, layout: l.id };
-        return [
-          l.id,
-          KEYS.map((k) => {
-            const [dx, dy] = ICON_SHIFT[l.id] ?? [0, 0];
-            const c = ledColor(generateColorAt(colorGen, asLayout, k.x + dx, k.y + dy));
-            return c.off ? "var(--panel-2)" : c.flat;
-          }),
-        ];
-      }),
-    ) as Record<LayoutId, string[]>,
+  // The three directions through a hexagon's edges, each drawn as a key with an
+  // arrow leaving it — tilted as the board is tilted — beside the interval that
+  // step makes under the selected layout.
+  const HEX_R = 7;
+  const HEX_POINTS = hexPoints(0, 0, HEX_R);
+  const DIRECTIONS = ([[1, 0], [0, 1], [1, -1]] as const).map(([dx, dy]) => {
+    const [px, py] = axialToPixel(dx, dy);
+    const len = Math.hypot(px, py);
+    const ux = px / len, uy = py / len;
+    const tip = 14.5, back = 10.5, half = 3; // arrow length and head, in icon units
+    return {
+      dx, dy,
+      line: `M0 0L${(ux * back).toFixed(2)} ${(uy * back).toFixed(2)}`,
+      head: [
+        [ux * tip, uy * tip],
+        [ux * back - uy * half, uy * back + ux * half],
+        [ux * back + uy * half, uy * back - ux * half],
+      ].map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" "),
+    };
+  });
+  const steps = $derived(
+    DIRECTIONS.map((d) => ({ ...d, name: stepIntervalName(LAYOUTS[pitchGen.layout], d.dx, d.dy) })),
   );
+
+  /** How the live colour generator would fill an icon key under a layout. */
+  function fillFor(layout: LayoutId): (x: number, y: number) => string {
+    const asLayout = { ...pitchGen, layout };
+    const [dx, dy] = ICON_SHIFT[layout] ?? [0, 0];
+    return (x, y) => {
+      const c = ledColor(generateColorAt(colorGen, asLayout, x + dx, y + dy));
+      return c.off ? "var(--panel-2)" : c.flat;
+    };
+  }
 </script>
 
 <section
@@ -98,8 +80,7 @@
     Layout
   </h2>
   <p class="m-0 mb-3 text-xs" style="color: var(--text-dim)">
-    Which interval each direction across the keys is, whatever the tuning.
-    <span class="mono">{LAYOUTS[pitchGen.layout].axes}</span>
+    Choose how notes are mapped onto the keyboard.
   </p>
 
   <div class="grid grid-cols-2 gap-2.5 min-[720px]:grid-cols-4" role="radiogroup" aria-label="Layout">
@@ -112,11 +93,7 @@
         aria-checked={selected}
         onclick={() => updatePitchGenerator({ layout: l.id })}
       >
-        <svg viewBox={VIEW_BOX} class="icon" aria-hidden="true">
-          {#each KEYS as k, i}
-            <polygon points={k.points} fill={fills[l.id][i]} />
-          {/each}
-        </svg>
+        <span class="icon"><TilingIcon fill={fillFor(l.id)} /></span>
         <span class="name">{l.name}</span>
       </button>
     {/each}
@@ -124,14 +101,23 @@
     <!-- Choosing two basis vectors by hand. Not built yet: it needs pitch
          arithmetic that can step outside a single octave/fifth-generated basis. -->
     <button class="option" role="radio" aria-checked="false" disabled title="Not available yet">
-      <svg viewBox={VIEW_BOX} class="icon" aria-hidden="true">
-        {#each KEYS as k}
-          <polygon points={k.points} fill="var(--panel-2)" stroke="var(--line)" stroke-width="1" />
-        {/each}
-      </svg>
+      <span class="icon"><TilingIcon /></span>
       <span class="name">Custom</span>
     </button>
   </div>
+
+  <ul class="steps" aria-label="Interval in each direction">
+    {#each steps as s}
+      <li>
+        <svg viewBox="-16 -16 32 32" width="38" height="38" aria-hidden="true">
+          <polygon points={HEX_POINTS} fill="var(--panel-2)" stroke="var(--text-dim)" stroke-width="1.2" />
+          <path d={s.line} stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" fill="none" />
+          <polygon points={s.head} fill="var(--accent)" />
+        </svg>
+        {s.name}
+      </li>
+    {/each}
+  </ul>
 
   <!-- Where the layout sits on the keys: one note pinned to one key, and every
        other key follows from the layout. -->
@@ -193,6 +179,21 @@
     letter-spacing: 0.1em;
     text-transform: uppercase;
     color: var(--text-dim);
+  }
+  .steps {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin: 12px 0 0;
+    padding: 0;
+    list-style: none;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .steps li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
   .option {
     display: flex;

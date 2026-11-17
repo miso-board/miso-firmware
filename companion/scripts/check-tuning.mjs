@@ -443,10 +443,17 @@ section("10. colour partitions: accidental rows are a special case; 7 + 5 repeat
     const { lightenMask, COLORGEN_CAPS_LATEST } = await import("../src/lib/colorMaps.ts");
     const bos = defaultPitchMap().generator;
     const wh = pitchMapFor({ layout: "wicki-hayden" }).generator;
-    const g = { ...defaultGenerator(), lightenCDE: true, lightenLetter: true, lightenLetterIndex: 4, lightenAmount: 60 };
+    const g = { ...defaultGenerator(), lightenCDE: true, lightenLetter: true, lightenLetterIndex: 4,
+                lightenCDEAmount: 60, lightenLetterAmount: 60 };
     ok(lightenMask(g, "wicki-hayden") === 0b0000111, "Wicki-Hayden's landmark is C D E");
-    ok(lightenMask(g, "bosanquet") === 0b0010000 && lightenMask(g, "harmonic-table") === 0b0010000,
-       "elsewhere it is the one chosen letter (G)");
+    ok(lightenMask(g, "bosanquet") === 0b0010000, "Bosanquet's is the one chosen letter (G)");
+    ok(lightenMask(g, "harmonic-table") === 0, "the Harmonic Table has none");
+    {
+      const { lightenPercent } = await import("../src/lib/colorMaps.ts");
+      const two = { ...g, lightenCDEAmount: 20, lightenLetterAmount: 80 };
+      ok(lightenPercent(two, "wicki-hayden") === 20 && lightenPercent(two, "bosanquet") === 80,
+         "each landmark keeps its own amount");
+    }
     ok(lightenMask({ ...g, lightenCDE: false }, "wicki-hayden") === 0 &&
        lightenMask({ ...g, lightenLetter: false }, "bosanquet") === 0,
        "each landmark has its own switch");
@@ -455,11 +462,51 @@ section("10. colour partitions: accidental rows are a special case; 7 + 5 repeat
        "current firmware gets 'G' with the letter mask and the amount");
     ok(colorgenFrame(g, bos) === null && colorgenFrame(g, wh) === null,
        "older firmware cannot be sent a letter landmark, or C D E at 60%");
-    const k = colorgenFrame({ ...g, lightenAmount: 35 }, wh);
+    const k = colorgenFrame({ ...g, lightenCDEAmount: 35 }, wh);
     ok(k !== null && k.length === 41 && k[0] === 0x4b && k[15] === 0x01,
        "…but C D E at 35% still goes out as the old 'K' flag");
     ok(colorgenFrame({ ...g, lightenLetter: false }, bos)?.[0] === 0x4b,
        "…as does no landmark at all");
+  }
+
+  // The piano scheme is seven-then-five on F; with the centre keys on, D and
+  // G♯ / A♭ are picked out, and it is still few enough partitions for the board.
+  {
+    const { pianoPartitions, COLORGEN_CAPS_LATEST } = await import("../src/lib/colorMaps.ts");
+    const colours = { natural: "#000001", accidental: "#000002", centres: false,
+                      centreNatural: "#000003", centreAccidental: "#000004" };
+    const piano = { ...defaultGenerator(), brightness: 100, scheme: "piano", piano: colours };
+    const marked = { ...piano, piano: { ...colours, centres: true } };
+    const asParts = { ...sevenFive, brightness: 100, partitions: pianoPartitions(colours) };
+    // Find a key playing each note under Bosanquet and ask what colour it gets.
+    const g = defaultPitchMap().generator;
+    const colourOf = (gen, note) => {
+      const want = SPN.toPitch(note);
+      for (let x = -40; x <= 40; x++) for (let y = -40; y <= 40; y++) {
+        const p = generatePitchAt(g, x, y);
+        if (p.w === want.w && p.h === want.h) return generateColorAt(gen, g, x, y);
+      }
+      return "not found";
+    };
+    let same = true;
+    for (const [x, y] of gridCoords(4)) {
+      if (generateColorAt(piano, g, x, y) !== generateColorAt(asParts, g, x, y)) same = false;
+    }
+    ok(same, "piano colours every key as seven-then-five partitions on F do");
+    ok(["C4", "D4", "E4", "F4", "G4", "A4", "B4"].every((n) => colourOf(piano, n) === "#000001"),
+       "piano: the naturals take one colour");
+    ok(["F#4", "C#4", "G#4", "D#4", "A#4", "Bb4", "Eb4", "Ab4", "Db4", "Gb4"]
+         .every((n) => colourOf(piano, n) === "#000002"), "piano: sharps and flats take the other");
+    ok(colourOf(marked, "D4") === "#000003" && colourOf(marked, "D5") === "#000003",
+       "centre keys: D is picked out among the naturals");
+    ok(colourOf(marked, "G#4") === "#000004" && colourOf(marked, "Ab4") === "#000004",
+       "centre keys: G♯ and A♭ are picked out among the sharps and flats");
+    ok(["C4", "E4", "F4", "G4", "A4", "B4"].every((n) => colourOf(marked, n) === "#000001") &&
+       ["F#4", "C#4", "D#4", "A#4", "Bb4", "Eb4", "Db4", "Gb4"].every((n) => colourOf(marked, n) === "#000002"),
+       "…and nothing else changes colour");
+    ok(pianoPartitions({ ...colours, centres: true }).length === 6 &&
+       colorgenFrame(marked, g, COLORGEN_CAPS_LATEST) !== null,
+       "with the centre keys it is six partitions, which the board can generate");
   }
 
   // Moving the anchor slides the whole pattern.
@@ -539,6 +586,126 @@ section("11. concert pitch: the reference note lands on its frequency, here and 
     }
   }
   console.log(`  worst app/firmware disagreement with a concert pitch: ${worst.toFixed(4)}¢`);
+}
+
+// --- 12. colours from the tuning ---------------------------------------------
+
+section("12. colours from the tuning: a hue per fifth, a colour per row, always the same");
+{
+  const { tuningHue, autoColor, autoColorsFor, hueOf, rowSpacing, colourDifference, ledDifference } =
+    await import("../src/lib/autoColors.ts");
+  const { defaultGenerator, pianoPartitions } = await import("../src/lib/colorMaps.ts");
+  const fifthOf = (edo) => fifthCents({ kind: "edo", edo });
+  const near = (a, b, tol = 0.5) => Math.abs(a - b) <= tol;
+
+  ok(near(tuningHue(fifthOf(7)), 0), "7-EDO is red");
+  ok(near(tuningHue(fifthOf(19)), 22), "19-EDO is deep orange");
+  ok(near(tuningHue(fifthOf(31)), 45), "31-EDO is gold");
+  ok(near(tuningHue(1200 * Math.log2(1.5)), 120), "a pure fifth is green");
+  ok(tuningHue(fifthOf(53)) > 110 && tuningHue(fifthOf(41)) < 150, "53- and 41-EDO are green too");
+  ok(near(tuningHue(fifthOf(22)), 225), "22-EDO is blue");
+  ok(near(tuningHue(fifthOf(5)), 310), "5-EDO is magenta");
+  ok(tuningHue(600) === 0 && tuningHue(800) === 310, "outside the range it holds the end colour");
+  {
+    let rising = true, last = -1;
+    for (let c = FIFTH_MIN; c <= FIFTH_MAX; c += 0.05) {
+      const h = tuningHue(c);
+      if (h < last) rising = false;
+      last = h;
+    }
+    ok(rising, "the hue only ever moves one way as the fifth widens");
+  }
+
+  // The home row wears the tuning's own hue, and is the same whatever the count.
+  for (const edo of [7, 19, 31, 12, 53, 22]) {
+    const f = fifthOf(edo);
+    ok(near(hueOf(autoColor(f, 0, 5)), tuningHue(f), 1.5) && autoColor(f, 0, 2) === autoColor(f, 0, 12),
+       `${edo}-EDO: the home row is the tuning's hue`);
+  }
+
+  // Any number of rows: every row gets a colour, all different, and asking
+  // twice gives the same answer.
+  for (const rows of [1, 2, 3, 5, 8, 12]) {
+    const g = { ...defaultGenerator(), palette: Array(rows).fill("#000000"), startAccidental: -Math.floor(rows / 2),
+                partitions: Array.from({ length: rows }, () => ({ width: 3, color: "#000000" })),
+                anchorPartition: Math.floor(rows / 3) };
+    const a = autoColorsFor(g, fifthOf(31)), b = autoColorsFor(g, fifthOf(31));
+    ok(JSON.stringify(a) === JSON.stringify(b), `${rows} rows: the same tuning gives the same colours`);
+    ok(a.palette.length === rows && new Set(a.palette).size === rows, `${rows} rows: each accidental row its own colour`);
+    ok(a.partitions.length === rows && new Set(a.partitions.map((p) => p.color)).size === rows &&
+       a.partitions.every((p) => p.width === 3), `${rows} partitions: each its own colour, widths untouched`);
+    ok(near(hueOf(a.partitions[g.anchorPartition].color), 45, 1.5), `${rows} partitions: the anchored one is home`);
+  }
+
+  // The point of all the measuring: at EVERY tuning, neighbouring rows are far
+  // enough apart to tell — on a screen, and as LED light, where it is hue that
+  // separates two keys and the greens, cyans and purples need far wider steps.
+  for (const rows of [2, 5, 8, 12]) {
+    const want = rowSpacing(rows);
+    let screen = Infinity, led = Infinity, ledHue = Infinity, closest = Infinity;
+    for (let c = FIFTH_MIN; c <= FIFTH_MAX; c += 0.25) {
+      const below = Math.floor((rows - 1) / 2);
+      const all = Array.from({ length: rows }, (_, i) => autoColor(c, i - below, rows));
+      for (let i = 1; i < rows; i++) {
+        const d = ledDifference(all[i - 1], all[i]);
+        screen = Math.min(screen, colourDifference(all[i - 1], all[i]));
+        led = Math.min(led, d.distance);
+        ledHue = Math.min(ledHue, d.hue);
+      }
+      for (let i = 0; i < rows; i++) for (let j = i + 1; j < rows; j++) {
+        closest = Math.min(closest, colourDifference(all[i], all[j]));
+      }
+    }
+    console.log(`  ${rows} rows, least over every fifth: screen ${screen.toFixed(3)} (want ${want.screen.toFixed(3)}), ` +
+                `LED ${led.toFixed(3)} (${want.led.toFixed(3)}), LED hue ${ledHue.toFixed(1)}° (${want.ledHue.toFixed(1)}°)`);
+    // Give or take rounding a colour to eight bits a channel.
+    ok(screen >= want.screen * 0.95, `${rows} rows: neighbours differ enough on a screen at every tuning`, screen.toFixed(3));
+    ok(led >= want.led * 0.95, `${rows} rows: …and as LED light`, led.toFixed(3));
+    ok(ledHue >= want.ledHue * 0.95, `${rows} rows: …and in hue as LED light`, ledHue.toFixed(1));
+    // Rows that are not neighbours must not come back round to meet each other.
+    ok(closest >= want.screen * 0.95, `${rows} rows: no two rows anywhere are closer than neighbours`,
+       closest.toFixed(3));
+  }
+
+  // The naturals' row of an accidental scheme is home, wherever it sits.
+  {
+    const g = { ...defaultGenerator(), startAccidental: -2 };
+    ok(near(hueOf(autoColorsFor(g, fifthOf(22)).palette[2]), 225, 1.5), "the naturals take the tuning's hue");
+  }
+  // Two colours on their own sit as far apart as a five-row scheme's flats and
+  // sharps, not as close as two neighbouring rows — in every scheme.
+  for (const edo of [7, 19, 31, 53, 41, 17, 22, 5]) {
+    const f = fifthOf(edo);
+    const g = { ...defaultGenerator(), palette: ["#000000", "#000000"], startAccidental: 0,
+                partitions: [{ width: 7, color: "#000000" }, { width: 5, color: "#000000" }] };
+    const a = autoColorsFor(g, f);
+    const pair = [autoColor(f, 0, 5), autoColor(f, -2, 5)];
+    // Piano and a pair of partitions put the second colour to the FLAT side of
+    // home — the same two colours as accidental rows of just ♭ and ♮.
+    const flatNatural = autoColorsFor({ ...g, startAccidental: -1 }, f).palette;
+    ok(a.piano.natural === pair[0] && a.piano.accidental === pair[1] &&
+       a.partitions[0].color === pair[0] && a.partitions[1].color === pair[1] &&
+       flatNatural[1] === pair[0] && flatNatural[0] === pair[1],
+       `${edo}-EDO: piano and a pair of partitions match accidental rows of ♭ and ♮`);
+    // Accidental rows of ♮ and ♯ still go the sharp way, as their names say.
+    ok(a.palette[0] === pair[0] && a.palette[1] === autoColor(f, 2, 5),
+       `${edo}-EDO: accidental rows of ♮ and ♯ are home and two steps sharp`);
+    const flatSharp = colourDifference(autoColor(f, -1, 5), autoColor(f, 1, 5));
+    const two = colourDifference(pair[0], pair[1]);
+    ok(two >= rowSpacing(5).screen * 1.4 && two >= flatSharp * 0.6,
+       `${edo}-EDO: …which is about a flat-to-sharp difference`, `${two.toFixed(3)} vs ${flatSharp.toFixed(3)}`);
+    const on = autoColorsFor({ ...g, piano: { ...g.piano, centres: true } }, f).piano;
+    ok(on.natural === a.piano.natural && on.accidental === a.piano.accidental,
+       `${edo}-EDO: switching the centre keys on leaves the two main colours alone`);
+  }
+
+  // Piano: four colours, all different, with the naturals at home.
+  {
+    const p = autoColorsFor(defaultGenerator(), fifthOf(19)).piano;
+    ok(new Set([p.natural, p.accidental, p.centreNatural, p.centreAccidental]).size === 4 &&
+       near(hueOf(p.natural), 22, 1.5), "piano: naturals at home, and four distinct colours");
+    ok(pianoPartitions({ ...p, centres: true }).length === 6, "…still six partitions");
+  }
 }
 
 // --- summary ---------------------------------------------------------------

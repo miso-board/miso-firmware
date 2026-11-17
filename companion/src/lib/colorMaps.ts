@@ -53,14 +53,28 @@ export const FIFTHS_LETTERS = ["F", "C", "G", "D", "A", "E", "B"] as const;
  *
  *  - "accidental": equal slices of seven fifths starting on F — the naturals,
  *    the sharps, the flats and so on — one `palette` entry each.
+ *  - "piano": seven then five, repeating every twelve fifths — the naturals
+ *    one colour and the sharps and flats another, as on a piano. Optionally the
+ *    middle key of each run of three gets a colour of its own.
  *  - "partitions": slices of any widths, pinned by naming the natural that
- *    starts one of them. Seven then five is the usual two-row scheme.
+ *    starts one of them.
  *
- * The first is a special case of the second (see `partitionsFromAccidentals`).
- * It stays a mode of its own because it is the one the firmware can generate.
+ * The first two are special cases of the third (see `partitionsFromAccidentals`
+ * and `pianoPartitions`). They stay modes of their own because they are what
+ * people mean, and need far fewer decisions.
  */
 export interface GeneratorParams {
-  scheme: "accidental" | "partitions";
+  /**
+   * Take the colours from the tuning (see autoColors.ts) rather than from the
+   * user. The generated colours are still WRITTEN into `palette`, `piano` and
+   * `partitions` — by the preset store, whenever the tuning or the rows change —
+   * so everything that draws or sends a scheme reads plain stored colours and
+   * needs to know nothing about this. Editing a colour by hand turns it off.
+   */
+  autoColors: boolean;
+  scheme: "accidental" | "piano" | "partitions";
+  /** "piano" scheme. */
+  piano: PianoColors;
   /** "partitions" scheme: the slices, in rising fifths order. */
   partitions: Partition[];
   /** "partitions" scheme: the natural that starts a partition, as an index into FIFTHS_LETTERS. */
@@ -81,20 +95,36 @@ export interface GeneratorParams {
    * Wicki-Hayden: lighten C, D and E — the left half of each row.
    */
   lightenCDE: boolean;
-  /** Bosanquet and the Harmonic Table: lighten every key of one letter. */
+  /** How far toward white those go: 0 unchanged, 100 white. */
+  lightenCDEAmount: number;
+  /** Bosanquet: lighten every key of one letter. */
   lightenLetter: boolean;
   /** Which letter, as an index into LANDMARK_LETTERS (C = 0 … B = 6). */
   lightenLetterIndex: number;
-  /** How far toward white a landmark key goes: 0 unchanged, 100 white. */
-  lightenAmount: number;
+  /** How far toward white that letter goes. Separate from Wicki-Hayden's amount. */
+  lightenLetterAmount: number;
+}
+
+/** The colours of the "piano" scheme, at full brightness. */
+export interface PianoColors {
+  /** The seven naturals. */
+  natural: string;
+  /** The five sharps, and the five flats. */
+  accidental: string;
+  /** Give the middle key of each run of three its own colour. */
+  centres: boolean;
+  /** D — the middle of C D E, and of the naturals as a whole. */
+  centreNatural: string;
+  /** G♯ / A♭ — the middle of the three sharps or flats that sit together. */
+  centreAccidental: string;
 }
 
 /** The letters in scale order, which is the order of a pitch's `pc7`. */
 export const LANDMARK_LETTERS = ["C", "D", "E", "F", "G", "A", "B"] as const;
 
-/** Which kind of landmark a layout uses. */
-export function landmarkFor(layout: LayoutId): "cde" | "letter" {
-  return layout === "wicki-hayden" ? "cde" : "letter";
+/** Which kind of landmark a layout uses, if any. */
+export function landmarkFor(layout: LayoutId): "cde" | "letter" | "none" {
+  return layout === "wicki-hayden" ? "cde" : layout === "bosanquet" ? "letter" : "none";
 }
 
 /**
@@ -102,15 +132,21 @@ export function landmarkFor(layout: LayoutId): "cde" | "letter" {
  * 0 … B = bit 6). Zero means no landmark. This is the form the firmware takes.
  */
 export function lightenMask(p: GeneratorParams, layout: LayoutId): number {
-  if (landmarkFor(layout) === "cde") return p.lightenCDE ? 0b0000111 : 0;
+  const kind = landmarkFor(layout);
+  if (kind === "none") return 0;
+  if (kind === "cde") return p.lightenCDE ? 0b0000111 : 0;
   if (!p.lightenLetter) return 0;
   const i = Math.round(p.lightenLetterIndex ?? 0);
   return i >= 0 && i < 7 ? 1 << i : 0;
 }
 
-/** The lighten amount as the whole percent that is drawn and sent. */
-function lightenPercent(p: GeneratorParams): number {
-  const v = Number.isFinite(p.lightenAmount) ? p.lightenAmount : LIGHTEN_DEFAULT;
+/**
+ * The lighten amount under a layout, as the whole percent that is drawn and
+ * sent. Each landmark has its own, so tuning one layout's does not move another's.
+ */
+export function lightenPercent(p: GeneratorParams, layout: LayoutId): number {
+  const raw = landmarkFor(layout) === "cde" ? p.lightenCDEAmount : p.lightenLetterAmount;
+  const v = Number.isFinite(raw) ? raw : LIGHTEN_DEFAULT;
   return Math.min(100, Math.max(0, Math.round(v)));
 }
 
@@ -137,6 +173,8 @@ export interface ColorLayer {
 // Chosen so that at 10% brightness these reproduce the board's boot pattern
 // byte for byte (250 -> 25, 100 -> 10, 20 -> 2 …).
 export const DEFAULT_GENERATOR: GeneratorParams = {
+  // Off by default: these are the colours a board shows with no app attached.
+  autoColors: false,
   scheme: "accidental",
   partitions: [],
   anchorLetter: 0,
@@ -145,14 +183,29 @@ export const DEFAULT_GENERATOR: GeneratorParams = {
   startAccidental: -2,
   brightness: 10,
   lightenCDE: false,
+  lightenCDEAmount: LIGHTEN_DEFAULT,
   lightenLetter: false,
   lightenLetterIndex: 0,
-  lightenAmount: LIGHTEN_DEFAULT,
+  lightenLetterAmount: LIGHTEN_DEFAULT,
+  // The default palette's naturals and sharps, with its flats and double sharps
+  // for the two centre keys.
+  piano: {
+    natural: "#c8c814",
+    accidental: "#32fa32",
+    centres: false,
+    centreNatural: "#fa6414",
+    centreAccidental: "#3232fa",
+  },
 };
 
 /** A fresh copy of the default generator, safe to mutate. */
 export function defaultGenerator(): GeneratorParams {
-  return { ...DEFAULT_GENERATOR, palette: [...DEFAULT_GENERATOR.palette], partitions: [] };
+  return {
+    ...DEFAULT_GENERATOR,
+    palette: [...DEFAULT_GENERATOR.palette],
+    partitions: [],
+    piano: { ...DEFAULT_GENERATOR.piano },
+  };
 }
 
 const mod = (v: number, m: number): number => ((v % m) + m) % m;
@@ -180,6 +233,46 @@ export function partitionsFromAccidentals(
     partitions: p.palette.map((color) => ({ width: 7, color })),
     anchorLetter: 0,
     anchorPartition: mod(-p.startAccidental, n),
+  };
+}
+
+/**
+ * The piano scheme, said as partitions starting on F.
+ *
+ * Seven naturals then five sharps, repeating every twelve fifths — so the five
+ * flats take the sharps' colour, and E♯ wraps round to the naturals'.
+ *
+ * With the centre keys on, each run of three alike gets its middle picked out:
+ * D among the naturals (F C G · D · A E B along the fifths, and the middle of
+ * C D E on the keys) and G♯ among the sharps (F♯ C♯ · G♯ · D♯ A♯). That is six
+ * partitions, which is exactly what the firmware's frame carries.
+ */
+export function pianoPartitions(c: PianoColors): Partition[] {
+  if (!c.centres) {
+    return [
+      { width: 7, color: c.natural },
+      { width: 5, color: c.accidental },
+    ];
+  }
+  return [
+    { width: 3, color: c.natural }, // F C G
+    { width: 1, color: c.centreNatural }, // D
+    { width: 3, color: c.natural }, // A E B
+    { width: 2, color: c.accidental }, // F♯ C♯
+    { width: 1, color: c.centreAccidental }, // G♯
+    { width: 2, color: c.accidental }, // D♯ A♯
+  ];
+}
+
+/** A generator with the piano scheme spelled out as the partitions it is. */
+function resolveScheme(p: GeneratorParams): GeneratorParams {
+  if (p.scheme !== "piano") return p;
+  return {
+    ...p,
+    scheme: "partitions",
+    partitions: pianoPartitions(p.piano ?? DEFAULT_GENERATOR.piano),
+    anchorLetter: 0,
+    anchorPartition: 0,
   };
 }
 
@@ -227,8 +320,9 @@ export function partitionIndexAt(p: GeneratorParams, fifths: number): number {
  * a slice starting on F.
  */
 export function asAccidentalScheme(
-  p: GeneratorParams,
+  generator: GeneratorParams,
 ): Pick<GeneratorParams, "palette" | "startAccidental"> | null {
+  const p = resolveScheme(generator);
   if (!usesPartitions(p)) return { palette: p.palette, startAccidental: p.startAccidental };
   if (p.partitions.some((part) => part.width !== 7)) return null;
   if (mod(partitionStarts(p)[0], 7) !== 0) return null;
@@ -247,11 +341,12 @@ export function asAccidentalScheme(
  * parameters, and an override is not one.
  */
 export function generateColorAt(
-  p: GeneratorParams,
+  generator: GeneratorParams,
   pitchGen: PitchGenerator,
   x: number,
   y: number,
 ): string {
+  const p = resolveScheme(generator);
   const pitch = generatePitchAt(pitchGen, x, y);
   let hex: string;
   if (usesPartitions(p)) {
@@ -261,7 +356,9 @@ export function generateColorAt(
     // Rows outside the palette wrap back through it.
     hex = p.palette[mod(pitch.accidental - p.startAccidental, n)] ?? "#000000";
   }
-  if ((lightenMask(p, pitchGen.layout) >> pitch.pc7) & 1) hex = lightenHex(hex, lightenPercent(p));
+  if ((lightenMask(p, pitchGen.layout) >> pitch.pc7) & 1) {
+    hex = lightenHex(hex, lightenPercent(p, pitchGen.layout));
+  }
   return scaleHex(hex, p.brightness);
 }
 
@@ -367,13 +464,14 @@ export const COLORGEN_CAPS_LATEST: ColorgenCaps = { partitions: true, lighten: t
  * attached firmware predates. The caller falls back to per-board `L` frames.
  */
 export function colorgenFrame(
-  g: GeneratorParams,
+  generator: GeneratorParams,
   pitchGen: PitchGenerator,
   caps: ColorgenCaps = { partitions: false, lighten: false },
 ): Uint8Array | null {
+  const g = resolveScheme(generator);
   const partitionsOk = caps.partitions;
   const letters = lightenMask(g, pitchGen.layout);
-  const amount = lightenPercent(g);
+  const amount = lightenPercent(g, pitchGen.layout);
   const legacyTint = letters === 0 || (letters === 0b0000111 && amount === LIGHTEN_DEFAULT);
   if (!caps.lighten && !legacyTint) return null;
 

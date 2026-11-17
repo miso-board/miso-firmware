@@ -16,7 +16,7 @@
 //    the meantone family is determined by it, and an EDO is just one way to
 //    choose it. That is why this module needs no per-EDO step lattice.
 
-import { Pitch, Map2D, MapVec, TuningMap, SPN, WICKI_FROM } from "meantonal";
+import { Pitch, Interval, Map2D, MapVec, TuningMap, SPN, WICKI_FROM } from "meantonal";
 import { cellKey } from "./layout";
 
 export type LayoutId = "bosanquet" | "wicki-hayden" | "harmonic-table";
@@ -28,8 +28,6 @@ export interface Layout {
   matrix: Map2D;
   /** Added after mapping, placing the layout at an absolute pitch. */
   anchor: { w: number; h: number };
-  /** What one step along each grid axis means, for the UI. */
-  axes: string;
 }
 
 /** Board axes are already meantonal's axes, so Bosanquet needs no basis change. */
@@ -43,7 +41,6 @@ export const LAYOUTS: Record<LayoutId, Layout> = {
     // Puts D4 on the centre key (3,3) and reproduces the board's boot pattern.
     // This is the firmware default (TUNE_W0/TUNE_H0 in Core/Src/main.c).
     anchor: { w: 23, h: 7 },
-    axes: "+x whole tone · +y diatonic semitone",
   },
   "wicki-hayden": {
     id: "wicki-hayden",
@@ -62,7 +59,6 @@ export const LAYOUTS: Record<LayoutId, Layout> = {
     // int16 in the `P` frame.
     matrix: WICKI_FROM.compose(new Map2D(1, 1, 0, -1)),
     anchor: { w: 29, h: 13 }, // also D4 on the centre key
-    axes: "+x whole tone · fifth up-right · fourth up-left",
   },
   "harmonic-table": {
     id: "harmonic-table",
@@ -82,9 +78,41 @@ export const LAYOUTS: Record<LayoutId, Layout> = {
     // still appears; in other tunings it does not.
     matrix: new Map2D(2, -1, 0, -1),
     anchor: { w: 23, h: 13 }, // also D4 on the centre key
-    axes: "+x major third · fifth up-right · minor third up-left",
   },
 };
+
+const QUALITY: Record<string, string> = {
+  P: "perfect", M: "major", m: "minor", A: "augmented", d: "diminished",
+};
+const ORDINAL = ["unison", "second", "third", "fourth", "fifth", "sixth", "seventh", "octave"];
+// The three smallest steps go by their everyday names.
+const STEP_NAME: Record<string, string> = {
+  M2: "whole tone", m2: "diatonic semitone", A1: "chromatic semitone",
+};
+
+/**
+ * The interval one step across the keys makes under a layout, in words:
+ * "whole tone", "perfect fifth", "perfect fourth down".
+ *
+ * `dx, dy` is a grid direction — (1, 0), (0, 1) and (1, −1) are the three
+ * through a hexagon's edges. The name is meantonal's, spelled out; a layout is a
+ * basis change in (w, h), so it is the same in every tuning.
+ */
+export function stepIntervalName(layout: Layout, dx: number, dy: number): string {
+  const v = layout.matrix.map(new MapVec(dx, dy));
+  const short = new Interval(v.x, v.y).name; // e.g. "M2", "-P4", "AA1"
+  const down = short.startsWith("-");
+  const m = /^-?([PMm]|A+|d+)(\d+)$/.exec(short);
+  if (!m) return short;
+  const code = m[1] + m[2];
+  const number = +m[2];
+  const quality =
+    m[1].length > 1
+      ? `${m[1].length}× ${QUALITY[m[1][0]]}`
+      : QUALITY[m[1]];
+  const name = STEP_NAME[code] ?? `${quality} ${ORDINAL[number - 1] ?? `${number}th`}`;
+  return down ? `${name} down` : name;
+}
 
 /** The board's centre key — the natural place to pin an anchor note. */
 export const CENTRE_KEY: readonly [number, number] = [3, 3];

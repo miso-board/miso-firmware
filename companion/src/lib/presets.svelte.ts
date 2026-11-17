@@ -20,6 +20,8 @@ import { NUM_KEYS } from "./layout";
 import {
   DEFAULT_PITCH_GENERATOR,
   LAYOUTS,
+  fifthCents,
+  tuningError,
   REFERENCE_HZ_MAX,
   REFERENCE_HZ_MIN,
   referenceOffsetMilli,
@@ -42,6 +44,7 @@ import {
   type ColorgenCaps,
   type GeneratorParams,
 } from "./colorMaps";
+import { autoColorsFor } from "./autoColors";
 import { sendBytes } from "./serial";
 import { ui, toast, fwAtLeast } from "./ui.svelte";
 import { mesh, gridCells, cellKey } from "./mesh.svelte";
@@ -94,7 +97,18 @@ function defaultPreset(): Preset {
 }
 
 export const presetState = $state({
+  /** The presets as they are being edited. */
   presets: [defaultPreset()] as Preset[],
+  /**
+   * Each preset as it was last SAVED, as JSON, index for index with `presets`.
+   *
+   * Editing a preset changes only the working copy above; nothing reaches
+   * storage until `savePreset`. Keeping the saved form alongside is what lets
+   * the list be written out (when a preset is added, removed or selected)
+   * without sweeping another preset's unsaved edits along with it, and what
+   * `isDirty` compares against.
+   */
+  saved: [JSON.stringify(defaultPreset())] as string[],
   active: 0,
   /**
    * The pitch frame the board is believed to be running, as hex.
@@ -179,6 +193,8 @@ function normaliseColorGenerator(raw: any): GeneratorParams {
     ? raw.palette.filter((c: unknown) => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c))
     : [];
   const isHex = (c: unknown): c is string => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c);
+  const percent = (v: unknown): number =>
+    Number.isFinite(v) ? Math.min(100, Math.max(0, Math.round(Number(v)))) : LIGHTEN_DEFAULT;
   const partitions = (Array.isArray(raw.partitions) ? raw.partitions : [])
     .filter((p: any) => p && isHex(p.color) && Number.isFinite(p.width))
     .slice(0, PARTITIONS_MAX)
@@ -189,8 +205,23 @@ function normaliseColorGenerator(raw: any): GeneratorParams {
   const letter = Math.round(Number(raw.anchorLetter));
   const anchorPartition = Math.round(Number(raw.anchorPartition));
   return {
+    autoColors: raw.autoColors === true,
     // A partition scheme with no partitions has nothing to draw with.
-    scheme: raw.scheme === "partitions" && partitions.length ? "partitions" : "accidental",
+    scheme:
+      raw.scheme === "partitions" && partitions.length
+        ? "partitions"
+        : raw.scheme === "piano"
+          ? "piano"
+          : "accidental",
+    piano: {
+      natural: isHex(raw.piano?.natural) ? raw.piano.natural : d.piano.natural,
+      accidental: isHex(raw.piano?.accidental) ? raw.piano.accidental : d.piano.accidental,
+      centres: raw.piano?.centres === true,
+      centreNatural: isHex(raw.piano?.centreNatural) ? raw.piano.centreNatural : d.piano.centreNatural,
+      centreAccidental: isHex(raw.piano?.centreAccidental)
+        ? raw.piano.centreAccidental
+        : d.piano.centreAccidental,
+    },
     partitions,
     anchorLetter: letter >= 0 && letter < FIFTHS_LETTERS.length ? letter : 0,
     anchorPartition:
@@ -204,9 +235,10 @@ function normaliseColorGenerator(raw: any): GeneratorParams {
       Number.isInteger(raw.lightenLetterIndex) && raw.lightenLetterIndex >= 0 && raw.lightenLetterIndex < 7
         ? raw.lightenLetterIndex
         : 0,
-    lightenAmount: Number.isFinite(raw.lightenAmount)
-      ? Math.min(100, Math.max(0, Math.round(Number(raw.lightenAmount))))
-      : LIGHTEN_DEFAULT,
+    // One amount per landmark. `lightenAmount` is the single shared one that
+    // presets saved before they were separated carry; it seeds both.
+    lightenCDEAmount: percent(raw.lightenCDEAmount ?? raw.lightenAmount),
+    lightenLetterAmount: percent(raw.lightenLetterAmount ?? raw.lightenAmount),
   };
 }
 
@@ -276,18 +308,48 @@ export function load(): void {
       .map(normalise)
       .filter((p: Preset | null): p is Preset => p !== null);
     presetState.presets = presets.length ? presets : [defaultPreset()];
+    presetState.saved = presetState.presets.map((p) => JSON.stringify(p));
     presetState.active = Math.min(Math.max(0, data.active | 0), presetState.presets.length - 1);
-    save(); // migrate storage forward on first load
+    persist(); // migrate storage forward on first load
   } catch {}
 }
 
-function save(): void {
+/** Write the SAVED presets and the selection to storage. Never the working copies. */
+function persist(): void {
   try {
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ presets: presetState.presets, active: presetState.active }),
+      JSON.stringify({
+        presets: presetState.saved.map((json) => JSON.parse(json)),
+        active: presetState.active,
+      }),
     );
   } catch {}
+}
+
+/** True when a preset has edits that have not been saved. */
+export function isDirty(index: number = presetState.active): boolean {
+  const p = presetState.presets[index];
+  return p !== undefined && JSON.stringify(p) !== presetState.saved[index];
+}
+
+/** True when any preset has unsaved edits. */
+export function anyDirty(): boolean {
+  return presetState.presets.some((_, i) => isDirty(i));
+}
+
+/** Save the active preset's edits. */
+export function savePreset(): void {
+  presetState.saved[presetState.active] = JSON.stringify(activePreset());
+  persist();
+}
+
+/** Throw the active preset's unsaved edits away, returning to what was saved. */
+export function revertPreset(): void {
+  const json = presetState.saved[presetState.active];
+  if (json === undefined) return;
+  presetState.presets[presetState.active] = JSON.parse(json);
+  schedulePush({ colors: true, pitch: true });
 }
 
 // --- editing the colour layer ----------------------------------------------
@@ -295,7 +357,6 @@ function save(): void {
 /** Paint one key by hand. The generator stays underneath for the rest. */
 export function paint(x: number, y: number, hex: string): void {
   activeColors().colors[cellKey(x, y)] = hex;
-  save();
   schedulePush({ colors: true });
 }
 
@@ -304,7 +365,6 @@ export function fillAll(hex: string): void {
   const colors: Record<string, string> = {};
   for (const c of gridCells()) colors[c.key] = hex;
   activeColors().colors = colors;
-  save();
   schedulePush({ colors: true });
 }
 
@@ -316,7 +376,6 @@ export function paintedCount(): number {
 /** Discard every hand-painted key, returning to the generated colours. */
 export function resetColors(): void {
   activeColors().colors = {};
-  save();
   schedulePush({ colors: true });
 }
 
@@ -324,7 +383,7 @@ export function resetColors(): void {
 export function updateColorGenerator(patch: Partial<GeneratorParams>): void {
   const m = activeColors();
   m.generator = { ...m.generator, ...patch };
-  save();
+  recolourFromTuning();
   schedulePush({ colors: true });
 }
 
@@ -343,9 +402,26 @@ export function updateColorGenerator(patch: Partial<GeneratorParams>): void {
 export function updatePitchGenerator(patch: Partial<PitchGenerator>): void {
   const m = activePitch();
   m.generator = { ...m.generator, ...patch };
-  save();
   const movesRows = "layout" in patch || "anchorNote" in patch || "anchorKey" in patch;
-  schedulePush({ pitch: true, colors: movesRows });
+  // A scheme that follows the tuning changes colour with it — the one case
+  // where retuning does have to reach the LEDs.
+  const recoloured = "tuning" in patch && recolourFromTuning();
+  schedulePush({ pitch: true, colors: movesRows || recoloured });
+}
+
+/**
+ * Rewrite the active preset's colours from its tuning, if it asks for that.
+ *
+ * Called after anything that could change the answer: the tuning, or the rows
+ * themselves (how many, which scheme, where the anchor is). Returns whether the
+ * colours are generated, so a caller knows the LEDs need them.
+ */
+function recolourFromTuning(): boolean {
+  const g = activeColors().generator;
+  const tuning = activePitch().generator.tuning;
+  if (!g.autoColors || tuningError(tuning) !== null) return false;
+  activeColors().generator = { ...g, ...autoColorsFor(g, fifthCents(tuning)) };
+  return true;
 }
 
 // Mutators for per-key pitch overrides are deliberately absent. The data model
@@ -357,49 +433,59 @@ export function updatePitchGenerator(patch: Partial<PitchGenerator>): void {
 
 // --- managing the list -----------------------------------------------------
 
+/**
+ * Add a preset to the list, saved as it stands, and select it.
+ *
+ * Adding one is an explicit act, so unlike an edit it is written straight away
+ * — a preset that vanished on reload because nobody pressed Save would be a
+ * surprise. The same goes for removing and selecting.
+ */
+function addPreset(p: Preset): void {
+  presetState.presets.push(p);
+  presetState.saved.push(JSON.stringify(p));
+  presetState.active = presetState.presets.length - 1;
+  persist();
+  schedulePush({ colors: true, pitch: true });
+}
+
 export function newPreset(): void {
-  presetState.presets.push({
+  addPreset({
     name: `Preset ${presetState.presets.length + 1}`,
     colors: { colors: {}, generator: defaultGenerator() },
     pitch: defaultPitchMap(),
   });
-  presetState.active = presetState.presets.length - 1;
-  save();
-  schedulePush({ colors: true, pitch: true });
 }
 
+/** Copy the active preset as it is on screen, unsaved edits included. */
 export function duplicatePreset(): void {
-  const src = activePreset();
-  presetState.presets.push({
-    name: `${src.name} copy`,
-    colors: structuredClone(src.colors),
-    pitch: structuredClone(src.pitch),
-    ...(src.settings ? { settings: structuredClone(src.settings) } : {}),
-  });
-  presetState.active = presetState.presets.length - 1;
-  save();
+  const src = $state.snapshot(activePreset()) as Preset;
+  addPreset({ ...structuredClone(src), name: `${src.name} copy` });
 }
 
+/** Rename the active preset. An edit like any other: it needs saving. */
 export function renamePreset(name: string): void {
   activePreset().name = name;
-  save();
 }
 
 export function deletePreset(): void {
   if (presetState.presets.length <= 1) {
-    presetState.presets = [defaultPreset()];
+    const fresh = defaultPreset();
+    presetState.presets = [fresh];
+    presetState.saved = [JSON.stringify(fresh)];
     presetState.active = 0;
   } else {
     presetState.presets.splice(presetState.active, 1);
+    presetState.saved.splice(presetState.active, 1);
     presetState.active = Math.min(presetState.active, presetState.presets.length - 1);
   }
-  save();
+  persist();
   schedulePush({ colors: true, pitch: true });
 }
 
 export function selectPreset(index: number): void {
+  if (index < 0 || index >= presetState.presets.length) return;
   presetState.active = index;
-  save();
+  persist();
   schedulePush({ colors: true, pitch: true });
 }
 
@@ -598,10 +684,7 @@ export function importPresetJson(text: string): boolean {
   try {
     const p = normalise(JSON.parse(text));
     if (!p) return false;
-    presetState.presets.push(p);
-    presetState.active = presetState.presets.length - 1;
-    save();
-    schedulePush({ colors: true, pitch: true });
+    addPreset(p);
     return true;
   } catch {
     return false;

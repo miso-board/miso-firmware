@@ -47,16 +47,19 @@ not raw scans, and remote sensor data at full rate would be 93 kB/s against a
 46 kB/s link. Live levels, stats and press capture therefore show the
 USB-connected board's own keys only.
 
-**Mapping**, the first tab, sets up a preset on one view of the instrument in axial hex:
-click or drag to paint key colours, with every key labelled by what it sounds —
-note name, MIDI number, bend or frequency. Colours start out generated from the
-pitch mapping and become custom once painted over, with a button to reset them.
-Underneath, in the order each depends on the last: the **tuning** (a row of
+**Mapping**, the first tab, sets up a preset. At the top the presets are a row of
+icons — each a 2×2 tiling of boards in that preset's own colours and layout —
+with *Create new* at the end, a bin on the selected one, and Save, Duplicate,
+Copy JSON, Import and Send to board beneath.
+Below that, in the order each depends on the last: the **tuning** (a row of
 common EDOs, a list of the rest, a ruler for the width of the fifth and a cents
 box, all showing and setting the same number, plus concert pitch as a note and
 a frequency); the **layout**, picked from live icons — 2×2 board tilings drawn in
 the preset's own colour rows — with the anchor note that places it on the keys;
-and the **colour rows**. One button sends tuning and colours to the board. Keys are drawn
+and the **colour rows**. Last, because it is used least, comes the keyboard
+itself: every key in its LED colour, labelled by what it sounds (note name, MIDI
+number, bend or frequency), with a brush for painting individual keys over the
+generated colours and a button to reset them. Keys are drawn
 in a single flat colour derived from the LED value (hue kept legible, washed
 toward white with brightness). **MIDI** monitors the board's MPE output and
 checks each received note against what meantonal says that key should sound, at
@@ -136,30 +139,57 @@ them; per-key pitch entry is modelled and persisted but has no editor yet.
 The colour generator holds only what the rows *look like* — palette, first
 accidental, brightness, the landmark tint. The landmark lightens some keys toward
 white by a chosen amount and is the layout's: C, D and E under Wicki-Hayden, every
-key of one chosen letter under Bosanquet and the Harmonic Table (`landmarkFor`,
-`lightenMask`). Each keeps its own switch, so changing layout loses neither. *Where* they fall is the pitch
+key of one chosen letter under Bosanquet, none under the Harmonic Table
+(`landmarkFor`, `lightenMask`). Each keeps its own switch and its own amount, so
+changing layout loses neither. *Where* they fall is the pitch
 generator's layout and anchor, so a key is always coloured by the accidental of
 the note it plays; there is no way to colour by one layout while sounding
 another.
 
 How the rows are cut is a **partition of the chain of fifths** (… B♭ F C G D A E
 B F♯ …): consecutive runs, each with a colour, repeating end to end. There are
-two ways to say it. *Accidental* is equal runs of seven starting on F — naturals,
-sharps, flats — one palette row each. *Partitions* is a list of runs of any
-widths, pinned by naming the natural that starts one of them; seven then five is
-the common two-row scheme, repeating every twelve fifths. The first is a special
-case of the second (`partitionsFromAccidentals`), kept as its own mode because
-it is the familiar one and the one every firmware since 0.8.0 can generate.
+three ways to say it. *Accidental* is equal runs of seven starting on F — naturals,
+sharps, flats — one palette row each. *Piano* is seven then five, repeating every
+twelve fifths: one colour for the naturals and one for the sharps and flats, with
+an option to pick out the middle key of each group of three (D, and G♯/A♭) in two
+more. *Partitions* is a list of runs of any widths, pinned by naming the natural
+that starts one of them. The first two are special cases of the third
+(`partitionsFromAccidentals`, `pianoPartitions`), kept as modes of their own
+because they are what people mean; Piano with its centre keys is six partitions,
+exactly what the firmware's frame carries.
 `colorgenFrame` sends a scheme that *is* accidental rows in that form however it
 was authored (`asAccidentalScheme` decides), and otherwise as a partition frame,
 which needs firmware 0.9.0 and at most six partitions. Anything else is rendered
 here and sent as `L` frames, so it needs the app connected.
+
+The colours themselves can **follow the tuning** (`autoColors`, off by default so
+a new preset matches a board's boot colours). `src/lib/autoColors.ts` maps the
+width of the fifth to a base hue through fixed points — red at 7-EDO, deep orange
+at 19, gold at 31, green at a pure fifth, blue at 22, magenta at 5 — and spreads a
+scheme's rows around it, the naturals (or the anchored partition) taking the hue
+itself. Rows are spaced by how different they *look*, not by hue angle, and by
+how they look in two places: on a screen (Oklab distance), and as LED light,
+which is linear in the number sent and has purer primaries, so colours bunch
+around yellow, cyan and magenta and it is hue that separates two keys. Each row
+sits at the first point far enough from the last by all three measures
+(`rowSpacing`), which is what widens the steps through the greens, cyans and
+purples. The LED primaries are approximate (`LED_PRIMARIES`), not measured. It is a pure function of the fifth and the row, so any number of rows gets
+the same colours every time. The preset store writes the result into the stored
+palette whenever the tuning or the rows change, so drawing and the wire frames
+read plain colours and know nothing of it; editing a swatch by hand turns it off.
 
 A preset starts procedural. Painting a key adds a colour override and
 makes it **custom**; **Reset to generated colours** drops the overrides. Older
 documents whose colour generator carried its own `layout` and `offset` load with
 those dropped, and hand-painted ones with no generator get the default
 underneath their painted keys.
+
+Edits are **not saved as they are made**. They show on screen and stream to the
+boards at once, but a preset is written to storage only by *Save changes*; the
+store keeps each preset's saved form alongside its working copy
+(`presetState.saved`), which is what lets adding, deleting or selecting a preset
+be written immediately without sweeping another preset's unsaved edits along, and
+what `isDirty` compares against. Leaving the page with unsaved edits prompts.
 
 Stored in `localStorage` under `miso-presets-v1`, reading `miso-color-maps-v2`
 and a v1 key as fallbacks and leaving both in place as backups
@@ -204,9 +234,9 @@ wire format:
 | Command | What it proves |
 |---------|----------------|
 | `npm run check` | `svelte-check`: types across the app |
-| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,316 assertions |
+| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,415 assertions |
 | `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `../Core/Src/main.c`, compiles it with clang, and diffs it against the app over nine tunings × three layouts × six concert-pitch offsets × a four-board grid — 20,088 cases, plus the byte-identical-default claim on 124 keys |
-| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 1,956 generators × a four-board grid — accidental rows, partition schemes and landmark tints, 242,544 cases — plus the byte-identical-boot-pattern claim and nineteen validation cases |
+| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 1,992 generators × a four-board grid — accidental rows, the piano scheme, partition schemes and landmark tints, 247,008 cases — plus the byte-identical-boot-pattern claim and nineteen validation cases |
 
 The 12-TET case is the one to keep: at a 700¢ fifth a wrong coefficient would not
 collapse to equal temperament, a wrong anchor would disagree with meantonal's own
@@ -232,6 +262,7 @@ keys in the wrong places rather than an error.
 | `src/lib/engine.ts` | frame ingestion, per-key stats, press capture |
 | `src/lib/tuning.ts` | pitch via meantonal, layout bases, note names, `pitchFrame` (`P`) |
 | `src/lib/colorMaps.ts` | colour semantics, `generateColorAt`, `colorgenFrame` (`K`) |
+| `src/lib/autoColors.ts` | colours worked out from the width of the fifth |
 | `src/lib/presets.svelte.ts` | the preset document, persistence, push orchestration, version gates |
 | `src/lib/mesh.svelte.ts` | `T`/`MESH` parsing, the grid model |
 | `src/lib/layout.ts` | the physical board: LED order, sensor positions, screen projection |
