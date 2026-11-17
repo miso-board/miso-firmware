@@ -10,13 +10,13 @@
   import { swatchStyle } from "../lib/ledColor";
   import {
     FIFTHS_LETTERS, PARTITIONS_MAX, PARTITION_WIDTH_MAX,
-    COLORGEN_PART_MAX, COLORGEN_PAL_MAX,
+    COLORGEN_PART_MAX, COLORGEN_PAL_MAX, LANDMARK_LETTERS, landmarkFor,
     defaultGenerator, fifthsName, partitionStarts, partitionsFromAccidentals,
     type GeneratorParams, type Partition,
   } from "../lib/colorMaps";
   import {
     activeColors, activePitch, updateColorGenerator, paintedCount, colorGenerationLimit,
-    COLORGEN_PARTITIONS_FW,
+    COLORGEN_LIGHTEN_FW,
   } from "../lib/presets.svelte";
   import { ui } from "../lib/ui.svelte";
 
@@ -24,6 +24,9 @@
 
   const gen = $derived(activeColors().generator);
   const layoutName = $derived(LAYOUTS[activePitch().generator.layout].name);
+  // The landmark is the layout's: C D E under Wicki-Hayden, one letter otherwise.
+  const landmark = $derived(landmarkFor(activePitch().generator.layout));
+  const landmarkOn = $derived(landmark === "cde" ? gen.lightenCDE : gen.lightenLetter);
   const painted = $derived(paintedCount());
   const byPartition = $derived(gen.scheme === "partitions" && gen.partitions.length > 0);
 
@@ -193,14 +196,43 @@
 
     <div class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
       Landmark
-      <button
-        class="btn text-sm normal-case tracking-normal"
-        style={gen.lightenCDE ? "border-color: var(--accent); color: var(--accent)" : ""}
-        aria-pressed={gen.lightenCDE ?? false}
-        title="Tint the keys whose letter is C, D or E paler"
-        onclick={() => updateGenerator({ lightenCDE: !gen.lightenCDE })}
-      >Lighten C D E</button>
+      <div class="flex items-center gap-1.5 text-sm normal-case tracking-normal">
+        {#if landmark === "cde"}
+          <button
+            class="btn"
+            style={gen.lightenCDE ? "border-color: var(--accent); color: var(--accent)" : ""}
+            aria-pressed={gen.lightenCDE}
+            onclick={() => updateGenerator({ lightenCDE: !gen.lightenCDE })}
+          >Lighten C D E</button>
+        {:else}
+          <button
+            class="btn"
+            style={gen.lightenLetter ? "border-color: var(--accent); color: var(--accent)" : ""}
+            aria-pressed={gen.lightenLetter}
+            onclick={() => updateGenerator({ lightenLetter: !gen.lightenLetter })}
+          >Lighten every</button>
+          <select
+            class="btn"
+            value={gen.lightenLetterIndex}
+            aria-label="Letter to lighten"
+            onchange={(e) => updateGenerator({ lightenLetterIndex: +e.currentTarget.value, lightenLetter: true })}
+          >
+            {#each LANDMARK_LETTERS as letter, i}<option value={i}>{letter}</option>{/each}
+          </select>
+        {/if}
+      </div>
     </div>
+
+    <label class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
+      Lighten by <span class="mono normal-case" style="color: var(--text)">{gen.lightenAmount}%</span>
+      <input
+        type="range" min="0" max="100" value={gen.lightenAmount}
+        disabled={!landmarkOn}
+        oninput={(e) => updateGenerator({ lightenAmount: +e.currentTarget.value })}
+        class="w-32"
+        aria-label="How far landmark keys move toward white"
+      />
+    </label>
 
     <label class="flex flex-col gap-1 text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">
       LED brightness <span class="mono normal-case" style="color: var(--text)">{gen.brightness}%</span>
@@ -291,9 +323,9 @@
   {#if limit !== "none"}
     <p class="m-0 mt-3 text-xs" style="color: var(--text-dim)">
       {#if limit === "firmware"}
-        This firmware (<span class="mono">{ui.fwVersion ?? "unknown"}</span>) can only generate
-        accidental rows on its own; update to
-        <b style="color: var(--text)">{COLORGEN_PARTITIONS_FW.join(".")}</b> or newer for partitions.
+        This firmware (<span class="mono">{ui.fwVersion ?? "unknown"}</span>) can't generate this
+        scheme on its own; update to
+        <b style="color: var(--text)">{COLORGEN_LIGHTEN_FW.join(".")}</b> or newer.
       {:else if byPartition}
         The boards can generate up to {COLORGEN_PART_MAX} partitions on their own.
       {:else}

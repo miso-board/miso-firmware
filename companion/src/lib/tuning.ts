@@ -160,6 +160,35 @@ export const VALID_EDOS: readonly number[] = (() => {
   return out;
 })();
 
+const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+
+/**
+ * The smaller EDO that `edo`'s chain of fifths actually walks, or `edo` itself
+ * when the chain reaches every step.
+ *
+ * Every pitch here is a stack of fifths and octaves, so an EDO whose fifth
+ * shares a factor with its size only ever lands on a fraction of its steps:
+ * 24-EDO's fifth is 14 steps, which is 12-EDO's 7 doubled, so its quarter tones
+ * are unreachable and it plays as 12-EDO. That is a limit of mapping with
+ * integer coordinates over a fifth-generated basis, not of the tuning.
+ */
+export function effectiveEdo(edo: number): number {
+  return edo / gcd(fifthStepsOf(edo), edo);
+}
+
+/**
+ * The EDOs offered for selection: the valid ones the keys can play in full.
+ *
+ * Narrower than `VALID_EDOS` on purpose. The rest still load and sound — a
+ * stored preset in 24-EDO keeps working, as 12 — they are just not offered,
+ * because picking one would not give what its name promises. Being a multiple
+ * of a smaller EDO is not the test: 50 is a multiple of 5 and 10, but its fifth
+ * is 29 steps, which reaches all fifty.
+ */
+export const SELECTABLE_EDOS: readonly number[] = VALID_EDOS.filter(
+  (edo) => effectiveEdo(edo) === edo,
+);
+
 /**
  * Why this tuning cannot be used at all, or null if it can.
  *
@@ -227,9 +256,81 @@ export function tuningMap(t: Tuning): TuningMap {
 const REF_PITCH = SPN.toPitch("C4");
 const REF_MIDI = 60;
 
-/** Frequency of a pitch in a tuning, in Hz. */
-export function hzAt(t: Tuning, p: Pitch): number {
-  return tuningMap(t).toHz(p);
+// --- Concert pitch ----------------------------------------------------------
+
+/**
+ * Concert pitch: one spelled note, and the frequency it sounds at.
+ *
+ * A tuning says how wide every interval is; this says where the whole thing
+ * sits. "A4 = 440 Hz" and "C4 = 261.63 Hz" are the same statement in 12-TET
+ * and different ones in every other tuning, which is why it has to be said
+ * with a note.
+ */
+export interface Reference {
+  /** SPN, e.g. "C4". */
+  note: string;
+  hz: number;
+}
+
+/**
+ * C4 on its 12-TET frequency — 261.63 Hz to the two places anyone quotes it to.
+ *
+ * Held at full precision rather than as 261.63 so that the default is exactly
+ * what the firmware plays with no concert pitch set (every C on a 12-TET C).
+ * Rounding it would put a default preset three hundredths of a cent away from
+ * a board that has never heard from this app.
+ */
+export const DEFAULT_REFERENCE: Reference = { note: "C4", hz: 440 * 2 ** (-9 / 12) };
+
+export const REFERENCE_HZ_MIN = 20;
+export const REFERENCE_HZ_MAX = 8000;
+
+/** Why a reference cannot be used, or null if it can. */
+export function referenceError(ref: Reference): string | null {
+  try {
+    SPN.toPitch(ref.note);
+  } catch {
+    return `"${ref.note}" isn't a note name — try C4, A4 or F#3.`;
+  }
+  if (!Number.isFinite(ref.hz) || ref.hz < REFERENCE_HZ_MIN || ref.hz > REFERENCE_HZ_MAX) {
+    return `Concert pitch must be between ${REFERENCE_HZ_MIN} and ${REFERENCE_HZ_MAX} Hz.`;
+  }
+  return null;
+}
+
+/** Where a pitch falls in MIDI note numbers with every C on a 12-TET C. */
+function midiFloatUnshifted(t: Tuning, p: Pitch): number {
+  return REF_MIDI + tuningMap(t).toCents(REF_PITCH.intervalTo(p)) / 100;
+}
+
+/**
+ * How far, in cents, concert pitch moves every key from where it would be with
+ * each C on a 12-TET C. Zero for the default reference.
+ *
+ * It is one number for the whole instrument: the reference note has to land on
+ * its frequency, and every other note keeps its interval from it.
+ */
+export function referenceOffsetCents(t: Tuning, ref: Reference = DEFAULT_REFERENCE): number {
+  if (referenceError(ref) !== null) return 0; // an unusable one changes nothing
+  const want = 69 + 12 * Math.log2(ref.hz / 440);
+  const cents = (want - midiFloatUnshifted(t, SPN.toPitch(ref.note))) * 100;
+  // The default is zero up to float noise; make it exactly zero, so it rounds
+  // the same way as the firmware's integers do.
+  return Math.abs(cents) < 1e-6 ? 0 : cents;
+}
+
+/** The reference a pitch generator carries, falling back to the default. */
+export function referenceOf(g: Pick<PitchGenerator, "referenceNote" | "referenceHz">): Reference {
+  return {
+    note: g.referenceNote ?? DEFAULT_REFERENCE.note,
+    hz: g.referenceHz ?? DEFAULT_REFERENCE.hz,
+  };
+}
+
+/** Frequency of a pitch in a tuning at a concert pitch, in Hz. */
+export function hzAt(t: Tuning, p: Pitch, ref: Reference = DEFAULT_REFERENCE): number {
+  const midi = midiFloatUnshifted(t, p) + referenceOffsetCents(t, ref) / 100;
+  return 440 * 2 ** ((midi - 69) / 12);
 }
 
 // --- MIDI / MPE -------------------------------------------------------------
@@ -260,8 +361,9 @@ export function midiFor(
   p: Pitch,
   t: Tuning,
   bendSemitones = MPE_BEND_SEMITONES,
+  ref: Reference = DEFAULT_REFERENCE,
 ): MidiPitch {
-  const midiFloat = REF_MIDI + tuningMap(t).toCents(REF_PITCH.intervalTo(p)) / 100;
+  const midiFloat = midiFloatUnshifted(t, p) + referenceOffsetCents(t, ref) / 100;
   const note = Math.round(midiFloat);
   const cents = (midiFloat - note) * 100;
   const bend = 8192 + Math.round((cents / (bendSemitones * 100)) * 8192);
@@ -320,6 +422,10 @@ export interface PitchGenerator {
   anchorKey: [number, number];
   /** MPE bend range the note+bend encoding assumes. */
   bendSemitones: number;
+  /** Concert pitch: this note, in SPN… */
+  referenceNote: string;
+  /** …sounds at this frequency. See `Reference`. */
+  referenceHz: number;
 }
 
 /**
@@ -360,6 +466,8 @@ export const DEFAULT_PITCH_GENERATOR: PitchGenerator = {
   anchorNote: "D4",
   anchorKey: [...CENTRE_KEY] as [number, number],
   bendSemitones: MPE_BEND_SEMITONES,
+  referenceNote: DEFAULT_REFERENCE.note,
+  referenceHz: DEFAULT_REFERENCE.hz,
 };
 
 export function defaultPitchMap(): PitchMap {
@@ -414,27 +522,38 @@ export function isOverridden(m: PitchMap, x: number, y: number): boolean {
 
 // --- The `P` wire frame -----------------------------------------------------
 
-export const PITCH_FRAME_LEN = 17; // 'P' + 16 payload bytes
+export const PITCH_FRAME_LEN = 21; // 'Q' + 20 payload bytes
+export const PITCH_LEGACY_FRAME_LEN = 17; // 'P' + 16, for firmware before 0.10.0
+
+/** The concert-pitch offset as the firmware takes it: whole millicents. */
+export function referenceOffsetMilli(g: PitchGenerator): number {
+  return Math.round(referenceOffsetCents(g.tuning, referenceOf(g)) * 1000);
+}
 
 /**
  * The tuning parameters, as the firmware wants them.
  *
- * 'P' · int32 fifth millicents · int16 m00, m01, m10, m11 · int16 aw, ah,
- * little-endian. Seventeen bytes replace what would otherwise be a per-key
- * table, and the firmware evaluates them at absolute coordinates so one frame
- * covers every board in the mesh.
+ * 'Q' · int32 fifth millicents · int16 m00, m01, m10, m11 · int16 aw, ah ·
+ * int32 concert-pitch offset in millicents, little-endian. Twenty-one bytes
+ * replace what would otherwise be a per-key table, and the firmware evaluates
+ * them at absolute coordinates so one frame covers every board in the mesh.
+ *
+ * Firmware before 0.10.0 has only 'P', the same frame without the offset — so
+ * with `withReference` false the concert pitch is simply not sent, and the
+ * board plays with every C on a 12-TET C (`referenceOffsetMilli` says how far
+ * off that is).
  *
  * Note what is NOT computed here: no note numbers, no bends. This function
  * rounds a fifth and copies six matrix/anchor integers, and that is all — which
  * is what keeps the app's expected-pitch path independent of the firmware's.
  */
-export function pitchFrame(m: PitchMap): Uint8Array {
+export function pitchFrame(m: PitchMap, withReference = false): Uint8Array {
   const g = m.generator;
   const matrix = LAYOUTS[g.layout].matrix;
   const a = anchorVec(g);
 
-  const frame = new Uint8Array(PITCH_FRAME_LEN);
-  frame[0] = 0x50; // 'P'
+  const frame = new Uint8Array(withReference ? PITCH_FRAME_LEN : PITCH_LEGACY_FRAME_LEN);
+  frame[0] = withReference ? 0x51 : 0x50; // 'Q' : 'P'
   const dv = new DataView(frame.buffer);
   dv.setInt32(1, Math.round(fifthCents(g.tuning) * 1000), true);
   // Signed: Wicki-Hayden's matrix is (1, −2, 0, −1).
@@ -444,5 +563,6 @@ export function pitchFrame(m: PitchMap): Uint8Array {
   dv.setInt16(11, matrix.m11, true);
   dv.setInt16(13, a.w, true);
   dv.setInt16(15, a.h, true);
+  if (withReference) dv.setInt32(17, referenceOffsetMilli(g), true);
   return frame;
 }

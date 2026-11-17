@@ -13,14 +13,17 @@
     /** The fifth, in cents. */
     value: number;
     onchange: (cents: number) => void;
+    /** Named fifths to point out along the bottom edge, e.g. the common EDOs. */
+    marks?: { cents: number; label: string }[];
   }
-  let { value, onchange }: Props = $props();
+  let { value, onchange, marks = [] }: Props = $props();
 
-  const HEIGHT = 62; // CSS px
+  const MARKS_H = 15; // room under the ruler for the marks' labels, when there are any
+  const HEIGHT = $derived(62 + (marks.length ? MARKS_H : 0)); // CSS px
   const PAD = 10; // side margin, so the marker is not clipped at the endpoints
   const LABEL_Y = 10; // baseline row for the cent numbers
   const RULER_TOP = 26; // the marker's tip touches this edge
-  const RULER_BOTTOM = HEIGHT - 4;
+  const RULER_BOTTOM = 58;
   const MIN_TICK_GAP = 10; // CSS px between the finest gradations
 
   let canvas: HTMLCanvasElement;
@@ -117,6 +120,31 @@
       taken = t.left + t.w + GAP;
     }
 
+    // Named fifths: a tick up from the bottom edge and a label underneath, in
+    // the accent colour so they read as a different kind of thing from cents.
+    if (marks.length) {
+      const accent = token("--accent");
+      ctx.strokeStyle = accent;
+      ctx.fillStyle = accent;
+      ctx.lineWidth = 1.5;
+      ctx.textBaseline = "alphabetic";
+      let takenTo = -Infinity;
+      for (const m of [...marks].sort((a, b) => a.cents - b.cents)) {
+        if (m.cents < FIFTH_MIN || m.cents > FIFTH_MAX) continue;
+        const x = xOf(m.cents);
+        ctx.beginPath();
+        ctx.moveTo(x, RULER_BOTTOM);
+        ctx.lineTo(x, RULER_BOTTOM - bodyH * 0.3);
+        ctx.stroke();
+        const w = ctx.measureText(m.label).width;
+        const left = Math.min(Math.max(x - w / 2, 0), width - w);
+        if (left < takenTo) continue; // no room beside the previous label
+        ctx.fillText(m.label, left, RULER_BOTTOM + 12);
+        takenTo = left + w + 3;
+      }
+      ctx.lineWidth = 1;
+    }
+
     // The marker: a triangle whose tip rests on the ruler's top edge, and a
     // line from that tip across to the far side.
     const mx = xOf(Math.min(FIFTH_MAX, Math.max(FIFTH_MIN, value)));
@@ -138,6 +166,7 @@
   $effect(() => {
     // Named so the effect tracks them; draw() reads the rest from the DOM.
     void value;
+    void marks;
     void width;
     void themeTick;
     draw();

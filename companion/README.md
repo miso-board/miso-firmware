@@ -51,9 +51,12 @@ USB-connected board's own keys only.
 click or drag to paint key colours, with every key labelled by what it sounds —
 note name, MIDI number, bend or frequency. Colours start out generated from the
 pitch mapping and become custom once painted over, with a button to reset them.
-The layout is picked from a row of live icons — 2×2 board tilings drawn in the
-preset's own colour rows — and the tuning and colour generators sit side by side
-underneath, and one button sends both to the board. Keys are drawn
+Underneath, in the order each depends on the last: the **tuning** (a row of
+common EDOs, a list of the rest, a ruler for the width of the fifth and a cents
+box, all showing and setting the same number, plus concert pitch as a note and
+a frequency); the **layout**, picked from live icons — 2×2 board tilings drawn in
+the preset's own colour rows — with the anchor note that places it on the keys;
+and the **colour rows**. One button sends tuning and colours to the board. Keys are drawn
 in a single flat colour derived from the LED value (hue kept legible, washed
 toward white with brightness). **MIDI** monitors the board's MPE output and
 checks each received note against what meantonal says that key should sound, at
@@ -85,7 +88,7 @@ Status lines the app parses:
 | `MESH self=… \| port=… \| board=… \| stat …` | `src/lib/mesh.svelte.ts` | the grid model |
 
 **Sending.** The app uses a deliberately small subset: `i`, `s`, `x`, `d<N>`,
-`T`, and the four push commands `C`, `L`, `P`, `K`. Everything else in the
+`T`, and the push commands `C`, `L`, `Q` and `G` (or `P` and `K` for firmware before 0.10.0). Everything else in the
 firmware's table — `l`, `M`, `e`, `r`, `k`, `f`, `F`, `n`, `p<N>`, `B!` — is a
 manual diagnostic, driven from a serial terminal or the flashing scripts.
 
@@ -93,13 +96,15 @@ manual diagnostic, driven from a serial terminal or the flashing scripts.
 
 The board reports `fw=miso X.Y.Z` on its `INFO` line, from `FW_VERSION` in
 [`../Core/Src/main.c`](../Core/Src/main.c). `fwAtLeast()` in
-`src/lib/ui.svelte.ts` compares against three constants in
+`src/lib/ui.svelte.ts` compares against five constants in
 `src/lib/presets.svelte.ts`:
 
 ```ts
 export const PITCH_PUSH_FW    = [0, 7, 0] as const;   // 'P'
+export const PITCH_REFERENCE_FW = [0, 10, 0] as const;  // 'Q': 'P' plus a concert pitch
 export const COLORGEN_PUSH_FW = [0, 8, 0] as const;   // 'K'
 export const COLORGEN_PARTITIONS_FW = [0, 9, 0] as const;   // 'K' carrying partitions
+export const COLORGEN_LIGHTEN_FW = [0, 10, 0] as const;     // 'G': landmark letters and amount
 ```
 
 **These gates are load-bearing, not polite.** A board that predates `P` does not
@@ -129,7 +134,10 @@ a table. Pitch overrides are additive exceptions, and retuning never discards
 them; per-key pitch entry is modelled and persisted but has no editor yet.
 
 The colour generator holds only what the rows *look like* — palette, first
-accidental, brightness, the C/D/E tint. *Where* they fall is the pitch
+accidental, brightness, the landmark tint. The landmark lightens some keys toward
+white by a chosen amount and is the layout's: C, D and E under Wicki-Hayden, every
+key of one chosen letter under Bosanquet and the Harmonic Table (`landmarkFor`,
+`lightenMask`). Each keeps its own switch, so changing layout loses neither. *Where* they fall is the pitch
 generator's layout and anchor, so a key is always coloured by the accidental of
 the note it plays; there is no way to colour by one layout while sounding
 another.
@@ -175,7 +183,7 @@ frame carries, and `pushColors()` then falls back to `L` frames. Because only th
 second case needs the host at all, the 1 Hz topology poll re-pushes on a grid
 change *only* when `colorsAreSelfSufficient()` is false.
 
-One rounding detail constrains the split: the C/D/E tint is applied per key
+One rounding detail constrains the split: the landmark tint is applied per key
 *before* brightness scaling and rounds on the way, so brightness cannot be folded
 into the palette here. The palette travels at full brightness and the board
 scales it.
@@ -196,9 +204,9 @@ wire format:
 | Command | What it proves |
 |---------|----------------|
 | `npm run check` | `svelte-check`: types across the app |
-| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,111 assertions |
-| `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `../Core/Src/main.c`, compiles it with clang, and diffs it against the app over nine tunings × three layouts × a four-board grid — 3,348 cases, plus the byte-identical-default claim on 124 keys |
-| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 1,236 generators × a four-board grid — accidental rows and partition schemes, 153,264 cases — plus the byte-identical-boot-pattern claim and fourteen validation cases |
+| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,316 assertions |
+| `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `../Core/Src/main.c`, compiles it with clang, and diffs it against the app over nine tunings × three layouts × six concert-pitch offsets × a four-board grid — 20,088 cases, plus the byte-identical-default claim on 124 keys |
+| `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 1,956 generators × a four-board grid — accidental rows, partition schemes and landmark tints, 242,544 cases — plus the byte-identical-boot-pattern claim and nineteen validation cases |
 
 The 12-TET case is the one to keep: at a 700¢ fifth a wrong coefficient would not
 collapse to equal temperament, a wrong anchor would disagree with meantonal's own

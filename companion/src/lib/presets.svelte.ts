@@ -20,13 +20,18 @@ import { NUM_KEYS } from "./layout";
 import {
   DEFAULT_PITCH_GENERATOR,
   LAYOUTS,
+  REFERENCE_HZ_MAX,
+  REFERENCE_HZ_MIN,
+  referenceOffsetMilli,
   defaultPitchMap,
   pitchFrame,
   type PitchGenerator,
   type PitchMap,
 } from "./tuning";
 import {
+  COLORGEN_CAPS_LATEST,
   FIFTHS_LETTERS,
+  LIGHTEN_DEFAULT,
   PARTITIONS_MAX,
   PARTITION_WIDTH_MAX,
   colorgenFrame,
@@ -34,6 +39,7 @@ import {
   defaultGenerator,
   rgbForBoard,
   type ColorLayer,
+  type ColorgenCaps,
   type GeneratorParams,
 } from "./colorMaps";
 import { sendBytes } from "./serial";
@@ -56,11 +62,17 @@ export interface Preset {
 /** Firmware that understands the `P` tuning frame. */
 export const PITCH_PUSH_FW = [0, 7, 0] as const;
 
+/** Firmware with the `Q` frame: the tuning plus a concert pitch. */
+export const PITCH_REFERENCE_FW = [0, 10, 0] as const;
+
 /** Firmware that understands the `K` colour-generator frame. */
 export const COLORGEN_PUSH_FW = [0, 8, 0] as const;
 
 /** Firmware whose `K` frame can carry a partition scheme, not just accidental rows. */
 export const COLORGEN_PARTITIONS_FW = [0, 9, 0] as const;
+
+/** Firmware with the `G` frame: any letters as the landmark, lightened by any amount. */
+export const COLORGEN_LIGHTEN_FW = [0, 10, 0] as const;
 
 /**
  * The out-of-the-box preset.
@@ -187,6 +199,14 @@ function normaliseColorGenerator(raw: any): GeneratorParams {
     startAccidental: Number.isFinite(raw.startAccidental) ? Number(raw.startAccidental) : d.startAccidental,
     brightness: Number.isFinite(raw.brightness) ? Number(raw.brightness) : d.brightness,
     lightenCDE: raw.lightenCDE === true,
+    lightenLetter: raw.lightenLetter === true,
+    lightenLetterIndex:
+      Number.isInteger(raw.lightenLetterIndex) && raw.lightenLetterIndex >= 0 && raw.lightenLetterIndex < 7
+        ? raw.lightenLetterIndex
+        : 0,
+    lightenAmount: Number.isFinite(raw.lightenAmount)
+      ? Math.min(100, Math.max(0, Math.round(Number(raw.lightenAmount))))
+      : LIGHTEN_DEFAULT,
   };
 }
 
@@ -215,6 +235,14 @@ function normalisePitch(raw: any): PitchMap {
       bendSemitones: Number.isFinite(g.bendSemitones)
         ? Number(g.bendSemitones)
         : DEFAULT_PITCH_GENERATOR.bendSemitones,
+      // Absent from presets saved before concert pitch existed, which played
+      // with every C on a 12-TET C — exactly what the default says.
+      referenceNote:
+        typeof g.referenceNote === "string" ? g.referenceNote : DEFAULT_PITCH_GENERATOR.referenceNote,
+      referenceHz:
+        Number.isFinite(g.referenceHz) && g.referenceHz >= REFERENCE_HZ_MIN && g.referenceHz <= REFERENCE_HZ_MAX
+          ? Number(g.referenceHz)
+          : DEFAULT_PITCH_GENERATOR.referenceHz,
     };
   }
 
@@ -409,7 +437,7 @@ export async function pushColors(): Promise<void> {
   }
 
   const gen = canPushColorgen()
-    ? colorgenFrame(m.generator, pitchGen, canPushPartitions())
+    ? colorgenFrame(m.generator, pitchGen, colorgenCaps())
     : null;
   if (gen) {
     await sendBytes(gen);
@@ -443,7 +471,7 @@ export function colorsAreSelfSufficient(): boolean {
   return (
     canPushColorgen() &&
     Object.keys(m.colors).length === 0 &&
-    colorgenFrame(m.generator, activePitch().generator, canPushPartitions()) !== null
+    colorgenFrame(m.generator, activePitch().generator, colorgenCaps()) !== null
   );
 }
 
@@ -452,9 +480,12 @@ export function canPushColorgen(): boolean {
   return ui.connected && fwAtLeast(...COLORGEN_PUSH_FW);
 }
 
-/** True when the attached firmware's `K` can carry a partition scheme. */
-export function canPushPartitions(): boolean {
-  return ui.connected && fwAtLeast(...COLORGEN_PARTITIONS_FW);
+/** What the attached firmware's colour generator can do. */
+export function colorgenCaps(): ColorgenCaps {
+  return {
+    partitions: ui.connected && fwAtLeast(...COLORGEN_PARTITIONS_FW),
+    lighten: ui.connected && fwAtLeast(...COLORGEN_LIGHTEN_FW),
+  };
 }
 
 /**
@@ -467,8 +498,8 @@ export function canPushPartitions(): boolean {
 export function colorGenerationLimit(): "none" | "firmware" | "too-many" {
   const g = activeColors().generator;
   const pitchGen = activePitch().generator;
-  if (colorgenFrame(g, pitchGen, ui.connected ? canPushPartitions() : true)) return "none";
-  return colorgenFrame(g, pitchGen, true) ? "firmware" : "too-many";
+  if (colorgenFrame(g, pitchGen, ui.connected ? colorgenCaps() : COLORGEN_CAPS_LATEST)) return "none";
+  return colorgenFrame(g, pitchGen, COLORGEN_CAPS_LATEST) ? "firmware" : "too-many";
 }
 
 /** True when the attached firmware understands `P`. */
@@ -492,7 +523,7 @@ export function canPushPitch(): boolean {
  */
 export async function pushPitch(): Promise<void> {
   if (!canPushPitch()) return;
-  const frame = pitchFrame(activePitch());
+  const frame = pitchFrame(activePitch(), canPushReference());
   await sendBytes(frame);
   presetState.pushedPitch = frameHex(frame);
 }
@@ -503,7 +534,20 @@ const frameHex = (f: Uint8Array): string =>
 /** True when the board is running a different tuning from the active preset. */
 export function pitchIsStale(): boolean {
   if (!canPushPitch()) return false;
-  return presetState.pushedPitch !== frameHex(pitchFrame(activePitch()));
+  return presetState.pushedPitch !== frameHex(pitchFrame(activePitch(), canPushReference()));
+}
+
+/** True when the attached firmware can be given a concert pitch. */
+export function canPushReference(): boolean {
+  return ui.connected && fwAtLeast(...PITCH_REFERENCE_FW);
+}
+
+/**
+ * True when the preset asks for a concert pitch the attached board cannot be
+ * given, so it sounds with every C on a 12-TET C instead.
+ */
+export function referenceIsIgnored(): boolean {
+  return canPushPitch() && !canPushReference() && referenceOffsetMilli(activePitch().generator) !== 0;
 }
 
 /** Everything, for connect time. */

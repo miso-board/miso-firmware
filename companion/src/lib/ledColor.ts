@@ -76,6 +76,20 @@ export function mixWhite(hex: string, amount: number): string {
   return toHex([r + (255 - r) * amount, g + (255 - g) * amount, b + (255 - b) * amount]);
 }
 
+/**
+ * Move a color `percent` of the way to white, in whole percent.
+ *
+ * Integer arithmetic on purpose: the firmware does exactly this sum, and the
+ * two are checked against each other byte for byte. Mixing with a fractional
+ * amount instead can land a hair either side of a .5 and round differently.
+ */
+export function lightenHex(hex: string, percent: number): string {
+  const p = Math.min(100, Math.max(0, Math.round(percent)));
+  const [r, g, b] = parseHex(hex);
+  const mix = (c: number) => Math.round((c * (100 - p) + 255 * p) / 100);
+  return toHex([mix(r), mix(g), mix(b)]);
+}
+
 /** Scale a color's channels to `percent` of their value (for LED brightness). */
 export function scaleHex(hex: string, percent: number): string {
   const k = percent / 100;

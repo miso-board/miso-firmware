@@ -16,8 +16,10 @@
 // colour by one layout while sounding another.
 
 import { LED_POS, cellKey } from "./layout";
-import { LAYOUTS, accidentalLabel, anchorVec, generatePitchAt, type PitchGenerator } from "./tuning";
-import { scaleHex, mixWhite, parseHex } from "./ledColor";
+import {
+  LAYOUTS, accidentalLabel, anchorVec, generatePitchAt, type LayoutId, type PitchGenerator,
+} from "./tuning";
+import { scaleHex, lightenHex, parseHex } from "./ledColor";
 
 /**
  * One slice of the chain of fifths, and the colour of every note inside it.
@@ -71,14 +73,51 @@ export interface GeneratorParams {
   startAccidental: number;
   /** Percent of full brightness written to the LEDs. */
   brightness: number;
-  /** Tint the letters C, D and E paler, as an orientation landmark. */
-  lightenCDE?: boolean;
+  /**
+   * Landmarks: keys lightened toward white so the hand can find its place.
+   * Which one applies depends on the layout (`landmarkFor`), and each keeps its
+   * own setting so switching layouts does not lose the other.
+   *
+   * Wicki-Hayden: lighten C, D and E — the left half of each row.
+   */
+  lightenCDE: boolean;
+  /** Bosanquet and the Harmonic Table: lighten every key of one letter. */
+  lightenLetter: boolean;
+  /** Which letter, as an index into LANDMARK_LETTERS (C = 0 … B = 6). */
+  lightenLetterIndex: number;
+  /** How far toward white a landmark key goes: 0 unchanged, 100 white. */
+  lightenAmount: number;
 }
 
-/** How far toward white a C/D/E key is mixed. Paler, not brighter, so it
- *  stays distinct from the firmware's velocity glow (which brightens a key's
- *  own colour while held). */
-const CDE_LIGHTEN = 0.35;
+/** The letters in scale order, which is the order of a pitch's `pc7`. */
+export const LANDMARK_LETTERS = ["C", "D", "E", "F", "G", "A", "B"] as const;
+
+/** Which kind of landmark a layout uses. */
+export function landmarkFor(layout: LayoutId): "cde" | "letter" {
+  return layout === "wicki-hayden" ? "cde" : "letter";
+}
+
+/**
+ * The letters a generator lightens under a layout, as a bit per `pc7` (C = bit
+ * 0 … B = bit 6). Zero means no landmark. This is the form the firmware takes.
+ */
+export function lightenMask(p: GeneratorParams, layout: LayoutId): number {
+  if (landmarkFor(layout) === "cde") return p.lightenCDE ? 0b0000111 : 0;
+  if (!p.lightenLetter) return 0;
+  const i = Math.round(p.lightenLetterIndex ?? 0);
+  return i >= 0 && i < 7 ? 1 << i : 0;
+}
+
+/** The lighten amount as the whole percent that is drawn and sent. */
+function lightenPercent(p: GeneratorParams): number {
+  const v = Number.isFinite(p.lightenAmount) ? p.lightenAmount : LIGHTEN_DEFAULT;
+  return Math.min(100, Math.max(0, Math.round(v)));
+}
+
+/** The default lighten amount, and the fixed one firmware before 0.10.0 used.
+ *  Paler, not brighter, so it stays distinct from the firmware's velocity glow
+ *  (which brightens a key's own colour while held). */
+export const LIGHTEN_DEFAULT = 35;
 
 /**
  * A preset's LED mapping.
@@ -106,6 +145,9 @@ export const DEFAULT_GENERATOR: GeneratorParams = {
   startAccidental: -2,
   brightness: 10,
   lightenCDE: false,
+  lightenLetter: false,
+  lightenLetterIndex: 0,
+  lightenAmount: LIGHTEN_DEFAULT,
 };
 
 /** A fresh copy of the default generator, safe to mutate. */
@@ -219,7 +261,7 @@ export function generateColorAt(
     // Rows outside the palette wrap back through it.
     hex = p.palette[mod(pitch.accidental - p.startAccidental, n)] ?? "#000000";
   }
-  if (p.lightenCDE && pitch.pc7 < 3) hex = mixWhite(hex, CDE_LIGHTEN);
+  if ((lightenMask(p, pitchGen.layout) >> pitch.pc7) & 1) hex = lightenHex(hex, lightenPercent(p));
   return scaleHex(hex, p.brightness);
 }
 
@@ -269,7 +311,19 @@ export const COLORGEN_PAL_MAX = 8;
 export const COLORGEN_PART_MAX = 6;
 const COLORGEN_PART_FLAG = 0x80;
 
-export const COLORGEN_FRAME_LEN = 41; // 'K' + 40 payload bytes
+export const COLORGEN_FRAME_LEN = 42; // 'G' + 41 payload bytes
+export const COLORGEN_LEGACY_FRAME_LEN = 41; // 'K' + 40, for firmware before 0.10.0
+
+/** What the attached firmware's colour generator can do. */
+export interface ColorgenCaps {
+  /** 0.9.0: the frame can carry a partition scheme. */
+  partitions: boolean;
+  /** 0.10.0: the `G` frame, with a letter mask and a lighten amount. */
+  lighten: boolean;
+}
+
+/** Everything current firmware can do. */
+export const COLORGEN_CAPS_LATEST: ColorgenCaps = { partitions: true, lighten: true };
 
 /**
  * The generator parameters, as the firmware wants them — the colour counterpart
@@ -287,7 +341,7 @@ export const COLORGEN_FRAME_LEN = 41; // 'K' + 40 payload bytes
  * The six integers of geometry are the pitch generator's own — the same matrix
  * and anchor `P` carries — which is what keeps the board's rows on the notes it
  * plays. The frame is still self-contained, so a board needs no tuning to colour
- * itself. `brightness` does NOT fold into the palette, because `lightenCDE` is applied per key BEFORE scaling and rounds on the way
+ * itself. `brightness` does NOT fold into the palette, because the landmark tint is applied per key BEFORE scaling and rounds on the way
  * (see `generateColorAt`), so pre-scaling would shift some channels by a count.
  *
  * The same 40 bytes carry one of two forms, told apart by the top bit of the
@@ -298,19 +352,31 @@ export const COLORGEN_FRAME_LEN = 41; // 'K' + 40 payload bytes
  *
  * A scheme that IS accidental rows always goes out in the first form, however it
  * was authored, because every firmware since 0.8.0 understands it. The second
- * needs 0.9.0, so it is only built when `partitionsOk` says the board has it. An
+ * needs 0.9.0, so it is only built when `caps.partitions` says the board has it. An
  * older board rejects a partition frame outright (it reads the marked length as
  * a palette over 8) and keeps the colours it had.
  *
+ * The landmark tint decides the command. Firmware from 0.10.0 takes `G`: the
+ * same block with the flags byte as a mask of letters to lighten and one more
+ * byte on the end for how far. Before that there is only `K`, whose one flag
+ * means "C, D and E, by 35%" — so an older board can be sent parameters only
+ * when the landmark is off or is exactly that.
+ *
  * Returns null when the scheme cannot be expressed as parameters: a palette over
- * eight rows, more than six partitions, or partitions on firmware that predates
- * them. The caller falls back to per-board `L` frames.
+ * eight rows, more than six partitions, or partitions or a landmark that the
+ * attached firmware predates. The caller falls back to per-board `L` frames.
  */
 export function colorgenFrame(
   g: GeneratorParams,
   pitchGen: PitchGenerator,
-  partitionsOk = false,
+  caps: ColorgenCaps = { partitions: false, lighten: false },
 ): Uint8Array | null {
+  const partitionsOk = caps.partitions;
+  const letters = lightenMask(g, pitchGen.layout);
+  const amount = lightenPercent(g);
+  const legacyTint = letters === 0 || (letters === 0b0000111 && amount === LIGHTEN_DEFAULT);
+  if (!caps.lighten && !legacyTint) return null;
+
   let scheme = asAccidentalScheme(g);
   if (scheme && (scheme.startAccidental < -128 || scheme.startAccidental > 127)) scheme = null;
   if (scheme && scheme.palette.length > COLORGEN_PAL_MAX) scheme = null;
@@ -327,8 +393,8 @@ export function colorgenFrame(
   const layout = LAYOUTS[pitchGen.layout];
   const anchor = anchorVec(pitchGen);
 
-  const frame = new Uint8Array(COLORGEN_FRAME_LEN);
-  frame[0] = 0x4b; // 'K'
+  const frame = new Uint8Array(caps.lighten ? COLORGEN_FRAME_LEN : COLORGEN_LEGACY_FRAME_LEN);
+  frame[0] = caps.lighten ? 0x47 : 0x4b; // 'G' : 'K'
   const dv = new DataView(frame.buffer);
   // Signed: Wicki-Hayden's matrix is (1, −2, 0, −1).
   dv.setInt16(1, layout.matrix.m00, true);
@@ -337,7 +403,12 @@ export function colorgenFrame(
   dv.setInt16(7, layout.matrix.m11, true);
   dv.setInt16(9, anchor.w, true);
   dv.setInt16(11, anchor.h, true);
-  frame[15] = p.lightenCDE ? 0x01 : 0x00;
+  if (caps.lighten) {
+    frame[15] = letters;
+    frame[41] = amount;
+  } else {
+    frame[15] = letters ? 0x01 : 0x00;
+  }
   frame[16] = Math.round(p.brightness);
 
   if (!scheme) {

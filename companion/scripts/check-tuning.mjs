@@ -70,7 +70,9 @@ function firmwarePitch(frame, x, y, bendSemitones = MPE_BEND_SEMITONES) {
 
   const w = m00 * x + m01 * y + aw;
   const h = m10 * x + m11 * y + ah;
-  const cm = fifthMilli * (2 * w - 5 * h) + 1200000 * (3 * h - w);
+  // A 'Q' frame carries a concert-pitch offset after the anchor; a 'P' has none.
+  const offset = frame.byteLength >= 21 ? dv.getInt32(17, true) : 0;
+  const cm = fifthMilli * (2 * w - 5 * h) + 1200000 * (3 * h - w) + offset;
   const note = divRound(cm, 100000);
   const rem = cm - note * 100000;
   const bend = 8192 + divRound(rem * 8192, bendSemitones * 100 * 1000);
@@ -309,6 +311,22 @@ section("7. validation: rejected EDOs, flagged degenerate tunings");
   ok(tuningError({ kind: "fifth", cents: NaN }) !== null, "NaN is rejected");
   ok(tuningError({ kind: "edo", edo: 31.5 }) !== null, "a fractional EDO is rejected");
   // Anything tuningError accepts, meantonal must accept too.
+  // The selectable list drops EDOs whose fifth cannot reach all their steps.
+  {
+    const { SELECTABLE_EDOS, effectiveEdo } = await import("../src/lib/tuning.ts");
+    for (const edo of [24, 36, 48, 72, 10, 14, 34, 38]) {
+      ok(!SELECTABLE_EDOS.includes(edo) && VALID_EDOS.includes(edo),
+         `${edo}-EDO is not offered, but still loads`);
+    }
+    ok(effectiveEdo(24) === 12 && effectiveEdo(72) === 12 && effectiveEdo(34) === 17 &&
+       effectiveEdo(10) === 5, "…because they play as 12, 12, 17 and 5");
+    for (const edo of [5, 7, 12, 17, 19, 22, 31, 43, 50, 53, 55]) {
+      ok(SELECTABLE_EDOS.includes(edo), `${edo}-EDO is offered`);
+    }
+    ok(SELECTABLE_EDOS.every((e) => SELECTABLE_EDOS.every((m) => m >= e || e % m !== 0 ||
+       effectiveEdo(e) === e)), "every offered EDO reaches all of its own steps");
+  }
+
   for (const edo of VALID_EDOS) {
     let threw = false;
     try { midiFor(SPN.toPitch("C4"), { kind: "edo", edo }); } catch { threw = true; }
@@ -410,13 +428,38 @@ section("10. colour partitions: accidental rows are a special case; 7 + 5 repeat
      colorgenFrame(sevenFive, defaultPitchMap().generator) === null,
      "7 + 5 is not an accidental scheme, so older firmware gets no parameter frame");
   {
-    const f = colorgenFrame(sevenFive, defaultPitchMap().generator, true);
+    const f = colorgenFrame(sevenFive, defaultPitchMap().generator, { partitions: true, lighten: false });
     ok(f !== null && f.length === 41 && f[14] === 0x82 && f[13] === 0 &&
        f[17 + 18] === 7 && f[17 + 19] === 5,
        "…but firmware with partitions gets one: 0x80|2, origin 0, widths 7 and 5");
     const seven = { ...sevenFive, partitions: Array.from({ length: 7 }, () => ({ width: 3, color: "#010101" })) };
-    ok(colorgenFrame(seven, defaultPitchMap().generator, true) === null,
+    ok(colorgenFrame(seven, defaultPitchMap().generator, { partitions: true, lighten: true }) === null,
        "seven partitions do not fit the frame");
+  }
+
+  // The landmark tint picks the command: 'G' carries any letters and amount,
+  // 'K' only "off" or "C D E by 35%".
+  {
+    const { lightenMask, COLORGEN_CAPS_LATEST } = await import("../src/lib/colorMaps.ts");
+    const bos = defaultPitchMap().generator;
+    const wh = pitchMapFor({ layout: "wicki-hayden" }).generator;
+    const g = { ...defaultGenerator(), lightenCDE: true, lightenLetter: true, lightenLetterIndex: 4, lightenAmount: 60 };
+    ok(lightenMask(g, "wicki-hayden") === 0b0000111, "Wicki-Hayden's landmark is C D E");
+    ok(lightenMask(g, "bosanquet") === 0b0010000 && lightenMask(g, "harmonic-table") === 0b0010000,
+       "elsewhere it is the one chosen letter (G)");
+    ok(lightenMask({ ...g, lightenCDE: false }, "wicki-hayden") === 0 &&
+       lightenMask({ ...g, lightenLetter: false }, "bosanquet") === 0,
+       "each landmark has its own switch");
+    const f = colorgenFrame(g, bos, COLORGEN_CAPS_LATEST);
+    ok(f !== null && f.length === 42 && f[0] === 0x47 && f[15] === 0b0010000 && f[41] === 60,
+       "current firmware gets 'G' with the letter mask and the amount");
+    ok(colorgenFrame(g, bos) === null && colorgenFrame(g, wh) === null,
+       "older firmware cannot be sent a letter landmark, or C D E at 60%");
+    const k = colorgenFrame({ ...g, lightenAmount: 35 }, wh);
+    ok(k !== null && k.length === 41 && k[0] === 0x4b && k[15] === 0x01,
+       "…but C D E at 35% still goes out as the old 'K' flag");
+    ok(colorgenFrame({ ...g, lightenLetter: false }, bos)?.[0] === 0x4b,
+       "…as does no landmark at all");
   }
 
   // Moving the anchor slides the whole pattern.
@@ -428,6 +471,74 @@ section("10. colour partitions: accidental rows are a special case; 7 + 5 repeat
   const at2 = (note) => partitionIndexAt(onSecond, fifthsOf(SPN.toPitch(note)));
   ok(at2("F4") === 1 && at2("A4") === 1 && at2("E4") === 0 && at2("Bb4") === 0,
      "anchoring F on the second partition starts the fives at F");
+}
+
+// --- 11. concert pitch -------------------------------------------------------
+
+section("11. concert pitch: the reference note lands on its frequency, here and on the board");
+{
+  const {
+    DEFAULT_REFERENCE, hzAt, referenceOf, referenceOffsetCents, referenceOffsetMilli, referenceError,
+  } = await import("../src/lib/tuning.ts");
+
+  const def = defaultPitchMap();
+  ok(referenceOffsetMilli(def.generator) === 0, "the default reference moves nothing");
+  ok(DEFAULT_REFERENCE.hz.toFixed(2) === "261.63", "…and reads as C4 = 261.63 Hz");
+  ok(referenceOffsetCents({ kind: "edo", edo: 12 }, { note: "A4", hz: 440 }) === 0,
+     "A4 = 440 in 12-TET is the same statement as the default");
+  ok(Math.abs(referenceOffsetCents({ kind: "edo", edo: 31 }, { note: "A4", hz: 440 })) > 1,
+     "…but in 31-EDO it is a different one");
+  ok(referenceError({ note: "H4", hz: 440 }) !== null && referenceError({ note: "A4", hz: 0 }) !== null,
+     "a bad note name or frequency is refused");
+  ok(referenceOffsetCents({ kind: "edo", edo: 31 }, { note: "H4", hz: 440 }) === 0,
+     "…and changes nothing");
+
+  // 'P' is 'Q' without the offset, so older firmware gets the same tuning.
+  {
+    const m = pitchMapFor({ referenceNote: "A4", referenceHz: 440 });
+    const p = pitchFrame(m), q = pitchFrame(m, true);
+    ok(p.length === 17 && p[0] === 0x50 && q.length === 21 && q[0] === 0x51, "frames: 'P' is 17 bytes, 'Q' is 21");
+    ok(p.slice(1).every((b, i) => b === q[i + 1]), "'Q' carries the same sixteen bytes as 'P', then the offset");
+    ok(new DataView(q.buffer).getInt32(17, true) === referenceOffsetMilli(m.generator),
+       "…and the offset is the concert-pitch shift in millicents");
+  }
+
+  const TOLERANCE_CENTS = matchToleranceCents();
+  const references = [
+    { note: "C4", hz: DEFAULT_REFERENCE.hz }, { note: "A4", hz: 440 }, { note: "A4", hz: 415 },
+    { note: "C4", hz: 256 }, { note: "F#3", hz: 180 }, { note: "Bb4", hz: 466.16 },
+  ];
+  const tunings = [
+    { kind: "edo", edo: 12 }, { kind: "edo", edo: 19 }, { kind: "edo", edo: 31 },
+    { kind: "edo", edo: 53 }, { kind: "fifth", cents: 696.578 },
+    { kind: "fifth", cents: FIFTH_MIN }, { kind: "fifth", cents: FIFTH_MAX },
+  ];
+  let worst = 0;
+  for (const ref of references) {
+    for (const tuning of tunings) {
+      const got = hzAt(tuning, SPN.toPitch(ref.note), ref);
+      ok(Math.abs(1200 * Math.log2(got / ref.hz)) < 1e-6,
+         `${ref.note} sounds at ${ref.hz} Hz in ${JSON.stringify(tuning)}`, `${got}`);
+      for (const id of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
+        const m = pitchMapFor({ layout: id, tuning, referenceNote: ref.note, referenceHz: ref.hz });
+        const frame = pitchFrame(m, true);
+        let agree = true;
+        for (const [x, y] of gridCoords(4)) {
+          const p = generatePitchAt(m.generator, x, y);
+          const app = midiFor(p, tuning, MPE_BEND_SEMITONES, referenceOf(m.generator));
+          const fw = firmwarePitch(frame, x, y);
+          if (app.note < 0 || app.note > 127) continue;
+          // Compare as pitch, not note-then-bend: with an offset in play the two
+          // can round to neighbouring notes at a boundary and still agree.
+          const d = (app.note - fw.note) * 100 + (app.bend - fw.bend) * (4800 / 8192);
+          worst = Math.max(worst, Math.abs(d));
+          if (Math.abs(d) >= TOLERANCE_CENTS) agree = false;
+        }
+        ok(agree, `${id} at ${ref.note} = ${ref.hz} Hz, ${JSON.stringify(tuning)}: app and firmware agree`);
+      }
+    }
+  }
+  console.log(`  worst app/firmware disagreement with a concert pitch: ${worst.toFixed(4)}¢`);
 }
 
 // --- summary ---------------------------------------------------------------

@@ -221,8 +221,10 @@ interface on the same USB-C port:
 | `L` + `int16 x`, `int16 y`, 93 bytes | Set LED colors on the board at that grid origin, anywhere in the mesh |
 | `B!`    | Reboot into the USB DFU bootloader (two bytes, so a stray character can't misfire) |
 | `C` + 93 bytes | Set all LED background colors: 31 × RGB, LED-chain order (a stalled frame aborts after 200 ms) |
-| `P` + 16 bytes | Set the pitch map: `int32` fifth in millicents, `int16` m00 m01 m10 m11 (grid → `(w, h)` basis change), `int16` anchor w, h. Little-endian, validated before it is installed |
-| `K` + 40 bytes | Set the **colour generator**: `int16` m00 m01 m10 m11, `int16` anchor w, h, `int8` start accidental, `u8` palette length, `u8` flags, `u8` brightness percent, then 8 × RGB. Since 0.9.0 the length byte may instead be `0x80 \| count` for a **partition scheme**: the `int8` is then the origin and the palette bytes hold 6 × RGB followed by 6 × `u8` width. Little-endian, validated, and propagated down the mesh |
+| `Q` + 20 bytes | Set the pitch map with a **concert pitch** (0.10.0): the `P` block below, then `int32` offset in millicents added to every key. Validated before it is installed |
+| `P` + 16 bytes | Set the pitch map (an offset of zero): `int32` fifth in millicents, `int16` m00 m01 m10 m11 (grid → `(w, h)` basis change), `int16` anchor w, h. Little-endian, validated before it is installed |
+| `G` + 41 bytes | Set the **colour generator** (0.10.0): the `K` block below with its flags byte as a mask of letters to lighten (C D E F G A B = bits 0–6) and one more byte, how far toward white, 0–100. Validated, and propagated down the mesh |
+| `K` + 40 bytes | The colour generator as it was before 0.10.0, still accepted and upgraded on the way in (its one flag becomes "C, D and E by 35%"): `int16` m00 m01 m10 m11, `int16` anchor w, h, `int8` start accidental, `u8` palette length, `u8` flags, `u8` brightness percent, then 8 × RGB. Since 0.9.0 the length byte may instead be `0x80 \| count` for a **partition scheme**: the `int8` is then the origin and the palette bytes hold 6 × RGB followed by 6 × `u8` width. Little-endian, validated, and propagated down the mesh |
 
 Scan frame format: `A5 5A 01` · `u32 t_µs` · `31×u16 raw` · `u8 checksum`
 (little-endian; checksum = byte sum of the payload).
@@ -385,6 +387,14 @@ The default is **Bosanquet in 31-EDO with D4 on the centre key** — fifth 69677
 millicents, identity matrix, anchor (23, 7) — which is **byte-identical to the
 hardcoded formula it replaced** for every key, so a board that never hears from
 the companion sounds exactly as it always did.
+
+**Concert pitch** (0.10.0). The formula puts every C exactly on a 12-TET C —
+C4 = 261.63 Hz — whatever the tuning, which fixes the reference at one note and
+one frequency. `Q` is `P` with one more `int32`: an offset in millicents added
+to every key before it is split into note and bend. "A4 = 440 Hz" in 31-EDO is
+the offset that brings that tuning's A4 onto 440; the companion works it out
+(`referenceOffsetCents` in `tuning.ts`) and the board just adds it. `P` is still
+accepted and means zero. The `INFO` line reports it as `offset=`.
 
 `P` needs no mesh propagation, and deliberately gets none: MIDI is generated
 only by the USB-connected board, which already plays every key in the grid from
@@ -754,6 +764,20 @@ older board in a mixed grid keeps the colours it had rather than painting widths
 as colours. Six partitions is what fits; the companion sends anything larger as
 per-board `L` frames.
 
+0.10.0 generalised the **landmark tint**. It was one flag — lighten C, D and E by
+a fixed 35% — which suits Wicki-Hayden, where those are the left half of each
+row, and nothing else. It is now a mask of which letters to lighten (`pc7`, C D E
+F G A B = bits 0–6) and how far toward white, 0–100%. A mask and a percent did
+not fit the 40 bytes, so the block grew to 41 and is sent as **`G`**: the same
+layout as `K`, with byte 14 the mask and byte 40 the percent. `K` is still
+accepted and upgraded in place (`colorgen_upgrade_legacy`), so older tooling
+keeps working.
+
+The mesh relays the 41-byte block. Mixed grids degrade rather than break: a
+0.10.0 board under an older parent upgrades the 40 bytes it is beaconed, and an
+older board under a 0.10.0 parent reads the first 40 of 41 — right in everything
+but the tint, where it sees only whether C is in the mask.
+
 Unlike `P`, which deliberately gets no propagation — only the master sounds notes
 — `K` travels **down the whole tree**, because every board lights its own LEDs.
 It is beaconed to children every second, carrying a sequence number bumped
@@ -945,8 +969,8 @@ compiling it on the host, and diffing it against the app:
 
 | Script | Extracts from `main.c` | Proves |
 |---|---|---|
-| [`companion/scripts/check-firmware-pitch.py`](companion/scripts/check-firmware-pitch.py) | `div_round`, `pitch_for_xy`, `pitch_params_apply` | 2,232 cases over nine tunings × both layouts × a four-board grid agree with the app, and the 31-EDO default is byte-identical to the step-lattice formula it replaced (124 keys) |
-| [`companion/scripts/check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) | `colorgen_params_t`, `floor_div`, `mod_pos`, `round_pct`, `colorgen_for_xy`, `colorgen_params_apply` | 153,264 cases over 1,236 generators × a four-board grid — accidental rows and partition schemes — agree with the app, the default generator is byte-identical to `fill_bosanquet()` (31 keys), and fourteen frames are accepted or refused as intended |
+| [`companion/scripts/check-firmware-pitch.py`](companion/scripts/check-firmware-pitch.py) | `div_round`, `pitch_for_xy`, `pitch_params_apply` | 20,088 cases over nine tunings × three layouts × six concert-pitch offsets × a four-board grid agree with the app, and the 31-EDO default is byte-identical to the step-lattice formula it replaced (124 keys) |
+| [`companion/scripts/check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) | `colorgen_params_t`, `floor_div`, `mod_pos`, `round_pct`, `colorgen_for_xy`, `colorgen_params_apply`, `colorgen_upgrade_legacy` | 242,544 cases over 1,956 generators × a four-board grid — accidental rows and partition schemes — agree with the app, the default generator is byte-identical to `fill_bosanquet()` (31 keys), and nineteen frames are accepted, refused or upgraded as intended |
 
 Both run from the companion, and both need `clang` and Node 24:
 

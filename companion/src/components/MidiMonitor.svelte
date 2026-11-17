@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { mesh, gridCells } from "../lib/mesh.svelte";
   import {
-    LAYOUTS, pitchOn, noteName, midiFor, centsFromBend, tuningLabel,
+    LAYOUTS, pitchOn, noteName, midiFor, centsFromBend, tuningLabel, referenceOf,
     tuningError, matchToleranceCents,
   } from "../lib/tuning";
   import { activePreset, canPushPitch, pitchIsStale } from "../lib/presets.svelte";
@@ -45,7 +45,7 @@
       return {
         label: mesh.boards.length > 1 ? `${c.x},${c.y}` : `S${String(c.sensor).padStart(2, "0")}`,
         name: noteName(p),
-        ...midiFor(p, gen.tuning, bendSemitones),
+        ...midiFor(p, gen.tuning, bendSemitones, referenceOf(gen)),
       };
     });
   });

@@ -78,11 +78,25 @@ CONFIG_AXES = {
     "layout": ["bosanquet", "wicki-hayden", "harmonic-table"],
     "palette_n": [1, 2, 3, 5, 8],
     "brightness": [1, 10, 60, 100],
-    "lightenCDE": [False, True],
+    # The landmark tint: off, or on at an amount. Which letters it lightens is
+    # the layout's choice -- C D E under Wicki-Hayden, one letter otherwise --
+    # so both are switched on and the layout axis picks.
+    "lighten": [None, 35, 100, 7, 0],
     # The pitch generator's anchor: where the rows fall.
     "anchor": [["D4", [3, 3]], ["F#3", [1, 5]]],
     "startAccidental": [-2, 0],
 }
+
+
+def landmark(amount: int | None, letter: int) -> dict:
+    """The landmark fields of a colour generator: off, or on at `amount` percent."""
+    on = amount is not None
+    return {
+        "lightenCDE": on,
+        "lightenLetter": on,
+        "lightenLetterIndex": letter,
+        "lightenAmount": amount if on else 35,
+    }
 
 
 def configs() -> list[dict]:
@@ -91,7 +105,7 @@ def configs() -> list[dict]:
     for layout in CONFIG_AXES["layout"]:
         for n in CONFIG_AXES["palette_n"]:
             for brightness in CONFIG_AXES["brightness"]:
-                for lighten in CONFIG_AXES["lightenCDE"]:
+                for lighten in CONFIG_AXES["lighten"]:
                     for note, key in CONFIG_AXES["anchor"]:
                         for start in CONFIG_AXES["startAccidental"]:
                             out.append({
@@ -99,7 +113,7 @@ def configs() -> list[dict]:
                                     "palette": PALETTE_POOL[:n],
                                     "startAccidental": start,
                                     "brightness": brightness,
-                                    "lightenCDE": lighten,
+                                    **landmark(lighten, 4),
                                 },
                                 "pitch": {
                                     "layout": layout,
@@ -117,7 +131,7 @@ def configs() -> list[dict]:
         for widths in PARTITION_WIDTHS:
             for letter in (0, 3, 6):
                 for anchor_partition in sorted({0, len(widths) - 1}):
-                    for brightness, lighten in ((10, False), (100, True), (1, True)):
+                    for brightness, lighten in ((10, None), (100, 60), (1, 100)):
                         for note, key in CONFIG_AXES["anchor"]:
                             out.append({
                                 "colors": {
@@ -131,7 +145,7 @@ def configs() -> list[dict]:
                                     "palette": PALETTE_POOL[:5],
                                     "startAccidental": -2,
                                     "brightness": brightness,
-                                    "lightenCDE": lighten,
+                                    **landmark(lighten, letter),
                                 },
                                 "pitch": {
                                     "layout": layout,
@@ -179,6 +193,7 @@ def build_harness(src: str, led_pos: list[list[int]]) -> str:
     round_pct = grab(src, "static uint8_t round_pct(uint32_t num, uint32_t den)")
     gen = grab(src, "static void colorgen_for_xy(int32_t x, int32_t y, uint8_t *rgb)")
     apply_fn = grab(src, "static uint8_t colorgen_params_apply(const uint8_t *m)")
+    upgrade = grab(src, "static void colorgen_upgrade_legacy(const uint8_t *legacy, uint8_t *m)")
 
     pos = ",".join(f"{{{x},{y}}}" for x, y in led_pos)
     legacy = ",".join(
@@ -198,6 +213,7 @@ def build_harness(src: str, led_pos: list[list[int]]) -> str:
 {round_pct}
 {gen}
 {apply_fn}
+{upgrade}
 
 static const int LED_POS[{len(led_pos)}][2] = {{ {pos} }};
 
@@ -230,7 +246,7 @@ int main(void)
   #define PUT16(i, v) do {{ m[i] = (uint8_t)(v); m[(i)+1] = (uint8_t)((v) >> 8); }} while (0)
   #define RESET() do {{ PUT16(0,1); PUT16(2,0); PUT16(4,0); PUT16(6,1); \\
                         PUT16(8,23); PUT16(10,7); m[12]=(uint8_t)(-2); m[13]=5; \\
-                        m[14]=0; m[15]=10; }} while (0)
+                        m[14]=0; m[15]=10; m[40]=35; }} while (0)
   RESET(); m[13] = 0;               printf("REJECT palette_empty %d\\n", !colorgen_params_apply(m));
   RESET(); m[13] = COLORGEN_PAL_MAX + 1;
                                     printf("REJECT palette_long %d\\n",  !colorgen_params_apply(m));
@@ -253,6 +269,22 @@ int main(void)
                                     printf("REJECT width_over %d\\n",    !colorgen_params_apply(m));
   PARTS(2, 7, 5);                   printf("REJECT none_parts %d\\n",    colorgen_params_apply(m));
   RESET();                          printf("REJECT none_after %d\\n",    colorgen_params_apply(m));
+  /* the landmark: seven letters, and a percent */
+  RESET(); m[14] = 0x80;            printf("REJECT letters %d\\n",       !colorgen_params_apply(m));
+  RESET(); m[40] = 101;             printf("REJECT lighten_over %d\\n",  !colorgen_params_apply(m));
+  RESET(); m[14] = 0x7F; m[40] = 100;
+                                    printf("REJECT none_letters %d\\n",  colorgen_params_apply(m));
+  /* a pre-0.10.0 block: its one flag meant "C, D and E, by 35%" */
+  {{
+    uint8_t legacy[COLORGEN_LEGACY_LEN];
+    RESET(); memcpy(legacy, m, sizeof(legacy));
+    legacy[14] = 0x01; memset(m, 0xEE, sizeof(m)); colorgen_upgrade_legacy(legacy, m);
+    printf("REJECT none_legacy_cde %d\\n",
+           m[14] == 0x07 && m[40] == 35 && memcmp(m, legacy, 14) == 0 && colorgen_params_apply(m));
+    legacy[14] = 0x00; memset(m, 0xEE, sizeof(m)); colorgen_upgrade_legacy(legacy, m);
+    printf("REJECT none_legacy_off %d\\n",
+           m[14] == 0x00 && m[40] == 35 && colorgen_params_apply(m));
+  }}
 
   /* 3. every frame on stdin, one 40-byte payload per line as hex, applied and
    *    evaluated over a four-board grid for diffing against the companion. */
@@ -294,15 +326,15 @@ const { readFileSync } = await import("node:fs");
 const { pathToFileURL } = await import("node:url");
 const lib = (f) => pathToFileURL(`${process.argv[3]}/src/lib/${f}`).href;
 
-const { colorgenFrame, generateColorAt } = await import(lib("colorMaps.ts"));
+const { colorgenFrame, generateColorAt, COLORGEN_CAPS_LATEST } = await import(lib("colorMaps.ts"));
 const { LED_POS } = await import(lib("layout.ts"));
 const { configs, boards } = JSON.parse(readFileSync(process.argv[2], "utf8"));
 
 const hex2 = (n) => n.toString(16).padStart(2, "0");
 const out = [];
 configs.forEach((cfg, i) => {
-  // true: build partition frames, as for firmware that understands them.
-  const frame = colorgenFrame(cfg.colors, cfg.pitch, true);
+  // As for current firmware: the 'G' frame, partitions and all.
+  const frame = colorgenFrame(cfg.colors, cfg.pitch, COLORGEN_CAPS_LATEST);
   if (!frame) {
     out.push(`FRAME ${i} -`);
     out.push(`ROW ${i} rejected`);

@@ -9,11 +9,11 @@
 
   import BoardView, { type ViewCell } from "./BoardView.svelte";
   import GeneratorPanel from "./GeneratorPanel.svelte";
-  import PitchGeneratorPanel from "./PitchGeneratorPanel.svelte";
+  import TuningPanel from "./TuningPanel.svelte";
   import LayoutPicker from "./LayoutPicker.svelte";
   import PresetBar from "./PresetBar.svelte";
   import {
-    LAYOUTS, noteName, pitchOn, isOverridden, midiFor, hzAt, tuningLabel, tuningError,
+    LAYOUTS, noteName, pitchOn, isOverridden, midiFor, hzAt, tuningLabel, tuningError, referenceOf,
     fifthCents,
   } from "../lib/tuning";
   import { colorAt } from "../lib/colorMaps";
@@ -62,15 +62,16 @@
   const rows = $derived.by<Row[]>(() => {
     const colors = activeColors();
     const t = gen.tuning;
+    const ref = referenceOf(gen);
     return gridCells().map((c) => {
       const color = colorAt(colors, gen, c.x, c.y);
       let sound: Sounding | null = null;
       if (!invalid) {
         const p = pitchOn(pitch, c.x, c.y);
-        const m = midiFor(p, t, gen.bendSemitones);
+        const m = midiFor(p, t, gen.bendSemitones, ref);
         sound = {
           name: noteName(p), note: m.note, bend: m.bend, cents: m.cents,
-          hz: hzAt(t, p), overridden: isOverridden(pitch, c.x, c.y),
+          hz: hzAt(t, p, ref), overridden: isOverridden(pitch, c.x, c.y),
         };
       }
       const label =
@@ -271,12 +272,11 @@
   {/if}
 </section>
 
+<!-- In the order one depends on the next: a tuning, a layout over it, and the
+     colours that follow from both. -->
+<TuningPanel />
 <LayoutPicker />
-
-<!-- The two generators that make up a preset, side by side: they describe the
-     same instrument and are meant to be set together. -->
-<div class="mb-3.5 grid items-start gap-3.5 min-[1000px]:grid-cols-2">
-  <PitchGeneratorPanel />
+<div class="mb-3.5">
   <GeneratorPanel />
 </div>
 

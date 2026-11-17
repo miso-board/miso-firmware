@@ -67,7 +67,7 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.9.0"
+#define FW_VERSION          "miso 0.10.0"
 #define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
@@ -94,7 +94,16 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define TUNE_FIFTH_MAX      720000 // above this likewise
 #define TUNE_MATRIX_MAX     64     // sanity bound on a pushed basis change
 #define TUNE_ANCHOR_MAX     4096   // sanity bound on a pushed anchor
-#define PITCH_MSG_LEN       16     // payload bytes after 'P'
+// 0.10.0 added a CONCERT PITCH. The formula above puts every C exactly on a
+// 12-TET C (C4 = 261.63 Hz), whatever the tuning, which fixes the reference at
+// one note and one frequency. A constant offset in millicents, added to every
+// key, moves it: "A4 = 440 Hz" in 31-EDO is the offset that brings that tuning's
+// A4 onto 440. The companion works it out; here it is one more int32. It did not
+// fit the 16 bytes, so the block is 20 and travels as 'Q'. 'P' is still accepted
+// in its 16-byte form and means an offset of zero.
+#define PITCH_MSG_LEN       20     // the parameter block: payload after 'Q'
+#define PITCH_LEGACY_LEN    16     // payload after 'P', the pre-0.10.0 block
+#define TUNE_OFFSET_MAX     2400000 // sanity bound on a pushed offset: two octaves, in millicents
 #define MPE_MEMBER_FIRST    1      // MIDI channel index of member channel 1 (= channel 2)
 #define MPE_MEMBER_COUNT    15     // channels 2..16
 #define MPE_BEND_SEMITONES  48     // MPE default; 0.59 cents per bend unit
@@ -137,13 +146,21 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define COLORGEN_PART_MAX     6    // partitions a frame can carry (colours + widths in 24 bytes)
 #define COLORGEN_PART_FLAG    0x80 // in the palette-length byte: this is a partition scheme
 #define COLORGEN_WIDTH_MAX    31   // fifths in one partition
-#define COLORGEN_MSG_LEN      40   // payload bytes after 'K'
+// 0.10.0 made the landmark tint general. It used to be one flag, "lighten C, D
+// and E by 35%"; it is now a mask of which of the seven letters to lighten and
+// how far toward white, 0..100%. That needed one more byte than the 40 had, so
+// the parameter block is 41 bytes and travels as 'G'. 'K' is still accepted in
+// its old 40-byte form and upgraded on the way in (colorgen_upgrade_legacy).
+#define COLORGEN_MSG_LEN      41   // the parameter block: payload after 'G', and what the mesh relays
+#define COLORGEN_LEGACY_LEN   40   // payload after 'K', the pre-0.10.0 block
 _Static_assert(COLORGEN_MSG_LEN == MESH_CGEN_BYTES,
                "mesh.h's MESH_CGEN_BYTES must match COLORGEN_MSG_LEN");
-_Static_assert(16 + COLORGEN_PART_MAX * 3 + COLORGEN_PART_MAX == COLORGEN_MSG_LEN,
+_Static_assert(16 + COLORGEN_PART_MAX * 3 + COLORGEN_PART_MAX == COLORGEN_LEGACY_LEN,
                "a partition frame's colours and widths must exactly fill the palette bytes");
-#define COLORGEN_LIGHTEN_CDE  0x01 // flags bit 0: tint C, D, E paler as a landmark
-#define COLORGEN_CDE_PCT      35   // how far toward white that tint goes
+#define COLORGEN_LEGACY_CDE   0x01 // legacy flags bit 0: tint C, D, E paler as a landmark
+#define COLORGEN_LETTERS_CDE  0x07 // ...which as a letter mask is bits 0-2 (C D E F G A B = bits 0-6)
+#define COLORGEN_LETTERS_MASK 0x7F
+#define COLORGEN_CDE_PCT      35   // how far toward white the legacy tint went
 #define COLORGEN_WAIT_MS      1200 // boot: longest a child waits for colours before rippling
 
 // Velocity engine. Positions are normalized per key: 0 = rest, 1 = calibrated
@@ -699,6 +716,7 @@ static volatile uint32_t cq_dropped = 0;  // queue full; surfaced by 'i'
 static volatile uint8_t  pq_buf[PITCH_MSG_LEN];
 static volatile uint8_t  pq_fill = 0;
 static volatile uint8_t  pq_active = 0;   // mid-frame, collecting payload bytes
+static volatile uint8_t  pq_want = PITCH_MSG_LEN;   // bytes this frame carries: 'P' 16, 'Q' 20
 static volatile uint8_t  pq_ready = 0;    // a complete frame awaits the main loop
 static volatile uint32_t pq_rejected = 0; // failed validation; surfaced by 'i'
 
@@ -707,6 +725,7 @@ static volatile uint32_t pq_rejected = 0; // failed validation; surfaced by 'i'
 static volatile uint8_t  kq_buf[COLORGEN_MSG_LEN];
 static volatile uint8_t  kq_fill = 0;
 static volatile uint8_t  kq_active = 0;
+static volatile uint8_t  kq_want = COLORGEN_MSG_LEN;   // bytes this frame carries: 'K' 40, 'G' 41
 static volatile uint8_t  kq_ready = 0;
 static volatile uint32_t kq_rejected = 0; // failed validation; surfaced by 'i'
 static volatile uint32_t last_rx_tick = 0;
@@ -884,10 +903,11 @@ typedef struct {
   int32_t fifth_milli;                  /* width of the fifth, millicents */
   int16_t m00, m01, m10, m11;           /* grid -> (w, h) basis change */
   int16_t aw, ah;                       /* anchor added after the map */
+  int32_t offset_milli;                 /* concert pitch: added to every key, millicents */
 } pitch_params_t;
 
 static volatile pitch_params_t pitch_params = {
-  TUNE_FIFTH_DEFAULT, 1, 0, 0, 1, TUNE_W0, TUNE_H0
+  TUNE_FIFTH_DEFAULT, 1, 0, 0, 1, TUNE_W0, TUNE_H0, 0
 };
 
 // Pitch for ANY absolute grid coordinate, in integers: cents above C-1 ->
@@ -906,7 +926,8 @@ static uint8_t pitch_for_xy(int32_t x, int32_t y, uint8_t *note_out, uint16_t *b
 
   // Millicents above C-1. Bounded well inside int32: the term is ~1e7 over a
   // grid of any size a link can address.
-  int32_t cm = p.fifth_milli * (2 * w - 5 * h) + 1200000 * (3 * h - w);
+  int32_t cm = p.fifth_milli * (2 * w - 5 * h) + 1200000 * (3 * h - w)
+             + p.offset_milli;
 
   // div_round rather than C division: on a multi-board grid a coordinate can be
   // negative, and truncation toward zero would round the wrong way there.
@@ -941,7 +962,12 @@ static uint8_t pitch_params_apply(const uint8_t *m)
   for (int i = 4; i < 6; i++) {
     if (v[i] < -TUNE_ANCHOR_MAX || v[i] > TUNE_ANCHOR_MAX) return 0;
   }
+  const uint8_t *o = m + PITCH_LEGACY_LEN;
+  int32_t offset = (int32_t)((uint32_t)o[0] | ((uint32_t)o[1] << 8)
+                             | ((uint32_t)o[2] << 16) | ((uint32_t)o[3] << 24));
+  if (offset < -TUNE_OFFSET_MAX || offset > TUNE_OFFSET_MAX) return 0;
 
+  pitch_params.offset_milli = offset;
   pitch_params.fifth_milli = fifth;
   pitch_params.m00 = v[0]; pitch_params.m01 = v[1];
   pitch_params.m10 = v[2]; pitch_params.m11 = v[3];
@@ -966,7 +992,7 @@ typedef struct {
   int16_t aw, ah;               /* anchor, with the generator's (x, y) offset folded in */
   int8_t  start_acc;            /* the accidental that receives pal[0] */
   uint8_t pal_n;                /* 1..COLORGEN_PAL_MAX */
-  uint8_t flags;                /* COLORGEN_LIGHTEN_CDE */
+  uint8_t letters;              /* which letters to lighten: bit pc7, C D E F G A B = bits 0-6 */
   uint8_t brightness;           /* percent, 1..100 */
   uint8_t pal[COLORGEN_PAL_MAX][3];   /* RGB at FULL brightness */
   /* Partition scheme. part_n == 0 means accidental rows, where start_acc and
@@ -975,6 +1001,7 @@ typedef struct {
   uint8_t part_n;                     /* 0, or 1..COLORGEN_PART_MAX */
   int8_t  part_origin;                /* chain-of-fifths position where partition 0 starts */
   uint8_t part_w[COLORGEN_PART_MAX];  /* each 1..COLORGEN_WIDTH_MAX fifths */
+  uint8_t lighten_pct;                /* how far toward white those letters go, 0..100 */
 } colorgen_params_t;
 
 static volatile colorgen_params_t colorgen = {
@@ -983,6 +1010,7 @@ static volatile colorgen_params_t colorgen = {
   5, 0, 10,
   { {250, 20, 20}, {250, 100, 20}, {200, 200, 20}, {50, 250, 50}, {50, 50, 250} },
   0, 0, {0},   /* accidental rows, not partitions */
+  COLORGEN_CDE_PCT,
 };
 
 // Whether led_background[] is generated from those parameters or was written
@@ -1050,14 +1078,14 @@ static void colorgen_for_xy(int32_t x, int32_t y, uint8_t *rgb)
     idx = (uint8_t)mod_pos(acc - p.start_acc, n);  /* rows beyond the palette wrap */
   }
 
-  uint8_t lighten = (p.flags & COLORGEN_LIGHTEN_CDE) && pc7 < 3;
+  uint8_t lighten = (uint8_t)((p.letters >> pc7) & 1u);
   for (int c = 0; c < 3; c++) {
     uint32_t v = p.pal[idx][c];
     // Lighten first, then scale -- the order the companion's generator uses,
     // rounding at both steps as its toHex() does. Reversing them would differ
     // by a count on some channels, and this is checked byte for byte.
     if (lighten) {
-      v = round_pct(v * (100 - COLORGEN_CDE_PCT) + 255u * COLORGEN_CDE_PCT, 100);
+      v = round_pct(v * (100u - p.lighten_pct) + 255u * p.lighten_pct, 100);
     }
     rgb[c] = round_pct(v * p.brightness, 100);
   }
@@ -1079,14 +1107,15 @@ static void colorgen_render(void)
 // come from a host, and a wild basis change would put every key on one row --
 // a uniformly coloured board with no way to tell why.
 //
-// Two layouts share the 40 bytes, told apart by the top bit of byte 13:
+// Two layouts share the block, told apart by the top bit of byte 13:
 //
 //   accidental rows   12 int8 start accidental | 13 palette length 1..8
 //                     16.. 8 x RGB
 //   partitions        12 int8 origin           | 13 0x80 | count, count 1..6
 //                     16.. 6 x RGB | 34.. 6 x u8 width
 //
-// Bytes 0-11 (geometry), 14 (flags) and 15 (brightness) are common. The marker
+// Bytes 0-11 (geometry), 14 (letters to lighten), 15 (brightness) and 40 (how
+// far to lighten them) are common. The marker
 // is in the length byte on purpose: firmware before 0.9.0 reads it as a palette
 // length over 8 and REJECTS the frame, so an old board in a mixed grid keeps the
 // colours it had rather than painting the widths as if they were colours.
@@ -1119,12 +1148,15 @@ static uint8_t colorgen_params_apply(const uint8_t *m)
   }
   uint8_t brightness = m[15];
   if (brightness == 0 || brightness > 100) return 0;
+  if (m[14] & (uint8_t)~COLORGEN_LETTERS_MASK) return 0;   /* only seven letters */
+  if (m[COLORGEN_LEGACY_LEN] > 100) return 0;              /* lighten percent */
 
   colorgen.m00 = v[0]; colorgen.m01 = v[1];
   colorgen.m10 = v[2]; colorgen.m11 = v[3];
   colorgen.aw  = v[4]; colorgen.ah  = v[5];
-  colorgen.flags      = m[14];
-  colorgen.brightness = brightness;
+  colorgen.letters     = m[14];
+  colorgen.lighten_pct = m[COLORGEN_LEGACY_LEN];
+  colorgen.brightness  = brightness;
   // In a partition frame the last two palette slots hold the widths, so only
   // the first COLORGEN_PART_MAX are colours.
   uint8_t colours = part_n ? COLORGEN_PART_MAX : COLORGEN_PAL_MAX;
@@ -1147,7 +1179,17 @@ static uint8_t colorgen_params_apply(const uint8_t *m)
   return 1;
 }
 
-// Serialise the live generator back into the 40 wire bytes, so the master can
+// Turn a pre-0.10.0 block (what 'K' carries, and what an older parent beacons)
+// into the current one. The geometry, scheme and palette are unchanged; the old
+// flags byte had one meaning, and the tint it selected was fixed at 35%.
+static void colorgen_upgrade_legacy(const uint8_t *legacy, uint8_t *m)
+{
+  memcpy(m, legacy, COLORGEN_LEGACY_LEN);
+  m[14] = (legacy[14] & COLORGEN_LEGACY_CDE) ? COLORGEN_LETTERS_CDE : 0;
+  m[COLORGEN_LEGACY_LEN] = COLORGEN_CDE_PCT;
+}
+
+// Serialise the live generator back into the wire block, so the master can
 // hand what it holds to the mesh layer without keeping a second copy.
 static void colorgen_params_pack(uint8_t *m)
 {
@@ -1157,8 +1199,9 @@ static void colorgen_params_pack(uint8_t *m)
     m[i * 2]     = (uint8_t)v[i];
     m[i * 2 + 1] = (uint8_t)((uint16_t)v[i] >> 8);
   }
-  m[14] = p.flags;
+  m[14] = p.letters;
   m[15] = p.brightness;
+  m[COLORGEN_LEGACY_LEN] = p.lighten_pct;
   for (uint8_t i = 0; i < COLORGEN_PAL_MAX; i++) {
     for (int c = 0; c < 3; c++) m[16 + i * 3 + c] = p.pal[i][c];
   }
@@ -1331,6 +1374,11 @@ void Miso_PackColorGen(uint8_t *p)
   colorgen_params_pack(p);
 }
 
+void Miso_UpgradeColorGen(const uint8_t *legacy, uint8_t *p)
+{
+  colorgen_upgrade_legacy(legacy, p);
+}
+
 void Miso_SensorCoord(uint8_t sensor, int8_t *x, int8_t *y)
 {
   if (sensor >= NUM_SENSORS) { *x = 0; *y = 0; return; }
@@ -1452,7 +1500,9 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
     }
     if (pq_active) {
       pq_buf[pq_fill++] = c;
-      if (pq_fill >= PITCH_MSG_LEN) {
+      if (pq_fill >= pq_want) {
+        // A 'P' stops four bytes short: no concert pitch, so an offset of zero.
+        while (pq_fill < PITCH_MSG_LEN) pq_buf[pq_fill++] = 0;
         pq_active = 0;
         pq_ready = 1;
       }
@@ -1460,7 +1510,7 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
     }
     if (kq_active) {
       kq_buf[kq_fill++] = c;
-      if (kq_fill >= COLORGEN_MSG_LEN) {
+      if (kq_fill >= kq_want) {
         kq_active = 0;
         kq_ready = 1;
       }
@@ -1509,8 +1559,10 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
         break;
       }
       case 'L': cq_active = 1; cq_fill = 0; break;
-      case 'P': pq_active = 1; pq_fill = 0; break;
-      case 'K': kq_active = 1; kq_fill = 0; break;
+      case 'P': pq_want = PITCH_LEGACY_LEN; pq_active = 1; pq_fill = 0; break;
+      case 'Q': pq_want = PITCH_MSG_LEN;    pq_active = 1; pq_fill = 0; break;
+      case 'K': kq_want = COLORGEN_LEGACY_LEN; kq_active = 1; kq_fill = 0; break;
+      case 'G': kq_want = COLORGEN_MSG_LEN;    kq_active = 1; kq_fill = 0; break;
       case 'T': topo_req = 1; break;
       case 'p': collecting_thr = 1; thr_val = 0; break;
       case 'n': scan_enabled ^= 1; break;
@@ -1695,12 +1747,12 @@ int main(void)
       info_req = 0;
       // 352, not 288: the line runs to ~250 bytes at its nominal values after
       // mdrop/retrig/nopitch joined it, and the counters on it are unbounded.
-      char line[352];
+      char line[384];
       snprintf(line, sizeof(line),
                "INFO fw=%s scan_hz=%lu decim=%lu stream=%u leds=%u links=%c%c%c%c usb=%u cdrop=%lu "
                "usbdef=%lu thr=%lu scan=%u ledchurn=%lu dmachurn=%lu "
                "float=%u idleedges=%lu "
-               "fifth=%ld M=%d,%d,%d,%d anchor=%d,%d preject=%lu "
+               "fifth=%ld M=%d,%d,%d,%d anchor=%d,%d offset=%ld preject=%lu "
                "cmode=%s cseq=%u kreject=%lu "
                "mdrop=%lu retrig=%lu nopitch=%lu\r\n",
                FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
@@ -1714,7 +1766,8 @@ int main(void)
                led_float_diag, (unsigned long)led_idle_edges,
                (long)pitch_params.fifth_milli,
                pitch_params.m00, pitch_params.m01, pitch_params.m10, pitch_params.m11,
-               pitch_params.aw, pitch_params.ah, (unsigned long)pq_rejected,
+               pitch_params.aw, pitch_params.ah, (long)pitch_params.offset_milli,
+               (unsigned long)pq_rejected,
                (color_mode == COLOR_MODE_PROCEDURAL) ? "proc" : "expl",
                mesh_colorgen_seq(), (unsigned long)kq_rejected,
                (unsigned long)n_mdrop, (unsigned long)n_retrigger,
@@ -1777,6 +1830,13 @@ int main(void)
     }
     if (kq_ready) {
       kq_ready = 0;
+      // A 'K' arrived in the old 40-byte form; bring it up to the current block
+      // before anything else sees it, so the mesh only ever relays one format.
+      if (kq_want == COLORGEN_LEGACY_LEN) {
+        uint8_t legacy[COLORGEN_LEGACY_LEN];
+        memcpy(legacy, (const uint8_t *)kq_buf, sizeof(legacy));
+        colorgen_upgrade_legacy(legacy, (uint8_t *)kq_buf);
+      }
       if (colorgen_params_apply((const uint8_t *)kq_buf)) {
         color_mode = COLOR_MODE_PROCEDURAL;
         colorgen_render();
@@ -1791,10 +1851,10 @@ int main(void)
       cq_active = 0;   // half-received frame: abandon the slot, keep the queue
     }
     if (pq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
-      pq_active = 0;   // likewise, so a truncated 'P' cannot wedge the parser
+      pq_active = 0;   // likewise, so a truncated 'P' or 'Q' cannot wedge the parser
     }
     if (kq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
-      kq_active = 0;   // and a truncated 'K'
+      kq_active = 0;   // and a truncated 'K' or 'G'
     }
 
     // LED rendering, decimated so the WS2812 DMA (~1.6 ms per refresh)
