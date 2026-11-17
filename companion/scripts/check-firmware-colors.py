@@ -150,6 +150,8 @@ def configs() -> list[dict]:
                                     **landmark(lighten, letter),
                                 },
                                 "pitch": {
+                                    # Turned, too: 0°, 180° and 300°.
+                                    "rotation": (letter * 5) % 6,
                                     "layout": layout,
                                     "tuning": {"kind": "edo", "edo": 31},
                                     "anchorNote": note,

@@ -9,6 +9,7 @@
 
   import {
     LAYOUTS, CENTRE_KEY, generatePitchAt, hzAt, noteName, referenceOf, tuningError, stepIntervalName,
+    layoutMatrix, rotateStep,
     type LayoutId,
   } from "../lib/tuning";
   import { generateColorAt } from "../lib/colorMaps";
@@ -42,13 +43,13 @@
   // step makes under the selected layout.
   const HEX_R = 7;
   const HEX_POINTS = hexPoints(0, 0, HEX_R);
-  const DIRECTIONS = ([[1, 0], [0, 1], [1, -1]] as const).map(([dx, dy]) => {
+  /** A key with an arrow leaving it toward the neighbour at grid offset (dx, dy). */
+  function arrow(dx: number, dy: number) {
     const [px, py] = axialToPixel(dx, dy);
     const len = Math.hypot(px, py);
     const ux = px / len, uy = py / len;
     const tip = 14.5, back = 10.5, half = 3; // arrow length and head, in icon units
     return {
-      dx, dy,
       line: `M0 0L${(ux * back).toFixed(2)} ${(uy * back).toFixed(2)}`,
       head: [
         [ux * tip, uy * tip],
@@ -56,10 +57,22 @@
         [ux * back + uy * half, uy * back - ux * half],
       ].map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" "),
     };
-  });
+  }
+
+  // The icons follow the layout's three intervals, not three fixed directions:
+  // turn the mapping and each arrow turns with it, still beside the same name.
+  const BASE_DIRECTIONS = [[1, 0], [0, 1], [1, -1]] as const;
+  const rotation = $derived(pitchGen.rotation ?? 0);
   const steps = $derived(
-    DIRECTIONS.map((d) => ({ ...d, name: stepIntervalName(LAYOUTS[pitchGen.layout], d.dx, d.dy) })),
+    BASE_DIRECTIONS.map(([bx, by]) => {
+      const [dx, dy] = rotateStep(bx, by, rotation);
+      return { ...arrow(dx, dy), dx, dy, name: stepIntervalName(layoutMatrix(pitchGen), dx, dy) };
+    }),
   );
+
+  function rotate(turns: number) {
+    updatePitchGenerator({ rotation: (((rotation + turns) % 6) + 6) % 6 });
+  }
 
   /** How the live colour generator would fill an icon key under a layout. */
   function fillFor(layout: LayoutId): (x: number, y: number) => string {
@@ -106,18 +119,37 @@
     </button>
   </div>
 
-  <ul class="steps" aria-label="Interval in each direction">
-    {#each steps as s}
-      <li>
-        <svg viewBox="-16 -16 32 32" width="38" height="38" aria-hidden="true">
-          <polygon points={HEX_POINTS} fill="var(--panel-2)" stroke="var(--text-dim)" stroke-width="1.2" />
-          <path d={s.line} stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" fill="none" />
-          <polygon points={s.head} fill="var(--accent)" />
+  <div class="mt-3 flex flex-wrap items-center gap-x-6 gap-y-2">
+    <ul class="steps" aria-label="Interval in each direction">
+      {#each steps as s}
+        <li title="Grid direction ({s.dx}, {s.dy})">
+          <svg viewBox="-16 -16 32 32" width="38" height="38" aria-hidden="true">
+            <polygon points={HEX_POINTS} fill="var(--panel-2)" stroke="var(--text-dim)" stroke-width="1.2" />
+            <path d={s.line} stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" fill="none" />
+            <polygon points={s.head} fill="var(--accent)" />
+          </svg>
+          {s.name}
+        </li>
+      {/each}
+    </ul>
+    <div class="flex-1"></div>
+    <div class="flex items-center gap-1.5" role="group" aria-label="Rotate the layout">
+      <span class="text-[10px] uppercase tracking-widest" style="color: var(--text-dim)">Rotate</span>
+      <button class="btn turn" aria-label="Rotate 60° anticlockwise" title="Rotate 60° anticlockwise" onclick={() => rotate(-1)}>
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3.2 8a4.8 4.8 0 1 0 1.5-3.5M3 2.5v2.4h2.4" />
         </svg>
-        {s.name}
-      </li>
-    {/each}
-  </ul>
+      </button>
+      <span class="mono w-12 text-center text-sm" style="color: var(--text)" aria-live="polite">{rotation * 60}°</span>
+      <button class="btn turn" aria-label="Rotate 60° clockwise" title="Rotate 60° clockwise" onclick={() => rotate(1)}>
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12.8 8a4.8 4.8 0 1 1-1.5-3.5M13 2.5v2.4h-2.4" />
+        </svg>
+      </button>
+    </div>
+  </div>
 
   <!-- Where the layout sits on the keys: one note pinned to one key, and every
        other key follows from the layout. -->
@@ -180,11 +212,17 @@
     text-transform: uppercase;
     color: var(--text-dim);
   }
+  .turn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 8px;
+  }
   .steps {
     display: flex;
     flex-wrap: wrap;
     gap: 6px 22px;
-    margin: 12px 0 0;
+    margin: 0;
     padding: 0;
     list-style: none;
     font-size: 13px;

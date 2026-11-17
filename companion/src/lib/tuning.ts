@@ -98,8 +98,8 @@ const STEP_NAME: Record<string, string> = {
  * through a hexagon's edges. The name is meantonal's, spelled out; a layout is a
  * basis change in (w, h), so it is the same in every tuning.
  */
-export function stepIntervalName(layout: Layout, dx: number, dy: number): string {
-  const v = layout.matrix.map(new MapVec(dx, dy));
+export function stepIntervalName(matrix: Map2D, dx: number, dy: number): string {
+  const v = matrix.map(new MapVec(dx, dy));
   const short = new Interval(v.x, v.y).name; // e.g. "M2", "-P4", "AA1"
   const down = short.startsWith("-");
   const m = /^-?([PMm]|A+|d+)(\d+)$/.exec(short);
@@ -112,6 +112,36 @@ export function stepIntervalName(layout: Layout, dx: number, dy: number): string
       : QUALITY[m[1]];
   const name = STEP_NAME[code] ?? `${quality} ${ORDINAL[number - 1] ?? `${number}th`}`;
   return down ? `${name} down` : name;
+}
+
+// --- Rotation ---------------------------------------------------------------
+
+/**
+ * One sixth of a turn clockwise, as it acts on a grid direction: east (1, 0)
+ * goes to (0, 1), which on screen is the next edge round clockwise.
+ */
+export function rotateStep(dx: number, dy: number, turns = 1): [number, number] {
+  let x = dx, y = dy;
+  for (let i = ((turns % 6) + 6) % 6; i > 0; i--) [x, y] = [-y, x + y];
+  return [x, y];
+}
+
+// The inverse of that, as a matrix: to find the pitch at a key of a mapping
+// turned clockwise, turn the key back anticlockwise and ask the unturned one.
+const UNTURN = new Map2D(1, 1, -1, 0);
+
+/**
+ * The matrix a pitch generator actually maps keys with: its layout's, turned
+ * by `rotation` sixths of a turn clockwise about the anchor key.
+ *
+ * Still a 2×2 integer matrix, so a rotated mapping needs nothing new from the
+ * firmware — and because the anchor is worked out from this matrix
+ * (`anchorVec`), the anchor note stays on the anchor key however it is turned.
+ */
+export function layoutMatrix(g: Pick<PitchGenerator, "layout" | "rotation">): Map2D {
+  let m = LAYOUTS[g.layout].matrix;
+  for (let i = ((((g.rotation ?? 0) % 6) + 6) % 6); i > 0; i--) m = m.compose(UNTURN);
+  return m;
 }
 
 /** The board's centre key — the natural place to pin an anchor note. */
@@ -450,6 +480,11 @@ export interface PitchGenerator {
   anchorKey: [number, number];
   /** MPE bend range the note+bend encoding assumes. */
   bendSemitones: number;
+  /**
+   * The layout turned about the anchor key, in sixths of a turn clockwise
+   * (0–5, so 60° each). See `layoutMatrix`.
+   */
+  rotation: number;
   /** Concert pitch: this note, in SPN… */
   referenceNote: string;
   /** …sounds at this frequency. See `Reference`. */
@@ -494,6 +529,7 @@ export const DEFAULT_PITCH_GENERATOR: PitchGenerator = {
   anchorNote: "D4",
   anchorKey: [...CENTRE_KEY] as [number, number],
   bendSemitones: MPE_BEND_SEMITONES,
+  rotation: 0,
   referenceNote: DEFAULT_REFERENCE.note,
   referenceHz: DEFAULT_REFERENCE.hz,
 };
@@ -512,20 +548,20 @@ export function defaultPitchMap(): PitchMap {
  * literals in `LAYOUTS` above.
  */
 export function anchorVec(g: PitchGenerator): { w: number; h: number } {
-  const layout = LAYOUTS[g.layout];
+  const matrix = layoutMatrix(g);
   let note: Pitch;
   try {
     note = SPN.toPitch(g.anchorNote);
   } catch {
     note = SPN.toPitch(DEFAULT_PITCH_GENERATOR.anchorNote);
   }
-  const v = layout.matrix.map(new MapVec(g.anchorKey[0], g.anchorKey[1]));
+  const v = matrix.map(new MapVec(g.anchorKey[0], g.anchorKey[1]));
   return { w: note.w - v.x, h: note.h - v.y };
 }
 
 /** Pitch a generator puts on a coordinate. */
 export function generatePitchAt(g: PitchGenerator, x: number, y: number): Pitch {
-  const v = LAYOUTS[g.layout].matrix.map(new MapVec(x, y));
+  const v = layoutMatrix(g).map(new MapVec(x, y));
   const a = anchorVec(g);
   return new Pitch(v.x + a.w, v.y + a.h);
 }
@@ -577,7 +613,7 @@ export function referenceOffsetMilli(g: PitchGenerator): number {
  */
 export function pitchFrame(m: PitchMap, withReference = false): Uint8Array {
   const g = m.generator;
-  const matrix = LAYOUTS[g.layout].matrix;
+  const matrix = layoutMatrix(g);
   const a = anchorVec(g);
 
   const frame = new Uint8Array(withReference ? PITCH_FRAME_LEN : PITCH_LEGACY_FRAME_LEN);

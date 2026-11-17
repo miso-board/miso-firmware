@@ -17,7 +17,7 @@
 
 import { LED_POS, cellKey } from "./layout";
 import {
-  LAYOUTS, accidentalLabel, anchorVec, generatePitchAt, type LayoutId, type PitchGenerator,
+  accidentalLabel, anchorVec, generatePitchAt, layoutMatrix, type LayoutId, type PitchGenerator,
 } from "./tuning";
 import { scaleHex, lightenHex, parseHex } from "./ledColor";
 
@@ -488,7 +488,8 @@ export function colorgenFrame(
   const p = scheme ? { ...g, ...scheme } : g;
   if (scheme && p.palette.length < 1) return null;
 
-  const layout = LAYOUTS[pitchGen.layout];
+  // The pitch generator's own matrix, rotation included.
+  const layout = { matrix: layoutMatrix(pitchGen) };
   const anchor = anchorVec(pitchGen);
 
   const frame = new Uint8Array(caps.lighten ? COLORGEN_FRAME_LEN : COLORGEN_LEGACY_FRAME_LEN);

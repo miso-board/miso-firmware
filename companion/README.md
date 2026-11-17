@@ -55,7 +55,8 @@ Below that, in the order each depends on the last: the **tuning** (a row of
 common EDOs, a list of the rest, a ruler for the width of the fifth and a cents
 box, all showing and setting the same number, plus concert pitch as a note and
 a frequency); the **layout**, picked from live icons — 2×2 board tilings drawn in
-the preset's own colour rows — with the anchor note that places it on the keys;
+the preset's own colour rows — with the interval each direction makes, buttons to
+turn it in 60° steps, and the anchor note that places it on the keys;
 and the **colour rows**. Last, because it is used least, comes the keyboard
 itself: every key in its LED colour, labelled by what it sounds (note name, MIDI
 number, bend or frequency), with a brush for painting individual keys over the
@@ -126,7 +127,13 @@ here in the same commit. Nothing enforces this pairing.
 A **preset** is how the instrument is set up: an LED mapping *and* a pitch
 mapping, with room for further preset-scoped settings. One selector serves both
 tabs, because switching preset changes what the instrument looks like and what it
-plays together. Both halves are keyed by **absolute grid coordinate**, not LED
+plays together. A layout can be **rotated** in sixths of a turn about the anchor key
+(`rotation`, `layoutMatrix` in `tuning.ts`). It is the layout's matrix composed
+with a 60° turn of the grid, so it is still a 2×2 integer matrix: the firmware
+needs nothing new, and the colours turn with the notes because both take their
+geometry from the same place.
+
+Both halves are keyed by **absolute grid coordinate**, not LED
 index, so one scheme covers however many boards are attached and survives them
 being added, removed or rearranged.
 
@@ -234,7 +241,7 @@ wire format:
 | Command | What it proves |
 |---------|----------------|
 | `npm run check` | `svelte-check`: types across the app |
-| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,415 assertions |
+| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,495 assertions |
 | `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `../Core/Src/main.c`, compiles it with clang, and diffs it against the app over nine tunings × three layouts × six concert-pitch offsets × a four-board grid — 20,088 cases, plus the byte-identical-default claim on 124 keys |
 | `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 1,992 generators × a four-board grid — accidental rows, the piano scheme, partition schemes and landmark tints, 247,008 cases — plus the byte-identical-boot-pattern claim and nineteen validation cases |
 

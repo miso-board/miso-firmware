@@ -708,6 +708,63 @@ section("12. colours from the tuning: a hue per fifth, a colour per row, always 
   }
 }
 
+// --- 13. rotation --------------------------------------------------------------
+
+section("13. rotation: a mapping turns in sixths about its anchor, and the board follows");
+{
+  const { layoutMatrix, rotateStep, stepIntervalName } = await import("../src/lib/tuning.ts");
+
+  ok(String(rotateStep(1, 0)) === "0,1" && String(rotateStep(0, 1)) === "-1,1" &&
+     String(rotateStep(1, -1)) === "1,0", "one turn clockwise takes each edge direction to the next");
+  ok(String(rotateStep(1, 0, 6)) === "1,0" && String(rotateStep(1, 0, -1)) === "1,-1",
+     "six turns come back round, and a negative turn goes the other way");
+
+  // Bosanquet turned 120° clockwise, as asked for: the whole tone, the diatonic
+  // semitone and the chromatic semitone each move two edges round.
+  {
+    const g = pitchMapFor({ rotation: 2 }).generator;
+    const m = layoutMatrix(g);
+    ok(stepIntervalName(m, -1, 1) === "whole tone", "120°: (−1, 1) is the ascending whole tone");
+    ok(stepIntervalName(m, -1, 0) === "diatonic semitone", "120°: (−1, 0) is the ascending diatonic semitone");
+    ok(stepIntervalName(m, 0, 1) === "chromatic semitone", "120°: (0, 1) is the chromatic semitone");
+  }
+
+  for (const id of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
+    const base = pitchMapFor({ layout: id, anchorNote: "F#3", anchorKey: [1, 5] }).generator;
+    const names = [[1, 0], [0, 1], [1, -1]].map(([x, y]) => stepIntervalName(layoutMatrix(base), x, y));
+    for (let r = 0; r < 6; r++) {
+      const g = { ...base, rotation: r };
+      // Each interval is found one edge further round per turn.
+      ok([[1, 0], [0, 1], [1, -1]].every(([x, y], i) =>
+           stepIntervalName(layoutMatrix(g), ...rotateStep(x, y, r)) === names[i]),
+         `${id} at ${r * 60}°: the three intervals have turned with it`);
+      // The anchor note stays on the anchor key.
+      ok(noteName(generatePitchAt(g, 1, 5)) === "F♯3", `${id} at ${r * 60}°: the anchor note stays put`,
+         noteName(generatePitchAt(g, 1, 5)));
+      // A key and the same key turned about the anchor play the same note.
+      let same = true;
+      for (const [x, y] of gridCoords(2)) {
+        const [dx, dy] = rotateStep(x - 1, y - 5, r);
+        const a = generatePitchAt(base, x, y), b = generatePitchAt(g, 1 + dx, 5 + dy);
+        if (a.w !== b.w || a.h !== b.h) same = false;
+      }
+      ok(same, `${id} at ${r * 60}°: every key has turned about the anchor`);
+      // And the firmware, given the frame, agrees with the app.
+      const frame = pitchFrame({ generator: g, overrides: {} }, true);
+      let agree = true;
+      for (const [x, y] of gridCoords(4)) {
+        const p = generatePitchAt(g, x, y);
+        const fw = firmwarePitch(frame, x, y);
+        if (fw.w !== p.w || fw.h !== p.h) agree = false;
+      }
+      ok(agree, `${id} at ${r * 60}°: the firmware puts every key on the same pitch`);
+    }
+    const back = { ...base, rotation: 6 };
+    ok(String(Object.values(layoutMatrix(back))) === String(Object.values(layoutMatrix(base))),
+       `${id}: six turns is no turn`);
+  }
+}
+
 // --- summary ---------------------------------------------------------------
 
 console.log(

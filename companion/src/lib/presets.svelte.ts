@@ -267,6 +267,7 @@ function normalisePitch(raw: any): PitchMap {
       bendSemitones: Number.isFinite(g.bendSemitones)
         ? Number(g.bendSemitones)
         : DEFAULT_PITCH_GENERATOR.bendSemitones,
+      rotation: Number.isInteger(g.rotation) ? (((g.rotation % 6) + 6) % 6) : 0,
       // Absent from presets saved before concert pitch existed, which played
       // with every C on a 12-TET C — exactly what the default says.
       referenceNote:
@@ -402,7 +403,8 @@ export function updateColorGenerator(patch: Partial<GeneratorParams>): void {
 export function updatePitchGenerator(patch: Partial<PitchGenerator>): void {
   const m = activePitch();
   m.generator = { ...m.generator, ...patch };
-  const movesRows = "layout" in patch || "anchorNote" in patch || "anchorKey" in patch;
+  const movesRows =
+    "layout" in patch || "rotation" in patch || "anchorNote" in patch || "anchorKey" in patch;
   // A scheme that follows the tuning changes colour with it — the one case
   // where retuning does have to reach the LEDs.
   const recoloured = "tuning" in patch && recolourFromTuning();
