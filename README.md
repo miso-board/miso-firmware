@@ -221,6 +221,7 @@ interface on the same USB-C port:
 | `L` + `int16 x`, `int16 y`, 93 bytes | Set LED colors on the board at that grid origin, anywhere in the mesh |
 | `B!`    | Reboot into the USB DFU bootloader (two bytes, so a stray character can't misfire) |
 | `C` + 93 bytes | Set all LED background colors: 31 × RGB, LED-chain order (a stalled frame aborts after 200 ms) |
+| `O` + 7 bytes | Set the **MIDI output mode** (0.12.0): `u8` mode (0 MPE, 1 mapped) then `int16` a, b, c. Mapped sends each key as note `v = a·x + b·y + c` with no pitch bend, for synths tuned by Scala files; values past 0–127 go out on further channels in banks of 128 (bank 0 on channel 1, +1 on 2, −1 on 3 …). Held in RAM; a board that has not heard from the companion plays MPE |
 | `Q` + 20 bytes | Set the pitch map with a **concert pitch** (0.10.0): the `P` block below, then `int32` offset in millicents added to every key. Validated before it is installed |
 | `P` + 16 bytes | Set the pitch map (an offset of zero): `int32` fifth in millicents, `int16` m00 m01 m10 m11 (grid → `(w, h)` basis change), `int16` anchor w, h. Little-endian, validated before it is installed |
 | `J` + 43 bytes | Set the **colour generator** (0.11.0): the `G` block below, then `u8` EDO and `int8` window start for **wrapping accidental rows to an EDO** (0 = no wrap; accidental rows only). Validated, and propagated down the mesh |
@@ -396,6 +397,21 @@ to every key before it is split into note and bend. "A4 = 440 Hz" in 31-EDO is
 the offset that brings that tuning's A4 onto 440; the companion works it out
 (`referenceOffsetCents` in `tuning.ts`) and the board just adds it. `P` is still
 accepted and means zero. The `INFO` line reports it as `offset=`.
+
+**Scala output** (0.12.0). Synths that do not speak MPE can still play Miso's
+tunings if they load a Scala scale (.scl) and keyboard mapping (.kbm): each MIDI
+note number is then a fixed pitch, with no bend. In an EDO every key is a whole
+number of steps from C4, and every layout is linear, so the step count is linear
+in the grid coordinate — `v = a·x + b·y + c` with C4 at 60 — and the companion
+sends those three integers over `O`. In mapped mode the board sends `v` as the
+note on channel 1 when it is in 0–127, and beyond that on further channels, in
+banks of 128 — bank +1 on channel 2, −1 on 3, +2 on 4 and so on — each meant for
+its own instance of the synth with its own .kbm. A note is ended only when the
+last key holding it is released, since two keys can share one (enharmonic
+spellings in one EDO, or the same pitch on two boards). Switching mode releases
+everything sounding; entering mapped mode turns the MPE zone off and centres
+pitch bend on every channel. The `INFO` line reports it as `omode=` and counts
+refused frames as `oreject=`.
 
 `P` needs no mesh propagation, and deliberately gets none: MIDI is generated
 only by the USB-connected board, which already plays every key in the grid from
@@ -987,6 +1003,7 @@ compiling it on the host, and diffing it against the app:
 |---|---|---|
 | [`companion/scripts/check-firmware-pitch.py`](companion/scripts/check-firmware-pitch.py) | `div_round`, `pitch_for_xy`, `pitch_params_apply` | 20,088 cases over nine tunings × three layouts × six concert-pitch offsets × a four-board grid agree with the app, and the 31-EDO default is byte-identical to the step-lattice formula it replaced (124 keys) |
 | [`companion/scripts/check-firmware-colors.py`](companion/scripts/check-firmware-colors.py) | `colorgen_params_t`, `floor_div`, `mod_pos`, `round_pct`, `colorgen_for_xy`, `colorgen_params_apply`, `colorgen_upgrade` | 258,912 cases over 2,088 generators × a four-board grid — accidental rows plain, symmetric and wrapped to EDOs from 5 to 90, partition schemes, the piano scheme and landmark tints — agree with the app, the default generator is byte-identical to `fill_bosanquet()` (31 keys), and twenty-two frames are accepted, refused or upgraded as intended |
+| [`companion/scripts/check-firmware-scala.py`](companion/scripts/check-firmware-scala.py) | `output_params_t`, `mapped_channel`, `mapped_for_xy`, `output_params_apply` | 44,640 keys over 360 mappings (EDOs 5 to 72 × three layouts × six rotations × two anchors) × a four-board grid send the channel and note the app expects, and malformed `O` frames are refused |
 
 Both run from the companion, and both need `clang` and Node 24:
 

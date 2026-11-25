@@ -47,6 +47,7 @@ import {
   type GeneratorParams,
 } from "./colorMaps";
 import { autoColorsFor, rowsForWrap } from "./autoColors";
+import { outputFrame, scalaMap, type ScalaMap } from "./scala";
 import { sendBytes } from "./serial";
 import { ui, toast, fwAtLeast } from "./ui.svelte";
 import { mesh, gridCells, cellKey } from "./mesh.svelte";
@@ -69,6 +70,9 @@ export const PITCH_PUSH_FW = [0, 7, 0] as const;
 
 /** Firmware with the `Q` frame: the tuning plus a concert pitch. */
 export const PITCH_REFERENCE_FW = [0, 10, 0] as const;
+
+/** Firmware with the `O` frame: Scala output, notes mapped for a Scala-tuned synth. */
+export const OUTPUT_FW = [0, 12, 0] as const;
 
 /** Firmware that understands the `K` colour-generator frame. */
 export const COLORGEN_PUSH_FW = [0, 8, 0] as const;
@@ -678,9 +682,56 @@ export function canPushPitch(): boolean {
  */
 export async function pushPitch(): Promise<void> {
   if (!canPushPitch()) return;
-  const frame = pitchFrame(activePitch(), canPushReference());
-  await sendBytes(frame);
-  presetState.pushedPitch = frameHex(frame);
+  const frames = pitchFrames();
+  for (const f of frames) await sendBytes(f);
+  presetState.pushedPitch = frames.map(frameHex).join("");
+}
+
+/** What a pitch push sends: the tuning, and the output mode where the firmware has it. */
+function pitchFrames(): Uint8Array[] {
+  const frames = [pitchFrame(activePitch(), canPushReference())];
+  if (canPushOutput()) frames.push(outputFrame(activeScalaMap()));
+  return frames;
+}
+
+// --- output mode --------------------------------------------------------------
+//
+// How the board sends notes: MPE (each key its own channel, with a bend), or
+// Scala (plain note numbers for a synth tuned by .scl/.kbm files). A setting of
+// the app, not of a preset — it describes the synth on the other end of the
+// cable, which does not change when the preset does.
+
+const OUTPUT_KEY = "miso-output-v1";
+
+export const output = $state({
+  mode: (() => {
+    try {
+      return localStorage.getItem(OUTPUT_KEY) === "scala" ? "scala" : "mpe";
+    } catch {
+      return "mpe";
+    }
+  })() as "mpe" | "scala",
+});
+
+export function setOutputMode(mode: "mpe" | "scala"): void {
+  output.mode = mode;
+  try {
+    localStorage.setItem(OUTPUT_KEY, mode);
+  } catch {}
+}
+
+/**
+ * The Scala mapping in effect, or null when the board should send MPE: either
+ * because MPE is chosen, or because the tuning is not an EDO, which Scala mode
+ * cannot express.
+ */
+export function activeScalaMap(): ScalaMap | null {
+  return output.mode === "scala" ? scalaMap(activePitch().generator) : null;
+}
+
+/** True when the attached firmware can be switched to Scala output. */
+export function canPushOutput(): boolean {
+  return ui.connected && fwAtLeast(...OUTPUT_FW);
 }
 
 const frameHex = (f: Uint8Array): string =>
@@ -695,7 +746,7 @@ const frameHex = (f: Uint8Array): string =>
  */
 export function pitchIsStale(): boolean {
   if (!canPushPitch()) return false;
-  return presetState.pushedPitch !== frameHex(pitchFrame(activePitch(), canPushReference()));
+  return presetState.pushedPitch !== pitchFrames().map(frameHex).join("");
 }
 
 /** True when the attached firmware can be given a concert pitch. */

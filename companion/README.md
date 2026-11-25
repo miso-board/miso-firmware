@@ -92,15 +92,37 @@ Status lines the app parses:
 | `MESH self=… \| port=… \| board=… \| stat …` | `src/lib/mesh.svelte.ts` | the grid model |
 
 **Sending.** The app uses a deliberately small subset: `i`, `s`, `x`, `d<N>`,
-`T`, and the push commands `C`, `L`, `Q` and `J` (or the older `P`, `K` and `G` for firmware that predates them). Everything else in the
+`T`, and the push commands `C`, `L`, `Q`, `J` and `O` (or the older `P`, `K` and `G` for firmware that predates them). Everything else in the
 firmware's table — `l`, `M`, `e`, `r`, `k`, `f`, `F`, `n`, `p<N>`, `B!` — is a
 manual diagnostic, driven from a serial terminal or the flashing scripts.
+
+## MIDI output: MPE or Scala
+
+The **MIDI output** section at the foot of the Mapping tab chooses how the board
+sends notes. It is a setting of the app (`output` in `presets.svelte.ts`, kept
+in `localStorage`), not of a preset, because it describes the synth on the other
+end of the cable.
+
+- **MPE** tunes every note with its own pitch bend, in any tuning.
+- **Scala** sends plain notes, one per EDO step, for synths that load .scl and
+  .kbm files. EDOs only: in any other tuning the board sends MPE until an EDO is
+  chosen. `src/lib/scala.ts` works out the three integers the firmware needs
+  (`scalaMap`), and writes the files: one .scl, and one .kbm per channel the grid
+  uses (`sclFile`, `kbmFile`). The convention is fixed — C4 is note 60 on channel
+  1 — so the files depend only on the tuning and concert pitch, never on which
+  boards are attached. Keys past MIDI's 128 notes go to further channels, each
+  for its own synth instance with its own .kbm, and the panel says how many the
+  grid needs. It also says when the tuning has changed since the files were last
+  downloaded. Each .kbm is a linear mapping whose middle and reference note is a
+  C within 0–127, at the frequency the tuning and concert pitch give it.
+
+The MIDI monitor checks Scala output by channel and note instead of note and bend.
 
 ## Firmware version gating
 
 The board reports `fw=miso X.Y.Z` on its `INFO` line, from `FW_VERSION` in
 [`../Core/Src/main.c`](../Core/Src/main.c). `fwAtLeast()` in
-`src/lib/ui.svelte.ts` compares against six constants in
+`src/lib/ui.svelte.ts` compares against seven constants in
 `src/lib/presets.svelte.ts`:
 
 ```ts
@@ -110,6 +132,7 @@ export const COLORGEN_PUSH_FW = [0, 8, 0] as const;   // 'K'
 export const COLORGEN_PARTITIONS_FW = [0, 9, 0] as const;   // 'K' carrying partitions
 export const COLORGEN_LIGHTEN_FW = [0, 10, 0] as const;     // 'G': landmark letters and amount
 export const COLORGEN_WRAP_FW = [0, 11, 0] as const;        // 'J': accidental rows wrapped to an EDO
+export const OUTPUT_FW = [0, 12, 0] as const;               // 'O': MPE or Scala output
 ```
 
 **These gates are load-bearing, not polite.** A board that predates `P` does not
@@ -275,14 +298,15 @@ shows a live board count.
 
 ## Cross-checks
 
-Four checks, because the pitch and colour pipelines each span two languages and a
+Five checks, because the pitch, colour and Scala pipelines each span two languages and a
 wire format:
 
 | Command | What it proves |
 |---------|----------------|
 | `npm run check` | `svelte-check`: types across the app |
-| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 12,791 assertions |
+| `npm run check:tuning` | the app's pitch maths against meantonal — golden 31-EDO regression, the anchor convention, wire-frame encoding, validation, and the 12-TET self-check (every bend exactly 8192). 13,006 assertions |
 | `npm run check:firmware` | extracts `pitch_for_xy` **verbatim** from `../Core/Src/main.c`, compiles it with clang, and diffs it against the app over nine tunings × three layouts × six concert-pitch offsets × a four-board grid — 20,088 cases, plus the byte-identical-default claim on 124 keys |
+| `npm run check:scala` | extracts `mapped_for_xy` and its helpers **verbatim** from `../Core/Src/main.c`, compiles them with clang, and checks every key of a four-board grid gets the channel and note the app expects over EDOs 5 to 72, three layouts, six rotations and two anchors — 44,640 keys — plus four validation cases |
 | `npm run check:colors` | the same treatment for `colorgen_for_xy`, diffed against the app's real `generateColorAt` (no JS mirror needed) over 2,088 generators × a four-board grid — accidental rows plain, symmetric and wrapped to EDOs from 5 to 90, the piano scheme, partition schemes and landmark tints, 258,912 cases — plus the byte-identical-boot-pattern claim and twenty-two validation cases |
 
 The 12-TET case is the one to keep: at a 700¢ fifth a wrong coefficient would not

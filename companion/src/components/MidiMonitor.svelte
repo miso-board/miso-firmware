@@ -5,7 +5,8 @@
     LAYOUTS, pitchOn, noteName, midiFor, centsFromBend, tuningLabel, referenceOf,
     tuningError, matchToleranceCents,
   } from "../lib/tuning";
-  import { activePreset, canPushPitch, pitchIsStale } from "../lib/presets.svelte";
+  import { activePreset, canPushPitch, pitchIsStale, activeScalaMap } from "../lib/presets.svelte";
+  import { scalaNote } from "../lib/scala";
   import { toast } from "../lib/ui.svelte";
 
   interface Row {
@@ -50,6 +51,21 @@
     });
   });
 
+  // In Scala output a key is identified by its channel and note alone.
+  const scala = $derived(activeScalaMap());
+  const expectedScala = $derived.by(() => {
+    if (!scala) return [];
+    return gridCells().flatMap((c) => {
+      const n = scalaNote(scala, c.x, c.y);
+      if (!n) return [];
+      return [{
+        label: mesh.boards.length > 1 ? `${c.x},${c.y}` : `S${String(c.sensor).padStart(2, "0")}`,
+        name: noteName(pitchOn(preset.pitch, c.x, c.y)),
+        ...n,
+      }];
+    });
+  });
+
   // In a tuning whose diatonic semitone has collapsed, several keys sound the
   // same pitch and attributing a note to one of them is meaningless. Detect that
   // rather than letting the tick mark quietly pick an arbitrary winner.
@@ -82,6 +98,20 @@
       push({
         at: stamp(), kind: "bend", channel,
         text: `bend ${bend} (${centsFromBend(bend, bendSemitones).toFixed(1)} cents)`,
+      });
+    } else if (type === 0x90 && d2 > 0 && scala) {
+      // Several keys can send one note (enharmonic spellings in one EDO), so
+      // any of them is a match.
+      const hits = expectedScala.filter((e) => e.channel === channel && e.note === d1);
+      push({
+        at: stamp(), kind: "on", channel,
+        text: `note ${d1} vel ${d2}`,
+        match: {
+          key: hits.map((h) => h.label).join("/") || "—",
+          name: hits[0]?.name ?? "no key sends this",
+          ok: hits.length > 0,
+          deltaCents: 0,
+        },
       });
     } else if (type === 0x90 && d2 > 0) {
       const bend = lastBend[channel - 1];
@@ -151,10 +181,15 @@
     MIDI monitor {portName ? `— ${portName}` : ""}
   </h2>
   <p class="m-0 mb-2.5 text-xs" style="color: var(--text-dim)">
-    Listens to the board's MPE output and checks each note against what meantonal says that key
-    should sound under the active preset. Bend is read at ±{bendSemitones} semitones, matching the
-    firmware, and a note counts as matching within {tolerance.toFixed(2)}¢ — one bend step plus a
-    little, so a wrong key or a stale tuning push can't hide as a rounding difference.
+    {#if scala}
+      Listens to the board's Scala output and checks each note's channel and number against the key
+      that should send it under the active preset.
+    {:else}
+      Listens to the board's MPE output and checks each note against what meantonal says that key
+      should sound under the active preset. Bend is read at ±{bendSemitones} semitones, matching the
+      firmware, and a note counts as matching within {tolerance.toFixed(2)}¢ — one bend step plus a
+      little, so a wrong key or a stale tuning push can't hide as a rounding difference.
+    {/if}
   </p>
 
   {#if ambiguous > 0}
@@ -195,7 +230,7 @@
               {#if r.match}
                 <span style="color: {r.match.ok ? 'var(--good)' : 'var(--crit)'}">
                   {r.match.ok ? "✓" : "✗"} key {r.match.key} {r.match.name}
-                  {#if !r.match.ok}({r.match.deltaCents.toFixed(1)}¢ off){/if}
+                  {#if !r.match.ok && !scala}({r.match.deltaCents.toFixed(1)}¢ off){/if}
                 </span>
               {/if}
             </li>

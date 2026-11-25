@@ -1013,6 +1013,93 @@ section("16. the default palette extended: nine hues to ♭⁴ and ♯⁴, paler
   }
 }
 
+// --- 17. Scala output ------------------------------------------------------------
+
+section("17. Scala output: each key's channel and note, and the .scl/.kbm files that tune it");
+{
+  const {
+    scalaMap, scalaNote, scalaValue, channelOfBank, bankOfChannel, sclFile, kbmFile, outputFrame, banksFor,
+  } = await import("../src/lib/scala.ts");
+  const { hzAt, referenceOf } = await import("../src/lib/tuning.ts");
+
+  ok([0, 1, -1, 2, -2, 7, -7, 8].every((b) => bankOfChannel(channelOfBank(b)) === b) &&
+     channelOfBank(0) === 1 && channelOfBank(1) === 2 && channelOfBank(-1) === 3 &&
+     channelOfBank(8) === 16 && channelOfBank(-8) === null, "banks 0, +1, −1 … go to channels 1, 2, 3 … 16");
+  ok(scalaMap(pitchMapFor({ tuning: { kind: "fifth", cents: 696.578 } }).generator) === null,
+     "a tuning that is not an EDO has no Scala mapping");
+
+  // 12-EDO is ordinary MIDI: the anchor D4 is note 62.
+  {
+    const g = pitchMapFor({ tuning: { kind: "edo", edo: 12 } }).generator;
+    const n = scalaNote(scalaMap(g), 3, 3);
+    ok(n.channel === 1 && n.note === 62, "12-EDO, Bosanquet: the centre key, D4, is note 62 on channel 1");
+  }
+
+  // Read the files back the way a synth would, and check every key of a big grid
+  // sounds at the frequency the app says it should.
+  const parseScl = (text) => {
+    const lines = text.split("\n").filter((l) => !l.startsWith("!"));
+    const count = Number(lines[1].trim());
+    const pitches = lines.slice(2, 2 + count).map((l) => l.trim());
+    return { count, pitches };
+  };
+  const parseKbm = (text) => {
+    const nums = text.split("\n").filter((l) => l && !l.startsWith("!")).map(Number);
+    const [size, first, last, middle, refNote, refHz, octave] = nums;
+    return { size, first, last, middle, refNote, refHz, octave };
+  };
+  let worst = 0;
+  for (const edo of [5, 7, 12, 17, 19, 22, 26, 31, 41, 53, 72]) {
+    for (const layout of ["bosanquet", "wicki-hayden", "harmonic-table"]) {
+      for (const [rotation, ref] of [[0, { note: "C4", hz: 440 * 2 ** (-9 / 12) }], [2, { note: "A4", hz: 440 }], [5, { note: "F#3", hz: 180 }]]) {
+        const g = pitchMapFor({ layout, rotation, tuning: { kind: "edo", edo }, referenceNote: ref.note, referenceHz: ref.hz }).generator;
+        const map = scalaMap(g);
+        const scl = parseScl(sclFile(map));
+        const tag = `${edo}-EDO ${layout} at ${rotation * 60}°, ${ref.note} = ${ref.hz.toFixed(2)}`;
+        if (rotation === 0 && layout === "bosanquet") {
+          ok(scl.count === map.edo && scl.pitches[scl.count - 1] === "2/1" &&
+             scl.pitches.slice(0, -1).every((p, i) => p.includes(".") &&
+               Math.abs(Number(p) - (1200 * (i + 1)) / map.edo) < 1e-5),
+             `${edo}-EDO: the .scl has ${map.edo} equal steps in cents, ending 2/1`);
+        }
+        const keys = gridCoords(4).map(([x, y]) => ({ x, y }));
+        const kbms = new Map(banksFor(map, keys).map((b) => [channelOfBank(b), parseKbm(kbmFile(map, g, b))]));
+        let right = true, sane = true;
+        for (const { x, y } of keys) {
+          const n = scalaNote(map, x, y);
+          if (!n) continue;
+          const k = kbms.get(n.channel);
+          if (!k) { right = false; continue; }
+          // Linear mapping in an EDO: each note one step from the middle note.
+          const fromFiles = k.refHz * 2 ** ((n.note - k.refNote) / map.edo);
+          const want = hzAt(g.tuning, generatePitchAt(g, x, y), referenceOf(g));
+          const cents = Math.abs(1200 * Math.log2(fromFiles / want));
+          worst = Math.max(worst, cents);
+          if (cents > 1e-4) right = false;
+          if (k.size !== 0 || k.first !== 0 || k.last !== 127 || k.octave !== 0 ||
+              k.middle < 0 || k.middle > 127 || k.refNote !== k.middle ||
+              (128 * bankOfChannel(n.channel) + k.middle - 60) % map.edo !== 0) sane = false;
+        }
+        ok(right, `${tag}: every key sounds where the app says, by the files`);
+        ok(sane, `${tag}: each .kbm is linear, its middle note a C, within 0–127`);
+      }
+    }
+  }
+  console.log(`  worst difference between the files and the app: ${worst.toExponential(1)}¢`);
+
+  // The 'O' frame.
+  {
+    const g = pitchMapFor({ tuning: { kind: "edo", edo: 31 } }).generator;
+    const map = scalaMap(g);
+    const f = outputFrame(map), dv = new DataView(f.buffer);
+    ok(f.length === 8 && f[0] === 0x4f && f[1] === 1 && dv.getInt16(2, true) === map.a &&
+       dv.getInt16(4, true) === map.b && dv.getInt16(6, true) === map.c, "'O' carries the mode and a, b, c");
+    ok(outputFrame(null).every((byte, i) => (i === 0 ? byte === 0x4f : byte === 0)), "MPE is 'O' with mode 0");
+    ok(scalaValue(map, 3, 3) === 60 + 5 && map.a === 5 && map.b === 3,
+       "31-EDO Bosanquet: a whole tone is 5 steps, a diatonic semitone 3, and D4 is C4 + 5");
+  }
+}
+
 // --- summary ---------------------------------------------------------------
 
 console.log(

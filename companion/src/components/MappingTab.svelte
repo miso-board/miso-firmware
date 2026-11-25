@@ -9,6 +9,7 @@
   import LayoutPicker from "./LayoutPicker.svelte";
   import GeneratorPanel from "./GeneratorPanel.svelte";
   import KeysPanel from "./KeysPanel.svelte";
+  import OutputPanel from "./OutputPanel.svelte";
   import { ui } from "../lib/ui.svelte";
 </script>
 
@@ -28,3 +29,4 @@
   <GeneratorPanel />
 </div>
 <KeysPanel />
+<OutputPanel />

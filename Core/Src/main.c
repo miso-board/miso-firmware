@@ -67,7 +67,7 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define STREAM_MAGIC1       0x5A
 #define FRAME_TYPE_SCAN     0x01
 #define STREAM_DECIM_DEFAULT 2u    // stream every Nth scan
-#define FW_VERSION          "miso 0.11.0"
+#define FW_VERSION          "miso 0.12.0"
 #define GLOW_TARGET         200u   // max channel a held key's color is lifted toward at vel 127
 #define COLOR_RX_TIMEOUT_MS 200u   // abort a half-received 'C' color frame after this
 
@@ -104,6 +104,12 @@ _Static_assert(NUM_SENSORS == MESH_SENSORS,
 #define PITCH_MSG_LEN       20     // the parameter block: payload after 'Q'
 #define PITCH_LEGACY_LEN    16     // payload after 'P', the pre-0.10.0 block
 #define TUNE_OFFSET_MAX     2400000 // sanity bound on a pushed offset: two octaves, in millicents
+// Output mode ('O'): MPE, or mapped notes for Scala-tuned synths. See the MIDI section.
+#define OUTPUT_MSG_LEN      7
+#define OUTPUT_MODE_MPE     0
+#define OUTPUT_MODE_MAPPED  1
+#define OUTPUT_STEP_MAX     1024   // sanity bound on a and b: steps per key
+#define MAPPED_HELD_MAX     32     // keys held at once in mapped mode
 #define MPE_MEMBER_FIRST    1      // MIDI channel index of member channel 1 (= channel 2)
 #define MPE_MEMBER_COUNT    15     // channels 2..16
 #define MPE_BEND_SEMITONES  48     // MPE default; 0.59 cents per bend unit
@@ -734,6 +740,13 @@ static volatile uint8_t  pq_want = PITCH_MSG_LEN;   // bytes this frame carries:
 static volatile uint8_t  pq_ready = 0;    // a complete frame awaits the main loop
 static volatile uint32_t pq_rejected = 0; // failed validation; surfaced by 'i'
 
+// The pushed output mode, single-buffered for the same reason as the pitch map.
+static volatile uint8_t  oq_buf[OUTPUT_MSG_LEN];
+static volatile uint8_t  oq_fill = 0;
+static volatile uint8_t  oq_active = 0;
+static volatile uint8_t  oq_ready = 0;
+static volatile uint32_t oq_rejected = 0; // failed validation; surfaced by 'i'
+
 // The pushed colour generator, single-buffered for the same reason: 'K' carries
 // parameters, which are idempotent and last-write-wins.
 static volatile uint8_t  kq_buf[COLORGEN_MSG_LEN];
@@ -864,6 +877,38 @@ static float    rest_acc[NUM_SENSORS];
 static uint32_t rest_scans = 0;           // < REST_CAL_SCANS while calibrating
 
 // --- MIDI / MPE --------------------------------------------------------------
+
+// 0.12.0 added a second way to send notes: MAPPED, for synths that are tuned by
+// a Scala scale rather than by per-note pitch bend. In an EDO every key is a
+// whole number of steps from C4, and since every layout is linear that number
+// is linear in the grid coordinate, so the companion sends three integers:
+//
+//   v = a*x + b*y + c          (C4 = 60)
+//
+// v is a MIDI note number when it is in 0..127. MIDI has only 128, which a
+// large EDO over a large grid outruns, so further keys spill onto further
+// channels — banks of 128 — each meant for its own synth instance with its own
+// keyboard mapping: bank 0 on channel 1, then +1 on 2, -1 on 3, +2 on 4, -2 on
+// 5 and so on outward. No pitch bend is sent, and the MPE zone is switched off
+// so a synth that was in MPE mode leaves it. 'O' + 7 bytes sets it: u8 mode
+// (0 MPE, 1 mapped), int16 a, b, c. Held in RAM, like the tuning; a board that
+// has not heard from the companion plays MPE.
+
+typedef struct {
+  uint8_t mode;
+  int16_t a, b, c;
+} output_params_t;
+static volatile output_params_t output_params = { OUTPUT_MODE_MPE, 0, 0, 0 };
+
+// One record per held key in mapped mode, with the channel and note it started,
+// so its note-off is right even if the mapping changed while it was held.
+typedef struct {
+  uint8_t  active;
+  uint32_t key;     // packed absolute (x, y)
+  uint8_t  channel; // 0..15
+  uint8_t  note;
+} mapped_voice_t;
+static mapped_voice_t mapped_voice[MAPPED_HELD_MAX];
 
 // One record per MPE member channel, keyed by PACKED ABSOLUTE COORDINATE rather
 // than by local sensor index, so keys on neighbouring boards are representable
@@ -1255,7 +1300,74 @@ static void colorgen_params_pack(uint8_t *m)
 static void midi_reset_voices(void)
 {
   memset(mpe_voice, 0, sizeof(mpe_voice));
+  memset(mapped_voice, 0, sizeof(mapped_voice));
   mpe_alloc_counter = 0;
+}
+
+// Release everything sounding, in whichever mode it was started.
+static void midi_release_all(void)
+{
+  for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
+    if (!mpe_voice[c].active) continue;
+    midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | (MPE_MEMBER_FIRST + c)), mpe_voice[c].note, 0);
+  }
+  for (uint8_t i = 0; i < MAPPED_HELD_MAX; i++) {
+    if (!mapped_voice[i].active) continue;
+    midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | mapped_voice[i].channel), mapped_voice[i].note, 0);
+  }
+  midi_reset_voices();
+}
+
+// Channel index (0..15) for a bank of 128 notes: 0, +1, -1, +2, -2 … outward.
+// Returns 0xFF for a bank beyond the sixteen channels.
+static uint8_t mapped_channel(int32_t bank)
+{
+  int32_t ch = (bank > 0) ? 2 * bank - 1 : -2 * bank;
+  return (ch < 16) ? (uint8_t)ch : 0xFF;
+}
+
+// The channel and note a key sends in mapped mode. Returns 0 if out of range.
+static uint8_t mapped_for_xy(int32_t x, int32_t y, uint8_t *channel_out, uint8_t *note_out)
+{
+  output_params_t o = output_params;   // snapshot, as pitch_for_xy does
+  int32_t v = (int32_t)o.a * x + (int32_t)o.b * y + o.c;
+  int32_t bank = (v >= 0) ? v / 128 : -((127 - v) / 128);   // floor division
+  uint8_t ch = mapped_channel(bank);
+  if (ch == 0xFF) return 0;
+  *channel_out = ch;
+  *note_out = (uint8_t)(v - bank * 128);
+  return 1;
+}
+
+// Install a pushed output mode. Returns 0 if the frame was rejected.
+static uint8_t output_params_apply(const uint8_t *m)
+{
+  uint8_t mode = m[0];
+  if (mode != OUTPUT_MODE_MPE && mode != OUTPUT_MODE_MAPPED) return 0;
+  int16_t v[3];
+  for (int i = 0; i < 3; i++) {
+    v[i] = (int16_t)((uint16_t)m[1 + i * 2] | ((uint16_t)m[2 + i * 2] << 8));
+  }
+  if (v[0] < -OUTPUT_STEP_MAX || v[0] > OUTPUT_STEP_MAX) return 0;
+  if (v[1] < -OUTPUT_STEP_MAX || v[1] > OUTPUT_STEP_MAX) return 0;
+  output_params.a = v[0];
+  output_params.b = v[1];
+  output_params.c = v[2];
+  output_params.mode = mode;
+  return 1;
+}
+
+// In mapped mode: switch the MPE zone off (a Configuration Message with no
+// member channels does that), and centre pitch bend on every channel, so a synth
+// left in MPE mode, or with a bend from it, plays the mapped notes as they are.
+static void midi_send_mapped_setup(void)
+{
+  midi_send(MIDI_CIN_CC, 0xB0, 101, 0);
+  midi_send(MIDI_CIN_CC, 0xB0, 100, 6);
+  midi_send(MIDI_CIN_CC, 0xB0, 6, 0);
+  for (uint8_t c = 0; c < 16; c++) {
+    midi_send(MIDI_CIN_PITCHBEND, (uint8_t)(0xE0 | c), 0x00, 0x40);   // 8192
+  }
 }
 
 // MPE Configuration Message: lower zone, master channel 1, 15 member channels,
@@ -1275,8 +1387,58 @@ static void midi_send_mpe_setup(void)
   }
 }
 
+// Mapped mode. Two keys can send the same note — enharmonic spellings in one
+// EDO, or one pitch on two boards — so a note is ended only when the last key
+// holding it is released, and pressing a second one restarts it.
+static void mapped_note_on(int16_t x, int16_t y, uint8_t vel)
+{
+  uint8_t ch, note;
+  if (!mapped_for_xy(x, y, &ch, &note)) { n_nopitch++; return; }
+  uint32_t id = key_id(x, y);
+
+  int free_slot = -1;
+  uint8_t already = 0;
+  for (uint8_t i = 0; i < MAPPED_HELD_MAX; i++) {
+    if (!mapped_voice[i].active) {
+      if (free_slot < 0) free_slot = i;
+      continue;
+    }
+    if (mapped_voice[i].key == id) {          // a leaked or duplicate press
+      mapped_voice[i].active = 0;
+      n_retrigger++;
+      if (free_slot < 0) free_slot = i;
+      continue;
+    }
+    if (mapped_voice[i].channel == ch && mapped_voice[i].note == note) already = 1;
+  }
+  if (free_slot < 0) { n_mdrop++; return; }   // more keys held than slots
+
+  if (already) midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | ch), note, 0);
+  mapped_voice[free_slot].active = 1;
+  mapped_voice[free_slot].key = id;
+  mapped_voice[free_slot].channel = ch;
+  mapped_voice[free_slot].note = note;
+  midi_send(MIDI_CIN_NOTE_ON, (uint8_t)(0x90 | ch), note, vel);
+}
+
+static void mapped_note_off(int16_t x, int16_t y)
+{
+  uint32_t id = key_id(x, y);
+  for (uint8_t i = 0; i < MAPPED_HELD_MAX; i++) {
+    if (!mapped_voice[i].active || mapped_voice[i].key != id) continue;
+    mapped_voice[i].active = 0;
+    uint8_t ch = mapped_voice[i].channel, note = mapped_voice[i].note;
+    for (uint8_t j = 0; j < MAPPED_HELD_MAX; j++) {
+      if (mapped_voice[j].active && mapped_voice[j].channel == ch && mapped_voice[j].note == note) return;
+    }
+    midi_send(MIDI_CIN_NOTE_OFF, (uint8_t)(0x80 | ch), note, 0);
+    return;
+  }
+}
+
 static void midi_note_on(int16_t x, int16_t y, uint8_t vel)
 {
+  if (output_params.mode == OUTPUT_MODE_MAPPED) { mapped_note_on(x, y, vel); return; }
   uint8_t note;
   uint16_t bend;
   if (!pitch_for_xy(x, y, &note, &bend)) { n_nopitch++; return; }
@@ -1332,6 +1494,10 @@ static void midi_note_on(int16_t x, int16_t y, uint8_t vel)
 
 static void midi_note_off(int16_t x, int16_t y)
 {
+  if (output_params.mode == OUTPUT_MODE_MAPPED) {
+    mapped_note_off(x, y);
+    // An MPE voice started before a switch to mapped mode still needs ending.
+  }
   uint32_t id = key_id(x, y);
   for (uint8_t c = 0; c < MPE_MEMBER_COUNT; c++) {
     if (!mpe_voice[c].active || mpe_voice[c].key != id) continue;
@@ -1542,6 +1708,14 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       }
       continue;
     }
+    if (oq_active) {
+      oq_buf[oq_fill++] = c;
+      if (oq_fill >= OUTPUT_MSG_LEN) {
+        oq_active = 0;
+        oq_ready = 1;
+      }
+      continue;
+    }
     if (kq_active) {
       kq_buf[kq_fill++] = c;
       if (kq_fill >= kq_want) {
@@ -1604,6 +1778,7 @@ void Miso_CDC_OnRx(uint8_t *buf, uint32_t len)
       case 'f': led_float_diag ^= 1; break;
       case 'F': led_selftest_req = 1; break;
       case 'M': mpe_setup_req = 1; break;
+      case 'O': oq_active = 1; oq_fill = 0; break;
       case 'e': events_text_on ^= 1; break;
       default: break;  // ignore CR/LF and unknown bytes
     }
@@ -1758,7 +1933,8 @@ int main(void)
     if (mpe_setup_req || (!mpe_setup_done && USBD_MIDI_Ready() && tick > 1500)) {
       mpe_setup_req = 0;
       mpe_setup_done = 1;
-      midi_send_mpe_setup();
+      if (output_params.mode == OUTPUT_MODE_MAPPED) midi_send_mapped_setup();
+      else midi_send_mpe_setup();
     }
     if (!USBD_MIDI_Ready()) {
       mpe_setup_done = 0;   // re-announce after a re-enumeration
@@ -1789,7 +1965,7 @@ int main(void)
                "float=%u idleedges=%lu "
                "fifth=%ld M=%d,%d,%d,%d anchor=%d,%d offset=%ld preject=%lu "
                "cmode=%s cseq=%u kreject=%lu "
-               "mdrop=%lu retrig=%lu nopitch=%lu\r\n",
+               "mdrop=%lu retrig=%lu nopitch=%lu omode=%s oreject=%lu\r\n",
                FW_VERSION, (unsigned long)scan_hz, (unsigned long)stream_decim,
                stream_on, led_viz_on,
                link_state_char(LINK_PORT_TOP), link_state_char(LINK_PORT_BOTTOM),
@@ -1806,7 +1982,9 @@ int main(void)
                (color_mode == COLOR_MODE_PROCEDURAL) ? "proc" : "expl",
                mesh_colorgen_seq(), (unsigned long)kq_rejected,
                (unsigned long)n_mdrop, (unsigned long)n_retrigger,
-               (unsigned long)n_nopitch);
+               (unsigned long)n_nopitch,
+               (output_params.mode == OUTPUT_MODE_MAPPED) ? "mapped" : "mpe",
+               (unsigned long)oq_rejected);
       cdc_send_text(line);
     }
 
@@ -1863,6 +2041,20 @@ int main(void)
       pq_ready = 0;
       if (!pitch_params_apply((const uint8_t *)pq_buf)) pq_rejected++;
     }
+    if (oq_ready) {
+      oq_ready = 0;
+      uint8_t was = output_params.mode;
+      if (output_params_apply((const uint8_t *)oq_buf)) {
+        // A change of mode ends everything sounding and tells the synth.
+        if (output_params.mode != was) {
+          midi_release_all();
+          if (output_params.mode == OUTPUT_MODE_MAPPED) midi_send_mapped_setup();
+          else midi_send_mpe_setup();
+        }
+      } else {
+        oq_rejected++;
+      }
+    }
     if (kq_ready) {
       kq_ready = 0;
       // A 'K' or 'G' arrived in an older, shorter form; bring it up to the
@@ -1885,6 +2077,9 @@ int main(void)
     }
     if (cq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
       cq_active = 0;   // half-received frame: abandon the slot, keep the queue
+    }
+    if (oq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
+      oq_active = 0;   // a truncated 'O'
     }
     if (pq_active && (tick - last_rx_tick) > COLOR_RX_TIMEOUT_MS) {
       pq_active = 0;   // likewise, so a truncated 'P' or 'Q' cannot wedge the parser
